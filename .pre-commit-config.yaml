@@ -1,0 +1,24 @@
+# Mirrors this project's own CI lint job (.github/workflows/test.yml's
+# `lint` job runs the identical two hooks via `uvx pre-commit run
+# --all-files`), so a change that passes locally cannot fail in CI for a
+# tooling-version reason, and vice versa. `rev` is pinned to the exact ruff
+# release this project develops against (ruff-pre-commit publishes one tag
+# per ruff release, in lockstep), not a floating major, so a contributor's
+# local hook run and CI always resolve to the same ruff.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.8
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+        # Default types_or already excludes markdown for ruff-check; kept
+        # explicit so both hooks below read the same way.
+        types_or: [python, pyi]
+      - id: ruff-format
+        # ruff-format's own default also reformats Python code blocks
+        # embedded in Markdown files (README.md here). Only the Python
+        # sources are in scope, as in Annealage Mesh, where this
+        # configuration comes from, so `markdown` is dropped from the default
+        # types_or here rather than silently expanding what gets reformatted
+        # on every commit.
+        types_or: [python, pyi]

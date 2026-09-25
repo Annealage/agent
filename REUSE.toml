@@ -1,0 +1,15 @@
+version = 1
+
+# Per-file licensing map for Annealage Agent (REUSE 3.0).
+# Authoritative, machine-readable companion to the LICENSE file. Resolves
+# the licence of any path, including files that cannot carry an inline SPDX
+# header (images, JSON, lockfiles, LICENSE itself).
+
+# The repository is PolyForm Noncommercial 1.0.0 throughout.
+# precedence = "aggregate" means this applies to any file that does not
+# declare its own licensing information via header.
+[[annotations]]
+path = "**/*"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Andrew Leech"
+SPDX-License-Identifier = "PolyForm-Noncommercial-1.0.0"

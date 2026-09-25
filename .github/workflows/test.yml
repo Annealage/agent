@@ -1,0 +1,102 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  # Callable, so a future release workflow cannot upload an artifact built
+  # from a commit whose suite was never run.
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      # Fail-fast off so one version's failure does not hide whether the others
+      # pass, which is the whole reason for testing several of them.
+      fail-fast: false
+      matrix:
+        # Every version the classifiers claim. 3.10 is not a formality: it is
+        # the one leg that exercises the `tomli` backport, since `tomllib` is
+        # stdlib from 3.11 onward.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The version comes from the git tag (hatch-vcs), and the default
+          # shallow checkout fetches none, which would build every install in
+          # this job as a 0.0.0 fallback.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          # The agent SDK is a base dependency and its wheel is about 90 MB,
+          # because it bundles the Claude Code CLI. Downloading that once per
+          # matrix leg per run is the single largest cost in this workflow, so
+          # uv's own download cache is keyed on the lockfile-equivalent inputs
+          # and restored before resolution. A miss costs what today costs; a hit
+          # takes the SDK download out of the run entirely.
+          enable-cache: true
+          # pyproject.toml alone: this project does not track a lockfile, so
+          # naming uv.lock here would key the cache on a file that is never
+          # present.
+          cache-dependency-glob: |
+            pyproject.toml
+
+      - name: install omp-rpc
+        # Not a pyproject.toml extra: it is not on PyPI, and a direct git
+        # dependency in published package metadata would be refused on
+        # upload (see session/omp.py's module docstring for the full
+        # reasoning). Pinned to the same commit that docstring documents as
+        # verified. `uv sync`'s own extras resolution runs first (triggered by
+        # the `uv run` below), so `uv pip install` here layers on top of that
+        # same managed environment rather than needing a real `pip` binary
+        # inside it.
+        #
+        # omp-rpc requires Python >=3.11, so skip on 3.10.
+        if: matrix.python-version != '3.10'
+        run: >-
+          uv run --extra dev --extra codex python -c "" &&
+          uv pip install
+          "omp-rpc @ git+https://github.com/can1357/oh-my-pi.git@71c5eec978b0e7ce9ff057eb4e311f67f4f03eb9#subdirectory=python/omp-rpc"
+
+      - name: run tests
+        # --extra codex: tests/test_codex_session.py and
+        # tests/test_mcp_bridge.py import openai_codex directly and would
+        # otherwise fail to collect at all, silently dropping their
+        # coverage from every run.
+        #
+        # On 3.10 omp-rpc is unavailable (requires >=3.11), so the omp test
+        # files, which import it through session/omp.py at the top level,
+        # are excluded there.
+        run: >-
+          uv run --extra dev --extra codex pytest -q
+          ${{ matrix.python-version == '3.10'
+          && '--ignore=tests/test_omp_session.py --ignore=tests/test_omp_session_live.py'
+          || '' }}
+
+      # The Python suite covers no JavaScript at all, so a syntax error in a
+      # module under static/ leaves it entirely green while every product's
+      # chat pane fails to boot. This is two seconds and catches exactly that.
+      # The browser suite that drives these modules is a product's (Annealage
+      # Mesh's tests/test_viewer_e2e.py), because only a product has a page.
+      - name: every browser module parses
+        run: |
+          for f in src/annealage_agent/static/*.js; do
+            node --check "$f" || exit 1
+          done
+
+  # Lint and formatting, as one short job rather than a step inside the matrix:
+  # the answer cannot differ per Python version, so running it four times would
+  # only slow the matrix down.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.1.0
+      - name: pre-commit
+        # Runs the exact same two ruff hooks, pinned to the exact same
+        # ruff release, as .pre-commit-config.yaml - one source of truth
+        # for what "lint clean" means, shared with the local git hook
+        # (CONTRIBUTING.md) instead of drifting from it.
+        run: uvx pre-commit run --all-files --show-diff-on-failure

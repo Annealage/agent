@@ -1,0 +1,70 @@
+name: integration
+
+# On-demand only, by design: these tests drive real backend CLIs/SDKs
+# against real accounts, spending real API/inference cost. No
+# `push`/`pull_request`/`workflow_call` trigger - a human must explicitly
+# run this from the Actions tab (or `gh workflow run integration.yml`).
+# Annealage Mesh's planning/tickets/phase7_live-integration-tests.md has the
+# full design (the tier moved here with the sessions it tests).
+#
+# Unlike an earlier version of this workflow, these tests need no
+# product-specific secret scheme: each live test (tests/test_sdk_session_live.py,
+# tests/test_codex_session_live.py, tests/test_omp_session_live.py)
+# constructs the real session class with no reconfiguration at all, the same
+# way a human would run `claude`/`codex`/`omp` directly - it authenticates
+# through whichever account that CLI is already logged into on the runner,
+# and skips at collection time (never errors) if the CLI itself is not on
+# PATH.
+#
+# That means `runs-on: ubuntu-latest` below is a placeholder: a fresh
+# GitHub-hosted runner has none of `claude`/`codex`/`omp` installed or
+# authenticated, so every test in this tier will skip cleanly (not fail)
+# until this points at a runner - most realistically self-hosted - that
+# already has all three set up, exactly the way the development host
+# does. There is no verified, repeatable install+auth channel for any
+# of the three CLIs to script here (`claude`/`codex` logins are normally
+# interactive OAuth; `omp`'s own provider configuration, e.g. whatever
+# "titan" names, is host-specific and has no public install channel this
+# project can pin a commit for) - a human wiring up a real runner for this
+# workflow is a prerequisite this file does not attempt to fabricate.
+#
+# Optional, non-sensitive overrides (repo variables) if a configured
+# runner's accounts should use different models than each test's own
+# default (Claude: "haiku", Codex: "gpt-5.6-luna", omp: "titan/qwen3.8-27b"):
+#   ANNEALAGE_AGENT_LIVE_CLAUDE_MODEL
+#   ANNEALAGE_AGENT_LIVE_CODEX_MODEL
+#   ANNEALAGE_AGENT_LIVE_OMP_MODEL
+
+on:
+  workflow_dispatch:
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+
+      - name: install omp-rpc
+        # Same pinned commit test.yml installs for the fake-transport omp
+        # suite - see session/omp.py's module docstring for why this is a
+        # manual step rather than a pyproject.toml extra.
+        run: >-
+          uv run --extra dev --extra codex python -c "" &&
+          uv pip install
+          "omp-rpc @ git+https://github.com/can1357/oh-my-pi.git@71c5eec978b0e7ce9ff057eb4e311f67f4f03eb9#subdirectory=python/omp-rpc"
+
+      - name: run the live integration tier
+        env:
+          ANNEALAGE_AGENT_LIVE_CLAUDE_MODEL: ${{ vars.ANNEALAGE_AGENT_LIVE_CLAUDE_MODEL }}
+          ANNEALAGE_AGENT_LIVE_CODEX_MODEL: ${{ vars.ANNEALAGE_AGENT_LIVE_CODEX_MODEL }}
+          ANNEALAGE_AGENT_LIVE_OMP_MODEL: ${{ vars.ANNEALAGE_AGENT_LIVE_OMP_MODEL }}
+        run: uv run --extra dev --extra codex pytest -m integration -q -rs

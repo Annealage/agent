@@ -1,0 +1,242 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "annealage-agent"
+dynamic = ["version"]
+description = "The embedded coding agent shared by Annealage products: a chat pane beside a product's own view, pluggable agent backends, permission cards, workspace trust and a WebSocket event channel"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Andrew Leech", email = "andrew@alelec.net" },
+]
+keywords = ["agent", "claude", "codex", "mcp", "chat", "microdot"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+# The Claude backend is the default backend, so the SDK is a base dependency
+# rather than an extra. The cost is real and worth stating: the SDK's own wheel
+# bundles a ~300 MB `claude` binary, so installing this package downloads
+# roughly 90 MB of platform-specific wheel instead of a few tens of kilobytes.
+# This package's own wheel stays pure Python and platform-independent; only the
+# dependency resolves per platform, and upstream publishes wheels for macOS
+# arm64 and x86_64, manylinux aarch64 and x86_64, and win_amd64.
+#
+# The floor is 0.2.136 rather than 0.2.135 because that is the version the
+# permission-broker contract was verified against: a `can_use_tool` callback
+# must return PermissionResultAllow or PermissionResultDeny, and the plain dict
+# form that older examples show is rejected outright (Annealage Mesh's
+# docs/agent-chat-plan.md section 2a, fact 14). The `<0.3` cap is load-bearing,
+# since this design depends on `Transport`, which the SDK documents as internal.
+dependencies = [
+    # The web framework every route here is written against (app.py, http/).
+    "microdot>=2.6,<3",
+    "claude-agent-sdk>=0.2.136,<0.3",
+    # http/routes_mcp.py builds the /mcp endpoint's request and response
+    # bodies from mcp.types (Tool/CallToolResult/ListToolsResult), and
+    # session/codex_mcp_stdio_bridge.py's stdio side is built entirely on
+    # mcp.server (Server/stdio_server): both are direct imports of this
+    # project's own code, not merely something claude-agent-sdk happens to
+    # pull in underneath it (it does, which is how this floor was verified:
+    # 1.21.0 is the version already resolved and exercised in this
+    # environment through that existing dependency chain), so it is declared
+    # here rather than relied on transitively - a future claude-agent-sdk
+    # release dropping its own use of mcp must not silently break this
+    # project's own direct imports of it. The `<2` cap follows this
+    # project's usual practice of not trusting an unreleased next major to
+    # keep today's API shape.
+    "mcp>=1.21,<2",
+    # session/codex_mcp_stdio_bridge.py's only HTTP client, used to reach
+    # the product's own /mcp endpoint from the stdio-proxy subprocess. Also
+    # already transitively present (mcp's own dependency), declared directly
+    # for the same reason as mcp above. 0.28.1 is what this floor was
+    # verified against; httpx's own versioning has stayed stable through the
+    # 0.2x series, so no upper cap tighter than the next major is warranted.
+    "httpx>=0.27,<1",
+    # session/codex_mcp_stdio_bridge.py imports anyio directly (anyio.run()
+    # and anyio.get_cancelled_exc_class()), so it is declared here for the
+    # same reason as mcp above rather than relied on through mcp and httpx,
+    # which both pull it in. The floor follows mcp's own (anyio>=4.5), the
+    # package whose stdio server the bridge runs under it; the `<5` cap
+    # follows the usual practice for the next major.
+    "anyio>=4.5,<5",
+    # settings.py locates the one user-wide settings.toml with this rather
+    # than hand-rolling the platform's config-directory convention
+    # (XDG_CONFIG_HOME on Linux, Application Support on macOS, %APPDATA% on
+    # Windows) a second time.
+    "platformdirs>=4,<5",
+    # tomllib is the standard library's TOML reader from Python 3.11 onward.
+    # tomli is the package it was vendored from, so the two parse identically;
+    # this only backfills the gap on 3.10, which this project still supports.
+    "tomli>=2;python_version<\"3.11\"",
+]
+
+[project.optional-dependencies]
+# pre-commit>=4.6: no upper cap, matching pytest-asyncio's own convention - a
+# stable CLI driver with no API this project imports, only ever invoked as
+# `pre-commit` (CONTRIBUTING.md, .pre-commit-config.yaml).
+dev = ["pytest", "pytest-asyncio>=0.23", "pre-commit>=4.6"]
+
+# Optional, unlike claude-agent-sdk, because it is an alternative backend
+# (settings.py's `backend` key) rather than the default: an install that
+# only ever runs the Claude backend should not pay for a second CLI it
+# will never invoke. Like claude-agent-sdk, this wheel bundles a pinned CLI
+# runtime of its own (`openai-codex-cli-bin`), so `uv sync --extra codex`
+# downloads a second platform-specific binary on top of the base install.
+#
+# The floor is 0.154.0 because that is the exact version Annealage Mesh's
+# `planning/20260919_codex-approval-handler-finding.md` verified by reading
+# the SDK's own source directly: the public `Codex`/`AsyncCodex`/
+# `AsyncCodexClient` wrappers have no way to set a custom `approval_handler`
+# at all and silently auto-accept every command-execution approval without
+# one, so `session/codex.py` constructs the low-level
+# `openai_codex.client.CodexClient` directly instead of any of those three.
+# That is reading an undocumented internal shape rather than the SDK's
+# stated public contract, so the `<1` cap is deliberately tight: a later
+# 0.x release is exactly where a shape like that is most likely to move
+# with no changelog entry warning this project to re-verify it.
+codex = ["openai-codex>=0.154,<1"]
+
+# The omp backend's client, omp-rpc, is deliberately not an extra: it is not
+# on PyPI, and a direct git dependency in published package metadata would be
+# refused by the index on upload (session/omp.py's module docstring has the
+# full reasoning). CI installs it from a pinned commit instead.
+
+# The version is the git tag, resolved at build time, so there is no literal to
+# keep in step with anything. Two consequences worth knowing. A build needs the
+# tags present, so CI checks out with fetch-depth: 0; and a build from an
+# unpacked sdist, which is what `uv build` does for the wheel, has no .git and
+# resolves the version from the sdist's PKG-INFO instead.
+[tool.hatch.version]
+source = "vcs"
+# A checkout with no tags at all, which a shallow clone, a source tarball or
+# this repository before its first release produces, would otherwise fail the
+# build outright. Products that depend on this package set their version floor
+# to match it until the first tag exists.
+fallback-version = "0.0.0"
+
+[tool.hatch.version.raw-options]
+# PyPI rejects a local version segment, and the default scheme appends one
+# (+g<sha>) to any commit that is not exactly a tag. A release is built on the
+# tag and so carries none either way; this makes an off-tag build uploadable
+# rather than silently unpublishable.
+local_scheme = "no-local-version"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/annealage_agent"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/annealage_agent",
+    "tests",
+    "README.md",
+    "LICENSE",
+    "COMMERCIAL.md",
+    "CONTRIBUTING.md",
+    "REUSE.toml",
+]
+
+# hatchling applies the repo .gitignore to package contents by default, so a
+# static/ subdirectory whose name matches a gitignore pattern (this repo's
+# .gitignore has "lib/", "build/", "parts/" and "var/") would silently drop
+# out of both the sdist and the wheel. "artifacts" bypasses that VCS-ignore
+# filtering, so everything under the front end's static tree ships regardless
+# of directory naming. Both the sdist and the wheel targets need this entry:
+# plain `uv build` builds the wheel from the sdist it just produced rather
+# than from the working tree, so a wheel-only override here would ship a wheel
+# with the assets during local `--wheel` testing while a wheel built from an
+# sdist missing them would silently drop them again.
+[tool.hatch.build]
+artifacts = [
+    "src/annealage_agent/static/**",
+]
+
+# Ruff is the linter and the formatter for this project. Its F rules are
+# pyflakes, which is the check this codebase is written against; every other
+# family below is selected deliberately rather than left to whatever a future
+# ruff release decides to default to, since the default set has grown before.
+[tool.ruff]
+# The code is written to roughly 80 columns by hand; 100 is the width that keeps
+# the formatter from rewrapping prose-heavy refusal messages that are laid out
+# to be read, while still catching a genuinely runaway line.
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "F",      # pyflakes: what this project already enforced
+    "E", "W", # pycodestyle, less E501: see the ignore list
+    "I",      # import order
+    "B",      # bugbear: mutable defaults, loop-variable capture, raise-from
+    "ASYNC",  # blocking calls inside async functions
+    "C4",     # comprehension rewrites
+    "RET",    # return-path simplifications
+    "PIE",    # small redundancies
+    "PERF",   # obvious O(n) mistakes in loops
+]
+# `UP` is deliberately absent. It wants 300-odd rewrites of `%` formatting into
+# f-strings and every `Optional[X]` into `X | None`; both are the house style
+# here, and a rule family that has to be half-ignored to be adopted is a rule
+# family that is not being enforced.
+ignore = [
+    # `ruff format` is the authority on line length for code, and it has already
+    # wrapped everything it can. What E501 is left reporting is prose inside
+    # docstrings that the formatter deliberately does not touch, so enforcing it
+    # would mean rewrapping paragraphs rather than fixing lines.
+    "E501",
+    # try/except/pass with a comment explaining what is being swallowed and why
+    # is this codebase's idiom for a best-effort cleanup; contextlib.suppress
+    # would move that comment away from the call it explains.
+    "SIM105",
+    # The three PERF rules that are micro-optimisation advice rather than
+    # mistake-finding, and that here would each make the code worse: two of the
+    # loops they flag mutate a dict that already exists, which no comprehension
+    # can do; the rest are guard-clause loops that read better than the
+    # comprehension equivalent; and the one try inside a loop is there precisely
+    # so that one unparseable message cannot end a conversation. PERF102, which
+    # catches iterating a dict's items when only the values are used, stays on.
+    "PERF203",
+    "PERF401",
+    "PERF403",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately open files without a context manager to hold a descriptor
+# across an assertion, call blocking file APIs inside async tests, and spawn
+# a real subprocess with blocking `subprocess.Popen` (rather than
+# `asyncio.create_subprocess_exec`) to exercise its actual stdin/exit
+# behaviour end to end - in every case there is no event loop to starve but
+# the test's own.
+"tests/*" = ["ASYNC220", "ASYNC230", "ASYNC240"]
+
+# `integration`-marked tests drive a real backend SDK/binary against a real
+# account or endpoint and complete an actual model turn - real network
+# calls, real credentials, real (small) cost, and no fake-transport
+# determinism. `addopts` excludes them from every default `pytest`
+# invocation (`uv run --extra dev pytest -q`, this project's own CI
+# `test.yml`) so a plain test run - local or CI - never depends on secrets
+# or reachability it may not have. They are opt-in only, run with
+# `pytest -m integration`, which overrides `addopts`'s own `-m` value
+# rather than combining with it (pytest resolves a repeated `-m` option to
+# its last occurrence, and CLI-supplied options are appended after
+# `addopts`). Each individual test still skips itself, with a clear reason,
+# when its own required credentials are not set - see
+# `tests/test_sdk_session_live.py`, `tests/test_codex_session_live.py` and
+# `tests/test_omp_session_live.py`.
+[tool.pytest.ini_options]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: drives a real backend SDK/binary and a real account or endpoint; opt-in only, run with `-m integration`",
+]
