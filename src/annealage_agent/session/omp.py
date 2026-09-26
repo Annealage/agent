@@ -247,6 +247,7 @@ class OmpSession:
         tool_table: Optional[dict] = None,
         on_sdk_session_id=None,
         client_factory: Optional[Callable[..., Any]] = None,
+        instructions: Optional[str] = None,
     ):
         self._on_event = on_event
         self.cwd = str(cwd)
@@ -254,6 +255,10 @@ class OmpSession:
         self.sdk_session_id = None
         self._broker = broker
         self._model = model
+        # The product's session context (Product.session_context), passed as
+        # --append-system-prompt; only when set, so the client is built with
+        # exactly today's keywords otherwise.
+        self._instructions = instructions or None
         self._base_url = base_url
         self._api_key = api_key
         self._tool_table = dict(tool_table or {})
@@ -482,7 +487,11 @@ class OmpSession:
                 # dict here changes nothing about the child's environment.
                 env = {}
                 model_arg = self._model
+            extra_client_kwargs = (
+                {"append_system_prompt": self._instructions} if self._instructions else {}
+            )
             self._client = self._client_factory(
+                **extra_client_kwargs,
                 executable="omp",
                 model=model_arg,
                 cwd=self.cwd,

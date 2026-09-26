@@ -6,8 +6,8 @@ these modules), and no product loads this one yet, so its behaviour is pinned
 here: one writer (``onChange``, only from a refetch), a reply that arrives
 after a later refetch has started is dropped, an unchanged list is not handed
 on twice, an unreadable review is reported rather than shown as empty, the
-fallback poll runs only while the socket is not live, and ``add`` posts the
-comment with the browser token.
+fallback poll runs only while the socket is not live, and ``add`` and
+``setStatus`` post with the browser token.
 """
 
 import json
@@ -124,6 +124,17 @@ const refused = review.add({ card: "side" }, "x");
 reply(400, { ok: false, error: "no card 'side'" });
 out.refused = await refused;
 
+// setStatus posts the new status to the comment's own URL and refetches.
+const setting = review.setStatus(4, "open");
+const statusPost = requests[requests.length - 1];
+out.statusPost = {
+  url: statusPost.url, method: statusPost.method, body: JSON.parse(statusPost.body),
+};
+reply(200, { ok: true, comment: { id: 4, status: "open" } });
+out.statusSet = await setting;
+out.refetchedAfterStatus = requests[requests.length - 1].method;
+reply(200, { ok: true, comments: B, capabilities: caps });
+
 console.log(JSON.stringify(out));
 """
 
@@ -173,3 +184,13 @@ def test_add_posts_the_comment_and_refetches(observed):
     assert observed["added"] == {"ok": True, "comment": {"id": 4}}
     assert observed["refetchedAfterAdd"] == "GET"
     assert observed["refused"] == {"ok": False, "error": "no card 'side'"}
+
+
+def test_set_status_posts_to_the_comment_and_refetches(observed):
+    assert observed["statusPost"] == {
+        "url": "/review/4?t=tok%2B1",
+        "method": "POST",
+        "body": {"status": "open"},
+    }
+    assert observed["statusSet"] == {"ok": True, "comment": {"id": 4, "status": "open"}}
+    assert observed["refetchedAfterStatus"] == "GET"

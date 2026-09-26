@@ -106,6 +106,44 @@ parentheses are Annealage Mesh's, as an example:
     The kind names the written file (``sketch-<stamp>-<hex>.png``), so each
     must be a short lowercase slug; ``install`` refuses anything else. The
     agent layer does nothing with a kind beyond naming the file by it.
+``write_protected``
+    Glob patterns naming files the agent's own file tools and shell must not
+    write, relative to the served directory with ``/`` separators (Mesh: none;
+    Annealage Loom: ``designs/src/*.review.json``). A file only the product's
+    tools may write, because a change made around them would skip what they
+    check and who they ask: a review file, whose ``status`` a direct edit
+    could flip on a human's comment with no card. Enforced beside the
+    credential paths (``session/secret_paths.py``, which says exactly where
+    and how far), and reading such a file stays allowed. ``*`` and ``?``
+    match within one path segment; ``install`` refuses an absolute pattern
+    or one with an empty, ``.`` or ``..`` segment. **Known limitation:** only
+    the Claude backend enforces it (omp has no file or shell tools of its
+    own); the Codex backend's own shell and patch tools write inside the
+    workspace without asking, so a product that relies on this must not run
+    Codex (Annealage Loom refuses it).
+``cli_command``
+    How the human starts the product, as a hint in refusals ("annealage-mesh";
+    Loom: "loom-review --design <id>"). ``None`` (the default) is
+    ``distribution``. Read through ``run_command``; the workspace-trust
+    refusal appends ``--trust-project-config`` to it.
+``doctor_command``
+    The command that reports what this machine has, offered when a backend
+    CLI fails to start. ``None`` (the default) is ``<distribution> doctor``;
+    ``""`` says the product has none, and the hint is left out. Read through
+    ``doctor_hint``.
+``codex_install_hint``
+    How to install the Codex extra, offered when it is missing. ``None`` (the
+    default) is ``pip install <distribution>[codex]``. Read through
+    ``codex_install``.
+``session_context``
+    ``session_context(bus, serve_dir) -> str | None``: a short text the
+    agent's session is started with as an addition to its system prompt
+    (what the run is about: Loom names the design under review and the skills
+    to use). Called once per agent-mode session by ``launch.build_session``,
+    after the tool server exists (``bus.tools``, ``bus.review_store``). Every
+    backend takes it: Claude as its system prompt (the SDK's default one is
+    empty), Codex as the thread's developer instructions, omp through
+    ``--append-system-prompt``. ``None`` (the default) adds nothing.
 ``codex_bridge_module``
     The module Codex launches as the stdio MCP bridge. Defaults to the agent
     layer's own bridge, which is the only one that speaks its ``/mcp``
@@ -142,7 +180,12 @@ class Product:
     events: Tuple[type, ...] = ()
     inbound_frames: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     upload_kinds: Tuple[str, ...] = ()
+    write_protected: Tuple[str, ...] = ()
     codex_bridge_module: str = CODEX_BRIDGE_MODULE
+    cli_command: Optional[str] = None
+    doctor_command: Optional[str] = None
+    codex_install_hint: Optional[str] = None
+    session_context: Optional[Callable[..., Any]] = None
 
     @property
     def server_header(self):
@@ -154,14 +197,33 @@ class Product:
         """The diagnostics key the product's version is reported under."""
         return "%s_version" % self.name
 
+    @property
+    def run_command(self):
+        """How the human starts the product (``cli_command``)."""
+        return self.cli_command if self.cli_command is not None else self.distribution
+
+    @property
+    def doctor_hint(self):
+        """The doctor command, or ``None`` for a product that has none."""
+        if self.doctor_command is None:
+            return "%s doctor" % self.distribution
+        return self.doctor_command or None
+
+    @property
+    def codex_install(self):
+        """How to install the Codex extra."""
+        if self.codex_install_hint is not None:
+            return self.codex_install_hint
+        return "pip install %s[codex]" % self.distribution
+
 
 _installed = None
 
 
 def install(product):
     """Make ``product`` the one this process runs as, and register its
-    settings keys, event kinds and inbound frame types (its upload kinds are
-    checked, and read off it by the upload route).
+    settings keys, event kinds and inbound frame types (its upload kinds and
+    write-protected patterns are checked, and read off it where they apply).
 
     Installing the product already installed is a no-op, so every entry point
     of a product may install it without coordinating which one runs first.
@@ -181,16 +243,18 @@ def install(product):
     # this module's own top level would make the two import each other.
     from . import protocol, settings
     from .http import routes_chat
-    from .session import base
+    from .session import base, secret_paths
 
     # Each registration validates before it changes anything, and they are
     # checked in an order that leaves nothing half-registered if a later one
-    # refuses: all are validated first, then all applied. Upload kinds need no
-    # applying: the upload route reads them off the installed product.
+    # refuses: all are validated first, then all applied. Upload kinds and
+    # write-protected patterns need no applying: the upload route and the
+    # session's tool-call guard read them off the installed product.
     settings.check_product_keys(product.settings_keys)
     protocol.check_product_frames(product.inbound_frames)
     base.check_product_events(product.events)
     routes_chat.check_product_upload_kinds(product.upload_kinds)
+    secret_paths.check_write_protected(product.write_protected)
     settings.register_product_keys(product.settings_keys)
     protocol.register_product_frames(product.inbound_frames)
     base.register_product_events(product.events)

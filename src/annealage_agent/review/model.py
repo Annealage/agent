@@ -106,6 +106,9 @@ class Capabilities:
     ``human_adds_via_api``: the page adds a human comment one at a time
     through ``POST /review``, rather than through a flow of the product's own
     (Mesh's pins are drafts in the page until the human submits them all).
+    ``human_sets_status``: the page resolves or reopens any comment through
+    ``POST /review/<id>``, which is how the human says a resolved comment was
+    not addressed after all (a model reading the list sees it open again).
     ``max_open_model_callouts``: how many open callouts the model may have at
     once, ``None`` for no limit. Every one is a marker the human has to read,
     so a model that pins a note per feature makes the page unusable.
@@ -114,6 +117,7 @@ class Capabilities:
     can_resolve: bool = False
     can_delete_own: bool = False
     human_adds_via_api: bool = False
+    human_sets_status: bool = False
     max_open_model_callouts: Optional[int] = None
 
     def to_wire(self):
@@ -255,6 +259,15 @@ class ReviewStore:
             "this review keeps no status, so comments cannot be resolved; say what "
             "you changed instead"
         )
+
+    def reopen_comment(self, comment_id):
+        """Mark ``comment_id`` open again and return ``Written``. The human's
+        operation (``POST /review/<id>``), never a tool's: it says a resolved
+        comment was not addressed after all. A resolution already recorded is
+        kept, so the model reading the list can tell a comment reopened after
+        it resolved it from one never resolved. Reopening an open comment
+        changes nothing."""
+        raise ReviewError("this review keeps no status, so comments cannot be reopened")
 
     def delete_callout(self, comment_id):
         """Delete the model's own callout ``comment_id`` and return

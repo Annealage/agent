@@ -862,6 +862,37 @@ async def test_the_secret_path_hook_is_installed_even_with_no_accepted_digest(
         await session.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.filterwarnings("ignore::claude_agent_sdk.CanUseToolShadowedWarning")
+async def test_the_hook_refuses_writing_a_file_the_product_protects(
+    tmp_path, monkeypatch, swap_product
+):
+    """``Product.write_protected`` is enforced by the same hook as the
+    credential list, so the agent's own Edit and Bash cannot change a file only
+    the product's tools may write (a review file), while Read still reads it."""
+    import dataclasses
+
+    from toy_product import TOY
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    swap_product(dataclasses.replace(TOY, write_protected=("reviews/*.review.json",)))
+    session, _transport, _recorder = await _started_session()
+
+    async def decision(tool_name, tool_input):
+        result = await session._guard_secret_paths(
+            {"tool_name": tool_name, "tool_input": tool_input}, "tu_1", None
+        )
+        return result.get("hookSpecificOutput", {}).get("permissionDecision")
+
+    try:
+        assert await decision("Edit", {"file_path": "reviews/a.review.json"}) == "deny"
+        assert await decision("Bash", {"command": "sed -i s/x/y/ reviews/a.review.json"}) == "deny"
+        assert await decision("Read", {"file_path": "reviews/a.review.json"}) is None
+        assert await decision("Edit", {"file_path": "reviews/a.sketch.json"}) is None
+    finally:
+        await session.close()
+
+
 # ---------------------------------------------------------------------------
 # _to_claude_result / _session_rule: the one Claude-specific adapter that
 # maps session/permissions.py's provider-neutral ``Decision`` onto the
@@ -951,3 +982,61 @@ def test_launch_builds_the_claude_session_with_the_tool_servers_pre_allowed_list
     assert allowed == EXPECTED_PRE_ALLOWED_TOOLS
     for name in EXPECTED_NEVER_PRE_ALLOWED:
         assert name not in allowed
+
+
+def test_the_product_s_session_context_reaches_each_backend(tmp_path, swap_product):
+    """``Product.session_context`` is what the run is about (Loom: the design
+    under review). ``launch.py`` calls it once and every backend is started
+    with it: Claude's system prompt, Codex's developer instructions, omp's
+    appended system prompt. A product with none leaves Claude's prompt at the
+    SDK's empty default."""
+    import dataclasses
+    from types import SimpleNamespace
+
+    from toy_product import TOY
+
+    from annealage_agent import launch, sessions
+    from annealage_agent import settings as settings_module
+
+    seen = []
+
+    def context(bus, serve_dir):
+        seen.append(serve_dir)
+        return "You are reviewing design demo."
+
+    session_id = sessions.create_session(tmp_path)
+
+    def build(backend):
+        bus = SimpleNamespace(
+            tools=build_toy_tools(SimpleNamespace(paused=False), tmp_path, session_id),
+            broker=None,
+            url="http://127.0.0.1:8765/",
+        )
+        return launch.build_session(
+            backend,
+            lambda event: None,
+            bus=bus,
+            serve_dir=tmp_path,
+            session_id=session_id,
+            resumed=False,
+            settings=settings_module.resolve(tmp_path),
+            mcp_host="127.0.0.1",
+            mcp_port=8765,
+            agent_token="agent",
+        )
+
+    assert build("claude")._build_options().system_prompt is None
+    swap_product(dataclasses.replace(TOY, session_context=context))
+    assert build("claude")._build_options().system_prompt == "You are reviewing design demo."
+    assert build("codex")._instructions == "You are reviewing design demo."
+    captured = {}
+
+    def omp_client(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("no omp here")
+
+    omp = build("omp")
+    omp._client_factory = omp_client
+    asyncio.run(omp.start())
+    assert captured["append_system_prompt"] == "You are reviewing design demo."
+    assert seen == [tmp_path] * 3

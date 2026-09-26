@@ -150,6 +150,7 @@ def create_app(
     settings=None,
     login=None,
     review_store=None,
+    external_agents=False,
 ):
     """Build a Microdot app serving ``serve_dir``, routes registered, not started.
 
@@ -194,6 +195,16 @@ def create_app(
     once), and ``app.agent_review_watcher`` is the ``ReviewWatcher`` that
     ``serve`` runs beside the server to publish ``review_changed``.
 
+    ``external_agents`` serves ``/mcp`` in viewer-only mode too, for an agent
+    in another process (attached through the stdio bridge with
+    ``agent_token``): the product's tools are built anyway, and the session
+    the app runs with is an ``ExternalAgentSession`` (``session/external.py``)
+    owning the ``PermissionBroker`` that puts that agent's write-grade calls
+    in front of the human as permission cards. In agent mode ``/mcp`` is
+    served beside the embedded agent whatever this says. A viewer-only run
+    that sets it imports the agent SDK, which the product's tools are
+    declared with.
+
     ``settings`` is the ``settings.Resolved`` this run started with, which
     the CLI builds because only it knows which flags were given. Passing
     ``None`` resolves the file and default layers here instead, so a caller
@@ -213,10 +224,10 @@ def create_app(
     allowed_hosts = net.allowed_hosts(bind, port)
     installed = product.current()
     server_header = installed.server_header
-    if session_id is not None and installed.build_tools is None:
+    if (session_id is not None or external_agents) and installed.build_tools is None:
         raise RuntimeError(
-            "%s has no tool builder (Product.build_tools), so an agent-mode app "
-            "cannot be built for it" % installed.distribution
+            "%s has no tool builder (Product.build_tools), so an app serving its "
+            "tools to an agent cannot be built for it" % installed.distribution
         )
 
     app = Microdot()
@@ -313,7 +324,7 @@ def create_app(
     # for the tools, the routes and the watcher is what makes a tool's write
     # notify the watcher directly rather than wait for its next sample.
     bus.review_store = review_store
-    if session_id is not None:
+    if session_id is not None or external_agents:
         tools = installed.build_tools(bus, serve_dir, session_id)
     # ``bus`` is the one object both this function and the CLI's
     # ``build_session`` closure already share, so it doubles as the wiring
@@ -370,6 +381,23 @@ def create_app(
     if build_session is not None:
         session = build_session(_event_publisher(registry, event_log, session_info), bus=bus)
     app.agent_session = session
+    if session is None and external_agents:
+        # Imported here, like the backends' own sessions: a product that never
+        # asks for this pays nothing for it.
+        from .session.external import ExternalAgentSession
+        from .session.permissions import PermissionBroker
+
+        publish = _event_publisher(registry, event_log, session_info)
+        # The broker a real session's factory would have built (launch.py),
+        # over the same grants file, and set on the bus for the same reason:
+        # /mcp below and a review tool that asks the human read it there.
+        bus.broker = PermissionBroker(
+            publish,
+            permissions_path=sessions.state_dir(serve_dir) / "permissions.toml",
+            viewer_url=bus.url,
+            never_remembered=tools.never_remembered,
+        )
+        session = app.agent_session = ExternalAgentSession(publish, bus.broker)
     if session is not None:
         # Both of these read the session, so both are inside this guard: a
         # factory returning None is the ordinary viewer-only case, not a

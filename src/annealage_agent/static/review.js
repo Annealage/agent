@@ -33,7 +33,10 @@
  *
  * `add(anchor, text)` posts one of the human's comments, for a product whose
  * review takes them one at a time (`capabilities.human_adds_via_api`), and
- * resolves to `{ok, comment}` or `{ok: false, error}`.
+ * resolves to `{ok, comment}` or `{ok: false, error}`. `setStatus(id,
+ * status)` resolves ("resolved") or reopens ("open") any comment, for a
+ * review whose page does that (`capabilities.human_sets_status`), and
+ * resolves the same way.
  */
 
 import { authToken } from "./ws.js";
@@ -102,14 +105,17 @@ export function initReview({ onChange = () => {}, onError = () => {}, pollMs = P
     pollTimer = null;
   }
 
-  async function add(anchor, text) {
+  // One POST to the review, answered with `{ok, comment}` or `{ok: false,
+  // error}`; a success refetches at once rather than wait for this page's own
+  // copy of the review_changed the server announces to every page.
+  async function post(url, payload, what) {
     let res;
     let body = null;
     try {
-      res = await fetch(reviewUrl(), {
+      res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ anchor, text }),
+        body: JSON.stringify(payload),
       });
       body = await res.json();
     } catch (err) {
@@ -119,13 +125,21 @@ export function initReview({ onChange = () => {}, onError = () => {}, pollMs = P
       const status = res ? res.status : "no answer";
       return {
         ok: false,
-        error: (body && body.error) || "the comment was not saved (" + status + ")",
+        error: (body && body.error) || what + " (" + status + ")",
       };
     }
-    // The server announces the change to every page with review_changed;
-    // this page refetches at once rather than wait for its own copy.
     refetch();
     return { ok: true, comment: body.comment };
+  }
+
+  function add(anchor, text) {
+    return post(reviewUrl(), { anchor, text }, "the comment was not saved");
+  }
+
+  function setStatus(id, status) {
+    const url =
+      "/review/" + encodeURIComponent(id) + "?t=" + encodeURIComponent(authToken());
+    return post(url, { status }, "the comment's status was not changed");
   }
 
   // Unconditional, so the first paint of the review never waits for the
@@ -141,6 +155,7 @@ export function initReview({ onChange = () => {}, onError = () => {}, pollMs = P
     onFallback: startPoll,
     refetch,
     add,
+    setStatus,
     comments: () => comments,
     capabilities: () => capabilities,
   };

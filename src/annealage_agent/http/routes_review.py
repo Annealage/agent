@@ -2,41 +2,49 @@
 
 Registers, whether or not the product keeps a review:
 
-    GET  /review    every comment in the product-neutral shape
-                    (``Comment.to_wire``), with the store's capabilities and
-                    anchor space name
-    POST /review    add one of the human's comments, ``{"anchor": {...},
-                    "text": "..."}``, when the store's capabilities say the
-                    page adds them this way (``human_adds_via_api``)
+    GET  /review         every comment in the product-neutral shape
+                         (``Comment.to_wire``), with the store's capabilities
+                         and anchor space name
+    POST /review         add one of the human's comments, ``{"anchor": {...},
+                         "text": "..."}``, when the store's capabilities say
+                         the page adds them this way (``human_adds_via_api``)
+    POST /review/<id>    set comment ``id``'s status, ``{"status": "open"}``
+                         to reopen it or ``{"status": "resolved"}`` to
+                         resolve it, when the capabilities say the page does
+                         (``human_sets_status``)
 
-Both require the browser token and a permitted ``Origin``, and refuse with the
-same opaque response ``/ws`` returns, so neither tells an unauthenticated
+All three require the browser token and a permitted ``Origin``, and refuse with
+the same opaque response ``/ws`` returns, so none tells an unauthenticated
 caller which check it failed. The review is the human's words about their
 project, so it is not readable without the token either, unlike a product's
 own file routes (Mesh's ``/callouts``) whose contract predates this one.
 
-A product with no review store still has both routes, answering 404: the
+A product with no review store still has the routes, answering 404: the
 route list is the agent layer's own, the same for every product, which is also
 what lets the page client name ``/review`` without naming a product route.
 
 A POST changes nothing but the store: the store notifies its listeners, the
 app's ``ReviewWatcher`` publishes ``review_changed``, and every page, the one
 that posted included, refetches through ``GET``. The POST's own answer carries
-the new comment so the page that posted it can show it before that.
+the comment as it now stands so the page that posted it can show it before
+that. Setting a status is the human's own act, on any comment, and asks
+nobody: the approval a model needs to resolve a human's comment exists
+because the review is the human's, which is also why the human needs none.
 """
 
 import asyncio
 import functools
 
 from .. import product
-from ..review.model import HUMAN, ReviewError
+from ..review.model import HUMAN, OPEN, RESOLVED, ReviewError
 from . import read_json_body
 from .ws import _origin_is_allowed, _token_is_allowed, refusal
 
 
 def register_review_routes(app, *, store, token, allowed_origins=()):
-    """Register ``GET`` and ``POST /review`` on ``app`` over ``store`` (a
-    ``ReviewStore``, or ``None`` when the product keeps no review)."""
+    """Register ``GET`` and ``POST /review`` and ``POST /review/<id>`` on
+    ``app`` over ``store`` (a ``ReviewStore``, or ``None`` when the product
+    keeps no review)."""
 
     def _no_review():
         return {
@@ -102,6 +110,39 @@ def register_review_routes(app, *, store, token, allowed_origins=()):
                 None,
                 functools.partial(store.add_comment, anchor=anchor, text=text, author=HUMAN),
             )
+        except ReviewError as exc:
+            return {"ok": False, "error": str(exc)}, 400
+        return {"ok": True, "comment": written.comment.to_wire()}, 200
+
+    @app.post("/review/<int:comment_id>")
+    async def set_review_status(req, comment_id):
+        if not _token_is_allowed(req, token):
+            return refusal()
+        if not _origin_is_allowed(req, allowed_origins):
+            return refusal()
+        if store is None:
+            return _no_review()
+        if not store.capabilities.human_sets_status:
+            return {
+                "ok": False,
+                "error": "%s's review does not let the page change a comment's status"
+                % product.current().title,
+            }, 405
+        data, error = await read_json_body(req)
+        if error is not None:
+            return error
+        if not isinstance(data, dict) or set(data) != {"status"}:
+            return {"ok": False, "error": 'body must be {"status": "open" or "resolved"}'}, 400
+        status = data["status"]
+        if status == OPEN:
+            change = functools.partial(store.reopen_comment, comment_id)
+        elif status == RESOLVED:
+            change = functools.partial(store.resolve_comment, comment_id)
+        else:
+            return {"ok": False, "error": 'status must be "open" or "resolved"'}, 400
+        loop = asyncio.get_running_loop()
+        try:
+            written = await loop.run_in_executor(None, change)
         except ReviewError as exc:
             return {"ok": False, "error": str(exc)}, 400
         return {"ok": True, "comment": written.comment.to_wire()}, 200

@@ -13,7 +13,7 @@ optional dependencies, and nothing here is imported at all by a viewer-only
 run.
 """
 
-from . import sessions
+from . import product, sessions
 from . import settings as settings_module
 
 
@@ -94,6 +94,11 @@ def build_session(
     # created session has no backend id to resume yet.
     resume = _resumable_sdk_id(serve_dir, session_id) if resumed else None
 
+    # What the product says this run is about (Product.session_context), added
+    # to the backend's system prompt; None adds nothing.
+    context_hook = product.current().session_context
+    instructions = context_hook(bus, serve_dir) if context_hook is not None else None
+
     if backend == "codex":
         # Imported only in this branch, per the module docstring's own
         # "keep the claude backend free of an unnecessary dependency
@@ -118,6 +123,7 @@ def build_session(
             mcp_host=mcp_host,
             mcp_port=mcp_port,
             mcp_token=agent_token,
+            instructions=instructions,
         )
 
     if backend == "omp":
@@ -141,6 +147,7 @@ def build_session(
             # reference to the tool server this run already built.
             tool_table=bus.tools.tool_table(),
             on_sdk_session_id=_record_sdk_id,
+            instructions=instructions,
         )
 
     from .session.sdk import SdkSession
@@ -166,4 +173,5 @@ def build_session(
         # What the CLI's trust gate accepted, so the session can refuse tool
         # calls if it stops being true while the run is in progress.
         trusted_config_digest=trusted_config_digest,
+        instructions=instructions,
     )

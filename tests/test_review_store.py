@@ -306,6 +306,32 @@ def test_a_human_s_comment_is_never_deleted(store, tmp_path):
     assert _file(tmp_path).read_bytes() == before
 
 
+def test_a_store_configured_to_keep_callouts_refuses_to_delete_one(tmp_path):
+    """``can_delete_own=False`` is a product keeping answered callouts as a
+    record: the capability says so (so no delete tool is built) and the store
+    refuses the operation itself."""
+    store = toy_review_store(tmp_path, can_delete_own=False)
+    assert store.capabilities.can_delete_own is False
+    _add(store)
+    with pytest.raises(ReviewError, match="resolve one rather than delete"):
+        store.delete_callout(1)
+    assert store.get_comment(1).status == "open"
+
+
+def test_reopening_keeps_the_resolution_and_reopening_an_open_comment_changes_nothing(
+    store, tmp_path
+):
+    _add(store, author="human")
+    store.resolve_comment(1, "widened the wall")
+    written = store.reopen_comment(1)
+    assert (written.comment.status, written.comment.resolution) == ("open", "widened the wall")
+    before = _file(tmp_path).read_bytes()
+    assert store.reopen_comment(1).comment.status == "open"
+    assert _file(tmp_path).read_bytes() == before
+    resolved = store.resolve_comment(1)
+    assert resolved.comment.resolution == "widened the wall", "no new note keeps the old one"
+
+
 def test_the_open_callout_limit_counts_only_the_model_s_open_callouts(tmp_path):
     store = toy_review_store(tmp_path, max_open_model_callouts=2)
     _add(store)

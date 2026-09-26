@@ -204,6 +204,7 @@ class SdkSession:
         transport=None,
         on_sdk_session_id=None,
         trusted_config_digest=None,
+        instructions=None,
     ):
         self._on_event = on_event
         self.cwd = str(cwd)
@@ -224,6 +225,10 @@ class SdkSession:
         # that drive this class directly, and installs no tripwire.
         self._trusted_config_digest = trusted_config_digest
         self._config_change_reported = False
+        # The product's session context (Product.session_context). The SDK's
+        # default system prompt is empty (it passes --system-prompt ""), so
+        # this becomes the whole of it, and a session with none keeps that.
+        self._instructions = instructions or None
 
         self._status = AGENT_CONNECTING
         self._client = None
@@ -464,6 +469,8 @@ class SdkSession:
             kwargs["can_use_tool"] = self._can_use_tool
         if self._model:
             kwargs["model"] = self._model
+        if self._instructions:
+            kwargs["system_prompt"] = self._instructions
         if self._effort:
             # How much thinking the model does per turn. Passed only when set,
             # so the CLI's own configured default stands otherwise.
@@ -543,7 +550,8 @@ class SdkSession:
         }
 
     async def _guard_secret_paths(self, hook_input, tool_use_id, context) -> dict:
-        """Refuse a call that reaches for this machine's credentials.
+        """Refuse a call that reaches for this machine's credentials, or that
+        writes a file the product protects (``Product.write_protected``).
 
         Installed in the same ``PreToolUse`` matcher as the configuration
         tripwire and kept separate from it, because the two answer different
@@ -551,24 +559,26 @@ class SdkSession:
         human accepted, this one asks what a single call is reaching for. Either
         can deny on its own.
 
-        The reasoning for the list, and the honest limit of what the ``Bash``
-        half of it covers, is in ``session/secret_paths.py``. A failure to
+        The reasoning for both lists, and the honest limit of what the ``Bash``
+        half of each covers, is in ``session/secret_paths.py``. A failure to
         decide denies, for the same reason the digest check does: a control that
         cannot tell whether a call is safe has to assume it is not.
         """
+        tool_name = hook_input.get("tool_name", "")
+        tool_input = hook_input.get("tool_input") or {}
         try:
             reason = secret_paths.refusal(
-                hook_input.get("tool_name", ""),
-                hook_input.get("tool_input") or {},
-                self.cwd,
+                tool_name, tool_input, self.cwd
+            ) or secret_paths.protected_refusal(
+                tool_name, tool_input, self.cwd, product.current().write_protected
             )
         except Exception as exc:
             sys.stderr.write("warning: could not check the call's paths: %r\n" % (exc,))
             reason = (
                 "Refused: %s could not determine whether that call reaches a "
-                "credential path, so it refused rather than guessing. Tell the "
-                "human; this is a bug in %s rather than anything you did."
-                % (product.current().name, product.current().name)
+                "credential path or a protected file, so it refused rather than "
+                "guessing. Tell the human; this is a bug in %s rather than anything "
+                "you did." % (product.current().name, product.current().name)
             )
         if reason is None:
             return {}
@@ -952,9 +962,8 @@ def _remediation_for(exc: BaseException) -> str:
             "distribution, and claude needs to be on PATH"
         )
     if name == "CLIConnectionError":
-        return (
-            "the claude CLI could not be started or lost its connection; run "
-            "%s doctor, and check that it is authenticated" % product.current().distribution
+        return "the claude CLI could not be started or lost its connection; %s" % (
+            _doctor_then("check that it is authenticated")
         )
     if name == "CLIJSONDecodeError":
         return (
@@ -962,3 +971,10 @@ def _remediation_for(exc: BaseException) -> str:
             "usually means a version mismatch; check the pinned SDK range"
         )
     return "the agent is unavailable; the captured output above is what it reported"
+
+
+def _doctor_then(advice):
+    """``advice``, after "run <doctor>, and" when the product has a doctor
+    command (``Product.doctor_hint``)."""
+    doctor = product.current().doctor_hint
+    return "run %s, and %s" % (doctor, advice) if doctor else advice

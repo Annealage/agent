@@ -167,6 +167,7 @@ class CodexSession:
         mcp_host: Optional[str] = None,
         mcp_port: Optional[int] = None,
         mcp_token: Optional[str] = None,
+        instructions: Optional[str] = None,
     ):
         self._on_event = on_event
         self.cwd = str(cwd)
@@ -192,6 +193,9 @@ class CodexSession:
         self._mcp_host = mcp_host
         self._mcp_port = mcp_port
         self._mcp_token = mcp_token
+        # The product's session context (Product.session_context), given to
+        # the thread as its developer instructions.
+        self._instructions = instructions or None
 
         self._status = AGENT_CONNECTING
         self._client = None
@@ -617,6 +621,7 @@ class CodexSession:
                         approval_policy=approval_policy,
                         approvals_reviewer=ApprovalsReviewer.user,
                         sandbox=SandboxMode.workspace_write,
+                        developer_instructions=self._instructions,
                     ),
                 )
                 return resumed.thread.id
@@ -635,6 +640,7 @@ class CodexSession:
                 approval_policy=approval_policy,
                 approvals_reviewer=ApprovalsReviewer.user,
                 sandbox=SandboxMode.workspace_write,
+                developer_instructions=self._instructions,
             ),
         )
         return started.thread.id
@@ -1012,14 +1018,14 @@ def _remediation_for(exc: BaseException) -> str:
     if name == "FileNotFoundError":
         return (
             "the bundled codex runtime could not be located; reinstall with the "
-            "codex extra (`uv sync --extra codex`, or `pip install "
-            "%s[codex]`), or set CodexConfig.codex_bin explicitly" % product.current().distribution
+            "codex extra (`uv sync --extra codex`, or `%s`), or set "
+            "CodexConfig.codex_bin explicitly" % product.current().codex_install
         )
     if name == "TransportClosedError":
-        return (
-            "the codex app-server exited or closed its connection; run "
-            "%s doctor, and check that it is authenticated "
-            "(run `codex login`)" % product.current().distribution
+        doctor = product.current().doctor_hint
+        return "the codex app-server exited or closed its connection; %s" % (
+            ("run %s, and " % doctor if doctor else "")
+            + "check that it is authenticated (run `codex login`)"
         )
     if name in ("InvalidRequestError", "InvalidParamsError", "MethodNotFoundError"):
         return (

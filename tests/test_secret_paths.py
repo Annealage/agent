@@ -298,3 +298,109 @@ def test_the_list_is_read_at_call_time_rather_than_cached(tmp_path, monkeypatch,
         secret_paths.refusal("Read", {"file_path": str(second / ".ssh" / "k")}, project) is not None
     )
     assert secret_paths.refusal("Read", {"file_path": str(first / ".ssh" / "k")}, project) is None
+
+
+# --- write-protected files (Product.write_protected) -------------------------
+#
+# A product names files only its own tools may write (Loom: its review files).
+# The file tools that only read may still read one; everything else naming one
+# is refused, and so is a command that names one.
+
+PROTECTED = ("reviews/*.review.json",)
+
+
+@pytest.mark.parametrize("tool", ["Write", "Edit", "MultiEdit", "NotebookEdit", "SomeFutureTool"])
+def test_a_tool_that_may_write_a_protected_file_is_refused(project, tool):
+    reason = secret_paths.protected_refusal(
+        tool, {"file_path": "reviews/a.review.json"}, project, PROTECTED
+    )
+    assert reason is not None
+    assert "reviews/*.review.json" in reason
+
+
+@pytest.mark.parametrize("tool", secret_paths.READ_ONLY_TOOLS)
+def test_reading_a_protected_file_is_allowed(project, tool):
+    assert (
+        secret_paths.protected_refusal(
+            tool, {"file_path": "reviews/a.review.json"}, project, PROTECTED
+        )
+        is None
+    )
+
+
+def test_a_protected_file_is_matched_by_its_resolved_path(project):
+    """Absolute, climbing and differently cased spellings of the one file, and a
+    symlink elsewhere in the project that points at it, all name it."""
+    (project / "reviews").mkdir()
+    target = project / "reviews" / "a.review.json"
+    target.write_text("{}", encoding="utf-8")
+    (project / "innocent.txt").symlink_to(target)
+    for spelling in (
+        str(target),
+        "reviews/../reviews/a.review.json",
+        "Reviews/A.Review.JSON",
+        "innocent.txt",
+    ):
+        assert (
+            secret_paths.protected_refusal("Write", {"file_path": spelling}, project, PROTECTED)
+            is not None
+        ), spelling
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "reviews/a.sketch.json",  # beside a protected file
+        "a.review.json",  # the name, outside the protected directory
+        "reviews/deeper/a.review.json",  # "*" does not cross a "/"
+        "../reviews/a.review.json",  # the pattern is relative to the served directory
+    ],
+)
+def test_files_the_patterns_do_not_name_are_not_refused(project, path):
+    assert secret_paths.protected_refusal("Write", {"file_path": path}, project, PROTECTED) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sed -i s/open/resolved/ reviews/a.review.json",
+        "echo '{}' > reviews/a.review.json",
+        "cd reviews && python -c \"open('a.review.json', 'w')\"",
+        "sed -i s/open/resolved/ reviews/*.review.json",
+        "cat reviews/a.review.json",  # its text cannot say it only reads
+    ],
+)
+def test_a_command_naming_a_protected_file_is_refused(project, command):
+    assert (
+        secret_paths.protected_refusal("Bash", {"command": command}, project, PROTECTED) is not None
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "loom-sketch build reviews/a.sketch.json",
+        "grep -rn review.json src",
+        "git status",
+        # The documented limit: a broader glob, or a name built at run time.
+        "sed -i s/open/resolved/ reviews/*.json",
+        "f=review; sed -i s/open/resolved/ reviews/a.$f.json",
+    ],
+)
+def test_commands_that_do_not_spell_a_protected_name_are_not_refused(project, command):
+    assert secret_paths.protected_refusal("Bash", {"command": command}, project, PROTECTED) is None
+
+
+def test_a_product_that_protects_nothing_refuses_nothing(project):
+    assert (
+        secret_paths.protected_refusal("Write", {"file_path": "x.review.json"}, project, ()) is None
+    )
+
+
+@pytest.mark.parametrize(
+    "patterns",
+    ["reviews/*.json", ("/abs/*.json",), ("../out/*.json",), ("a//b",), ("a\\b",), ("",), (1,)],
+)
+def test_a_pattern_that_cannot_be_enforced_is_refused_at_install(patterns):
+    with pytest.raises(ValueError):
+        secret_paths.check_write_protected(patterns)

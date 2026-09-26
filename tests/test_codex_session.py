@@ -817,3 +817,17 @@ async def test_start_threads_config_overrides_through_to_codex_config():
         assert not any("ttt" in entry for entry in captured["config"].config_overrides)
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_the_session_context_is_the_thread_s_developer_instructions():
+    session, fake, recorder, broker = await _started_session(instructions="Review design demo.")
+    try:
+        assert fake.thread_start_params.developer_instructions == "Review design demo."
+    finally:
+        await session.close()
+    plain, fake, recorder, broker = await _started_session()
+    try:
+        assert fake.thread_start_params.developer_instructions is None
+    finally:
+        await plain.close()

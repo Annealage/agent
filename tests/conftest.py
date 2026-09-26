@@ -55,6 +55,7 @@ def create_toy_app(
     settings=None,
     login=None,
     review_store=None,
+    external_agents=False,
 ):
     """The toy product's app over ``serve_dir``: ``agent_app.create_app`` with
     the toy page, whose inline script the Content-Security-Policy hashes, and
@@ -73,6 +74,7 @@ def create_toy_app(
         settings=settings,
         login=login,
         review_store=review_store,
+        external_agents=external_agents,
     )
 
 

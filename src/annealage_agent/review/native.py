@@ -42,13 +42,22 @@ version 1 file is refused with a message that says so, rather than misread.
   checkout`` or an external agent's direct write is seen by the next call.
 - Every write replaces the file atomically (``files.atomic_replace``), under
   ``file_lock`` so two writers in this process cannot lose each other's
-  comment or hand out one id twice.
+  comment or hand out one id twice. **The lock is per process**: two
+  processes serving one file (two ``loom-review`` runs of one design, or a
+  separately running agent editing the file directly) can still race, so one
+  writer's change can replace the other's. The atomic replace keeps that to a
+  lost change, never a corrupt file; running one server per review file is
+  what rules it out.
 - Ids are never reused: ``next_id`` only grows, so deleting the newest
   comment does not free its number, and a reply naming #4 cannot land on a
   different comment.
 - A file that exists but does not parse, does not have this shape, or is not
   a plain single-linked file is refused, and never overwritten: it holds a
   human's words, and fixing it is theirs to do.
+- A comment the human reopens (``reopen_comment``) keeps the ``resolution``
+  it was resolved with, so it reads as "resolved once, then reopened" rather
+  than as never addressed; resolving it again replaces the note, and
+  resolving with no note keeps the one it has.
 """
 
 import dataclasses
@@ -86,19 +95,29 @@ _RECORD_KEYS = ("id", "anchor", "ref", "text", "author", "status", "resolution")
 
 class JsonReviewStore(ReviewStore):
     """The native store over the file at ``path``, anchors checked by
-    ``anchor_space``. It supports every operation: comments carry a status and
-    resolve, the model deletes its own callouts, the page adds the human's
-    comments through ``POST /review``, and the model may hold at most
-    ``max_open_model_callouts`` open callouts (``None``: no limit)."""
+    ``anchor_space``. Comments carry a status: the model resolves them, the
+    page adds the human's comments through ``POST /review`` and resolves or
+    reopens any comment through ``POST /review/<id>``. The product configures
+    the rest: ``max_open_model_callouts`` (``None``: no limit) and
+    ``can_delete_own``, whether the model may delete its own callouts (off
+    for a product that keeps answered callouts as a record, resolved)."""
 
-    def __init__(self, path, anchor_space, *, max_open_model_callouts=DEFAULT_MAX_OPEN_CALLOUTS):
+    def __init__(
+        self,
+        path,
+        anchor_space,
+        *,
+        max_open_model_callouts=DEFAULT_MAX_OPEN_CALLOUTS,
+        can_delete_own=True,
+    ):
         super().__init__()
         self.path = Path(path)
         self.anchor_space = anchor_space
         self.capabilities = Capabilities(
             can_resolve=True,
-            can_delete_own=True,
+            can_delete_own=can_delete_own,
             human_adds_via_api=True,
+            human_sets_status=True,
             max_open_model_callouts=max_open_model_callouts,
         )
 
@@ -237,11 +256,20 @@ class JsonReviewStore(ReviewStore):
     def resolve_comment(self, comment_id, resolution=None):
         if isinstance(resolution, str):
             resolution = resolution.strip() or None
+        return self._set_status(comment_id, RESOLVED, resolution)
+
+    def reopen_comment(self, comment_id):
+        return self._set_status(comment_id, OPEN, None)
+
+    def _set_status(self, comment_id, status, resolution):
+        """``comment_id`` with ``status``, and ``resolution`` when one is
+        given (the one it has otherwise); nothing is written when the status
+        is already that."""
         with file_lock(self.path):
             document, next_id, comments = self._load()
             index = self._index(comments, comment_id)
             comment = comments[index]
-            if comment.status == RESOLVED:
+            if comment.status == status:
                 return Written(comment, _count(comments, comment.author))
             comment = _comment(
                 comment.id,
@@ -249,8 +277,8 @@ class JsonReviewStore(ReviewStore):
                 comment.text,
                 comment.author,
                 comment.ref,
-                RESOLVED,
-                resolution,
+                status,
+                resolution if resolution is not None else comment.resolution,
                 comment.extra,
             )
             comments[index] = comment
@@ -259,6 +287,10 @@ class JsonReviewStore(ReviewStore):
         return Written(comment, _count(comments, comment.author), path)
 
     def delete_callout(self, comment_id):
+        if not self.capabilities.can_delete_own:
+            raise ReviewError(
+                "this review keeps answered callouts; resolve one rather than delete it"
+            )
         with file_lock(self.path):
             document, next_id, comments = self._load()
             index = self._index(comments, comment_id)

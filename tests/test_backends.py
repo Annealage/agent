@@ -69,3 +69,22 @@ def test_a_config_file_still_saying_local_is_refused(tmp_path):
     with pytest.raises(settings.SettingsError) as exc:
         settings.resolve(tmp_path)
     assert "'omp'" in str(exc.value)
+
+
+def test_the_refusal_with_none_installed_names_all_three_exactly_by_default():
+    """The default text is the published one, word for word."""
+    with pytest.raises(backends.NoBackend) as exc:
+        backends.choose((), interactive=False)
+    assert str(exc.value).startswith(
+        "no agent backend found. Agent mode needs one of these on PATH, signed in: claude "
+        "(Claude Code), codex (OpenAI Codex CLI, plus the openai-codex package), or omp (Oh My "
+        "Pi, plus the omp-rpc package). Or run the viewer alone: "
+    )
+
+
+def test_a_product_that_refuses_a_backend_is_not_told_to_install_it():
+    with pytest.raises(backends.NoBackend) as exc:
+        backends.choose((), interactive=False, supported=("claude", "omp"))
+    message = str(exc.value)
+    assert "codex" not in message
+    assert "claude (Claude Code) or omp (Oh My Pi, plus the omp-rpc package)." in message

@@ -44,22 +44,40 @@ def _call(fn, arg):
         return None
 
 
-def choose(available, *, interactive, ask=None, write=None):
+# What each backend needs, as the refusal with none installed names it.
+_NEEDS = {
+    "claude": "claude (Claude Code)",
+    "codex": "codex (OpenAI Codex CLI, plus the openai-codex package)",
+    "omp": "omp (Oh My Pi, plus the omp-rpc package)",
+}
+
+
+def _listing(items):
+    if len(items) <= 2:
+        return " or ".join(items)
+    return "%s, or %s" % (", ".join(items[:-1]), items[-1])
+
+
+def choose(available, *, interactive, ask=None, write=None, supported=BACKENDS):
     """``(backend, save)`` for a run whose settings name no backend.
 
     One available backend is used without asking. More than one is a
     question for the person at the terminal, followed by whether to keep the
     answer; with nobody at the terminal it is an error naming the ways to
-    choose, rather than a guess.
+    choose, rather than a guess. ``supported`` is the backends the product
+    runs, which the refusal with none available names (a product that
+    refuses one passes the rest; ``available`` is the caller's to filter).
     """
     ask = ask or input
     write = write or print
     if not available:
         raise NoBackend(
             "no agent backend found. Agent mode needs one of these on PATH, "
-            "signed in: claude (Claude Code), codex (OpenAI Codex CLI, plus "
-            "the openai-codex package), or omp (Oh My Pi, plus the omp-rpc "
-            "package). Or run the viewer alone: %s" % product.current().viewer_only_command
+            "signed in: %s. Or run the viewer alone: %s"
+            % (
+                _listing([_NEEDS[name] for name in supported]),
+                product.current().viewer_only_command,
+            )
         )
     if len(available) == 1:
         return available[0], False

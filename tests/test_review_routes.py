@@ -1,6 +1,7 @@
-"""``GET`` and ``POST /review`` (``http/routes_review.py``), and the review as
-the app wires it: one store for the routes, the tools and the watcher, and
-``review_changed`` published through the app's own event log.
+"""``GET`` and ``POST /review`` and ``POST /review/<id>``
+(``http/routes_review.py``), and the review as the app wires it: one store
+for the routes, the tools and the watcher, and ``review_changed`` published
+through the app's own event log.
 
 The routes carry the human's words about their project, so they sit behind
 the browser token like every other browser route, never the agent token, and
@@ -112,6 +113,7 @@ async def test_get_serves_every_comment_in_the_product_neutral_shape(served_dir)
             "can_resolve": True,
             "can_delete_own": True,
             "human_adds_via_api": True,
+            "human_sets_status": True,
             "max_open_model_callouts": 50,
         },
         "comments": [
@@ -187,6 +189,90 @@ async def test_post_is_refused_where_the_page_adds_comments_its_own_way(served_d
     )
     assert res.status_code == 405
     assert not (served_dir / TOY_REVIEW_FILE).exists()
+
+
+def _set_status(client, comment_id, body, *, token=TOKEN):
+    return client.post(
+        "/review/%s?t=%s" % (comment_id, token),
+        headers={"Content-Type": "application/json"},
+        body=json.dumps(body),
+    )
+
+
+async def test_the_human_reopens_a_resolved_comment_and_its_resolution_is_kept(served_dir):
+    """How the human says a change did not satisfy them: the comment is open
+    again, and the note it was resolved with stays, so the model reading the
+    list sees it was resolved once and reopened."""
+    store = toy_review_store(served_dir)
+    store.add_comment(anchor=FRONT, text="thin", author="human")
+    store.resolve_comment(1, "thicker now")
+    client = make_test_client(_app(served_dir, store=store))
+
+    res = await _set_status(client, 1, {"status": "open"})
+    assert res.status_code == 200
+    assert _body(res)["comment"]["status"] == "open"
+    reopened = store.get_comment(1)
+    assert (reopened.status, reopened.resolution) == ("open", "thicker now")
+
+    res = await _set_status(client, 1, {"status": "resolved"})
+    assert res.status_code == 200
+    assert store.get_comment(1).status == "resolved"
+
+
+async def test_the_human_may_resolve_the_model_s_callout_too(served_dir):
+    store = toy_review_store(served_dir)
+    store.add_comment(anchor=FRONT, text="is this right?", author="model")
+    res = await _set_status(
+        make_test_client(_app(served_dir, store=store)), 1, {"status": "resolved"}
+    )
+    assert res.status_code == 200
+    assert store.get_comment(1).status == "resolved"
+
+
+@pytest.mark.parametrize(
+    "comment_id, body, status, fragment",
+    [
+        (1, {"status": "deleted"}, 400, "status must be"),
+        (1, {"status": "open", "text": "x"}, 400, "body must be"),
+        (9, {"status": "open"}, 400, "no comment #9"),
+    ],
+)
+async def test_a_bad_status_change_is_refused_and_changes_nothing(
+    served_dir, comment_id, body, status, fragment
+):
+    store = toy_review_store(served_dir)
+    store.add_comment(anchor=FRONT, text="thin", author="human")
+    before = (served_dir / TOY_REVIEW_FILE).read_bytes()
+    res = await _set_status(make_test_client(_app(served_dir, store=store)), comment_id, body)
+    assert res.status_code == status
+    assert fragment in _body(res)["error"]
+    assert (served_dir / TOY_REVIEW_FILE).read_bytes() == before
+
+
+async def test_a_status_change_needs_the_browser_token_not_the_agent_s(served_dir):
+    """The agent token would let the model flip the human's comment with no
+    card, which is the bypass the review's approval policy exists to close."""
+    store = toy_review_store(served_dir)
+    store.add_comment(anchor=FRONT, text="thin", author="human")
+    res = await _set_status(
+        make_test_client(_app(served_dir, store=store)),
+        1,
+        {"status": "resolved"},
+        token=AGENT_TOKEN,
+    )
+    assert res.status_code == 403
+    assert store.get_comment(1).status == "open"
+
+
+async def test_a_status_change_is_refused_where_the_store_does_not_offer_it(served_dir):
+    store = toy_review_store(served_dir)
+    store.add_comment(anchor=FRONT, text="thin", author="human")
+    store.capabilities = Capabilities(can_resolve=True, human_adds_via_api=True)
+    res = await _set_status(
+        make_test_client(_app(served_dir, store=store)), 1, {"status": "resolved"}
+    )
+    assert res.status_code == 405
+    assert store.get_comment(1).status == "open"
 
 
 # --- review_changed, as the app publishes it ---------------------------------------

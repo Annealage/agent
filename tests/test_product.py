@@ -123,6 +123,7 @@ def test_registrations_follow_the_installed_product(swap_product):
         {"upload_kinds": ("sheet\n",)},
         {"upload_kinds": ("sheet", "sheet")},
         {"upload_kinds": "draw"},
+        {"write_protected": ("../elsewhere/*.json",)},
     ],
     ids=[
         "generic-setting",
@@ -134,6 +135,7 @@ def test_registrations_follow_the_installed_product(swap_product):
         "upload-kind-trailing-newline",
         "upload-kind-twice",
         "upload-kinds-a-bare-string",
+        "write-protected-outside-the-served-directory",
     ],
 )
 def test_a_registration_that_collides_with_the_agent_layer_installs_nothing(
@@ -256,3 +258,34 @@ def test_the_toy_is_installed_again_after_a_swap():
     assert not protocol.is_product_frame("sheet")
     assert "units" in settings.KEYS_BY_NAME
     assert protocol.is_product_frame("view")
+
+
+def test_command_hints_default_to_the_distribution_and_follow_the_product(swap_product, tmp_path):
+    """Refusals name commands that exist: by default the distribution's (so
+    an existing product's text is unchanged), else the product's own, and a
+    product with no doctor command is not told to run one."""
+    from annealage_agent.session import codex, sdk, workspace_trust
+
+    class CLIConnectionError(Exception):
+        pass
+
+    class TransportClosedError(Exception):
+        pass
+
+    assert "run annealage-toy doctor, and" in sdk._remediation_for(CLIConnectionError())
+    assert "`pip install annealage-toy[codex]`" in codex._remediation_for(FileNotFoundError())
+    assert "annealage-toy --trust-project-config" in workspace_trust.refusal_message(tmp_path, ())
+
+    swap_product(
+        _other(
+            cli_command="loom-review --design <id>",
+            doctor_command="",
+            codex_install_hint="uv sync --extra codex",
+        )
+    )
+    assert "doctor" not in sdk._remediation_for(CLIConnectionError())
+    assert "doctor" not in codex._remediation_for(TransportClosedError())
+    assert "`uv sync --extra codex`" in codex._remediation_for(FileNotFoundError())
+    assert "loom-review --design <id> --trust-project-config" in workspace_trust.refusal_message(
+        tmp_path, ()
+    )

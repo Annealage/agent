@@ -513,7 +513,7 @@ def refusal_message(root, entries: Iterable[Path]) -> str:
             root,
             listed,
             why,
-            product.current().distribution,
+            product.current().run_command,
             product.current().viewer_only_command,
         )
     )
