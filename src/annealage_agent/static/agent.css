@@ -33,6 +33,9 @@
 .chathint { flex: none; padding: 0 14px 8px; color: #778; font-size: 11px; }
 
 .chatbanner { flex: none; margin: 8px 14px 0; padding: 8px 10px; border-radius: 6px; display: flex; align-items: flex-start; gap: 8px; font-size: 12px; }
+/* The display above outranks the UA sheet's [hidden] rule, and chat.js shows
+   and hides the banner with that attribute, so it has to be honoured here. */
+.chatbanner[hidden] { display: none; }
 .chatbanner[data-kind="error"] { background: #3a1e1e; border: 1px solid #5c2f2f; color: #e8a0a0; }
 .chatbanner[data-kind="reset"] { background: #3a2f1e; border: 1px solid #5c4a2f; color: #e0c07f; }
 .chatbanner[data-kind="info"] { background: #1e2f3a; border: 1px solid #2f4a5c; color: #9fc8e0; }

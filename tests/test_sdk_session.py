@@ -984,19 +984,44 @@ def test_launch_builds_the_claude_session_with_the_tool_servers_pre_allowed_list
         assert name not in allowed
 
 
+def _session_with_context(backend, tmp_path, session_id):
+    """``launch.build_session``'s session for ``backend`` over the toy's tools,
+    for the two session-context tests below."""
+    from types import SimpleNamespace
+
+    from annealage_agent import launch
+    from annealage_agent import settings as settings_module
+
+    bus = SimpleNamespace(
+        tools=build_toy_tools(SimpleNamespace(paused=False), tmp_path, session_id),
+        broker=None,
+        url="http://127.0.0.1:8765/",
+    )
+    return launch.build_session(
+        backend,
+        lambda event: None,
+        bus=bus,
+        serve_dir=tmp_path,
+        session_id=session_id,
+        resumed=False,
+        settings=settings_module.resolve(tmp_path),
+        mcp_host="127.0.0.1",
+        mcp_port=8765,
+        agent_token="agent",
+    )
+
+
 def test_the_product_s_session_context_reaches_each_backend(tmp_path, swap_product):
     """``Product.session_context`` is what the run is about (Loom: the design
     under review). ``launch.py`` calls it once and every backend is started
-    with it: Claude's system prompt, Codex's developer instructions, omp's
-    appended system prompt. A product with none leaves Claude's prompt at the
-    SDK's empty default."""
+    with it: Claude's system prompt, Codex's developer instructions (omp's,
+    which needs omp-rpc, is the next test). A product with none leaves
+    Claude's prompt at the SDK's empty default."""
     import dataclasses
-    from types import SimpleNamespace
 
     from toy_product import TOY
 
-    from annealage_agent import launch, sessions
-    from annealage_agent import settings as settings_module
+    from annealage_agent import sessions
 
     seen = []
 
@@ -1005,38 +1030,43 @@ def test_the_product_s_session_context_reaches_each_backend(tmp_path, swap_produ
         return "You are reviewing design demo."
 
     session_id = sessions.create_session(tmp_path)
-
-    def build(backend):
-        bus = SimpleNamespace(
-            tools=build_toy_tools(SimpleNamespace(paused=False), tmp_path, session_id),
-            broker=None,
-            url="http://127.0.0.1:8765/",
-        )
-        return launch.build_session(
-            backend,
-            lambda event: None,
-            bus=bus,
-            serve_dir=tmp_path,
-            session_id=session_id,
-            resumed=False,
-            settings=settings_module.resolve(tmp_path),
-            mcp_host="127.0.0.1",
-            mcp_port=8765,
-            agent_token="agent",
-        )
-
-    assert build("claude")._build_options().system_prompt is None
+    claude = _session_with_context("claude", tmp_path, session_id)
+    assert claude._build_options().system_prompt is None
     swap_product(dataclasses.replace(TOY, session_context=context))
-    assert build("claude")._build_options().system_prompt == "You are reviewing design demo."
-    assert build("codex")._instructions == "You are reviewing design demo."
+    claude = _session_with_context("claude", tmp_path, session_id)
+    assert claude._build_options().system_prompt == "You are reviewing design demo."
+    codex = _session_with_context("codex", tmp_path, session_id)
+    assert codex._instructions == "You are reviewing design demo."
+    assert seen == [tmp_path] * 2
+
+
+def test_the_product_s_session_context_reaches_omp(tmp_path, swap_product):
+    """The omp leg of the test above: its appended system prompt. omp-rpc
+    needs Python 3.11 or later and is installed separately (CONTRIBUTING.md),
+    so this skips where it is absent rather than failing the 3.10 run."""
+    pytest.importorskip("omp_rpc")
+    import dataclasses
+
+    from toy_product import TOY
+
+    from annealage_agent import sessions
+
+    seen = []
+
+    def context(bus, serve_dir):
+        seen.append(serve_dir)
+        return "You are reviewing design demo."
+
+    swap_product(dataclasses.replace(TOY, session_context=context))
+    session_id = sessions.create_session(tmp_path)
     captured = {}
 
     def omp_client(**kwargs):
         captured.update(kwargs)
         raise RuntimeError("no omp here")
 
-    omp = build("omp")
+    omp = _session_with_context("omp", tmp_path, session_id)
     omp._client_factory = omp_client
     asyncio.run(omp.start())
     assert captured["append_system_prompt"] == "You are reviewing design demo."
-    assert seen == [tmp_path] * 3
+    assert seen == [tmp_path]
