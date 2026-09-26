@@ -1,0 +1,46 @@
+name: publish
+
+# Publishes to PyPI on a GitHub Release, using trusted publishing (OIDC) - no
+# API token stored. To enable: create the "annealage-agent" project on PyPI
+# with a trusted publisher pointing at this repo + workflow (owner Annealage,
+# repo agent, workflow publish.yml), then cut a GitHub release. See
+# RELEASING.md.
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  # The whole suite, against the exact commit being released. A version on PyPI
+  # cannot be replaced once uploaded, so the gate belongs before the upload
+  # rather than in a status check someone reads afterwards. test.yml declares
+  # no secrets, so none are passed.
+  test:
+    uses: ./.github/workflows/test.yml
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for PyPI trusted publishing
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # hatch-vcs takes the version from the git tag, and the default
+          # shallow checkout fetches no tags at all: without this the release
+          # would build and upload as the 0.0.0 fallback version.
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v10.1.0
+      - name: build
+        run: uv build
+      - name: the built version matches the tag
+        # A mismatch here means the tag was not what the build resolved, which
+        # would otherwise be discovered only by looking at PyPI afterwards.
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          test -f "dist/annealage_agent-${tag}.tar.gz" || {
+            echo "no sdist for tag ${tag}; built:"; ls dist; exit 1; }
+          test -f "dist/annealage_agent-${tag}-py3-none-any.whl" || {
+            echo "no wheel for tag ${tag}; built:"; ls dist; exit 1; }
+      - name: publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

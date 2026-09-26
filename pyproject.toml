@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "annealage-agent"
 dynamic = ["version"]
-description = "The embedded coding agent shared by Annealage products: a chat pane beside a product's own view, pluggable agent backends, permission cards, workspace trust and a WebSocket event channel"
+description = "An embedded coding agent for browser-based tools: a chat pane beside the product's own view, Claude, Codex and omp backends, permission cards, workspace trust and a WebSocket event channel with replay"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -13,10 +13,17 @@ license-files = ["LICENSE"]
 authors = [
     { name = "Andrew Leech", email = "andrew@alelec.net" },
 ]
-keywords = ["agent", "claude", "codex", "mcp", "chat", "microdot"]
+keywords = ["agent", "annealage", "claude", "codex", "omp", "mcp", "chat", "microdot"]
+# No licence classifier: PolyForm Noncommercial is not OSI-approved and has no
+# trove classifier of its own, and the `license` expression above is what
+# carries it (a License :: classifier beside an expression is refused anyway).
+# Alpha rather than Beta: the code is Annealage Mesh's and mature, but the
+# Product contract a consumer programs against is new with this package and
+# may still change before 1.0.
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Environment :: Web Environment",
+    "Framework :: AsyncIO",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -114,17 +121,24 @@ codex = ["openai-codex>=0.154,<1"]
 # refused by the index on upload (session/omp.py's module docstring has the
 # full reasoning). CI installs it from a pinned commit instead.
 
+[project.urls]
+Homepage = "https://github.com/Annealage/agent"
+Repository = "https://github.com/Annealage/agent"
+Issues = "https://github.com/Annealage/agent/issues"
+
 # The version is the git tag, resolved at build time, so there is no literal to
-# keep in step with anything. Two consequences worth knowing. A build needs the
-# tags present, so CI checks out with fetch-depth: 0; and a build from an
+# keep in step with anything. Three consequences worth knowing. A build needs
+# the tags present, so CI checks out with fetch-depth: 0. A build from an
 # unpacked sdist, which is what `uv build` does for the wheel, has no .git and
-# resolves the version from the sdist's PKG-INFO instead.
+# resolves the version from the sdist's PKG-INFO instead. And a checkout used
+# as a git submodule, whose .git is a file pointing into the parent's
+# .git/modules, resolves it the same way a plain clone does, since hatch-vcs
+# asks git rather than reading the directory.
 [tool.hatch.version]
 source = "vcs"
-# A checkout with no tags at all, which a shallow clone, a source tarball or
-# this repository before its first release produces, would otherwise fail the
-# build outright. Products that depend on this package set their version floor
-# to match it until the first tag exists.
+# A checkout with no git metadata at all (a source tarball, a copied tree)
+# would otherwise fail the build outright. A clone with history but no tag yet
+# resolves to 0.0.1.devN (N commits) rather than this.
 fallback-version = "0.0.0"
 
 [tool.hatch.version.raw-options]
@@ -143,6 +157,7 @@ include = [
     "tests",
     "README.md",
     "LICENSE",
+    "LICENSES",
     "COMMERCIAL.md",
     "CONTRIBUTING.md",
     "REUSE.toml",

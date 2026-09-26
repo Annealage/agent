@@ -13,12 +13,24 @@ Optional body explaining what the change makes true and why, wrapped at
 Signed-off-by: Your Name <you@example.com>
 ```
 
+## Running the tests
+
+```
+uv sync --extra dev --extra codex
+uv pip install "omp-rpc @ git+https://github.com/can1357/oh-my-pi.git@71c5eec978b0e7ce9ff057eb4e311f67f4f03eb9#subdirectory=python/omp-rpc"
+uv run --extra dev --extra codex pytest -q
+```
+
+omp-rpc is the omp backend's client. It isn't on PyPI, so it isn't an extra either (a git dependency in published metadata would be refused on upload); install it from the pinned commit `session/omp.py` was verified against. `uv sync` removes anything the lock doesn't name, so install it again after every sync. It needs Python 3.11 or later: on 3.10 skip it and leave out its two test files, as CI does (`--ignore=tests/test_omp_session.py --ignore=tests/test_omp_session_live.py`).
+
+The suite runs as a small made-up product (`tests/toy_product.py`) whose every name differs from the package's own, so an assertion that sees one of its names proves the value came from the product. Tests marked `integration` drive the real `claude`, `codex` and `omp` CLIs against whatever accounts they're signed in to, cost real money, and are excluded by default; `pytest -m integration` runs them. The front end has no browser suite here, since only a product has a page (see below).
+
 ## Pull requests
 
 - Rebase onto current `main` before submitting; do not merge `main` into your branch.
 - One logical change per pull request. Small focused PRs are easier to review and revert.
 - Include a test or a reproducer in the same PR where it is reasonable to do so.
-- Run `uv run --extra dev --extra codex pytest -q` locally before pushing.
+- Run the suite (above) before pushing.
 - Run the suite of every product that depends on this package as well (Annealage Mesh's includes the browser suite that exercises this package's front end); a change here is a change to each of them.
 - Install the pre-commit hook once per checkout (`uv run --extra dev pre-commit install`), so `ruff check --fix` and `ruff format` run automatically on `git commit`. CI's `lint` job runs the identical hooks (`.pre-commit-config.yaml`) and fails a PR where they were skipped.
 

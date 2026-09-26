@@ -2,7 +2,7 @@
 
 Annealage Agent is published under the **PolyForm Noncommercial License 1.0.0** (see [LICENSE](LICENSE)) for noncommercial use only. This document explains when a commercial licence is required and how to obtain one.
 
-Annealage Agent is the embedded-agent layer the Annealage products (such as Annealage Mesh) are built on. A commercial licence for an Annealage product that depends on it is the place to cover this package as well; ask when you enquire.
+Annealage Agent is the embedded-agent layer the Annealage products (Annealage Mesh and Annealage Loom) are built on. A commercial licence for an Annealage product that depends on it is the place to cover this package as well; ask when you enquire.
 
 ## When a commercial licence is required
 

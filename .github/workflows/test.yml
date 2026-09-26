@@ -3,8 +3,9 @@ name: test
 on:
   push:
   pull_request:
-  # Callable, so a future release workflow cannot upload an artifact built
-  # from a commit whose suite was never run.
+  # Called by publish.yml, so a release cannot upload an artifact built from
+  # a commit whose suite was never run. It needs no secrets: every dependency,
+  # omp-rpc's git repository included, is public.
   workflow_call:
 
 jobs:
