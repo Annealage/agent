@@ -36,7 +36,7 @@ from .http.static import register_agent_static_routes
 from .http.ws import host_is_allowed, ping_forever, refusal, register_ws
 from .review.watcher import ReviewWatcher
 from .session import secret_paths
-from .session.base import AgentModelChanged
+from .session.base import AgentModelChanged, TurnEnd
 from .session.events import EventLog
 from .viewers import ViewerBus, ViewerRegistry
 
@@ -301,6 +301,13 @@ def create_app(
     event_log = EventLog(
         str(sessions.events_path(serve_dir, session_id)) if session_id is not None else None
     )
+    # A resumed session's history already holds turns 1..N. The next turn is
+    # N+1 on every backend (launch.build_session passes bus.turn on), so the
+    # page never merges a new turn into an old one of the same number. A turn
+    # an earlier process never finished (killed mid-turn) is closed here, so
+    # the page does not show a finished history as a running turn.
+    for turn in event_log.unfinished_turns:
+        event_log.append(TurnEnd(turn=turn, stop_reason="interrupted", cost_usd=0.0))
     registry = ViewerRegistry(event_log=event_log, on_presence=_presence)
     # The tool layer's view of the browser, and the holder of the human's pause
     # switch. Built here rather than by the session factory because both halves
@@ -312,7 +319,10 @@ def create_app(
     # The tokenless address: ViewerBus's docstring says why the browser token
     # must not appear in anything a tool or the broker says to the model.
     bus = ViewerBus(
-        registry, url=net.server_url(bind, port), publish=_event_publisher(registry, event_log)
+        registry,
+        url=net.server_url(bind, port),
+        publish=_event_publisher(registry, event_log),
+        turn=event_log.last_turn,
     )
     bus.write_protected = write_protected
     # The product's tool server, built once, here, whether or not this backend

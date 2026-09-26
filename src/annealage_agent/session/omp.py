@@ -204,6 +204,7 @@ from typing import Any, Callable, Optional
 from omp_rpc import RpcClient, host_tool
 
 from .. import product
+from ..tools import host_tool_name
 from . import turn_images
 from .base import (
     AGENT_CONNECTING,
@@ -305,6 +306,7 @@ class OmpSession:
         session_dir=None,
         resume: Optional[str] = None,
         on_session_file=None,
+        turn: int = 0,
     ):
         self._on_event = on_event
         self.cwd = str(cwd)
@@ -339,7 +341,9 @@ class OmpSession:
         # The throwaway PI_CODING_AGENT_DIR an omp_base_url run writes its
         # models.yml into, removed by close(); never where a conversation is.
         self._temp_agent_dir: Optional[Path] = None
-        self._turn = 0
+        # The last turn of a resumed session's history (launch passes
+        # bus.turn), so the next one continues its numbering.
+        self._turn = int(turn)
         # Whether a turn is running, as far as this session knows: set when a
         # message is sent, cleared by omp's terminal agent_end. Decides only
         # whether a new message ends the running turn as "steered" in the
@@ -630,8 +634,11 @@ class OmpSession:
             if self._config_rel is not None:
                 env["PI_CONFIG_DIR"] = self._config_rel
             client_kwargs = {}
-            if self._instructions:
-                client_kwargs["append_system_prompt"] = self._instructions
+            instructions = "\n\n".join(
+                p for p in (self._instructions, _renamed_tools_note(self._tool_table)) if p
+            )
+            if instructions:
+                client_kwargs["append_system_prompt"] = instructions
             if self._session_dir is not None:
                 self._session_dir.mkdir(parents=True, exist_ok=True)
                 client_kwargs["session_dir"] = str(self._session_dir)
@@ -768,11 +775,13 @@ class OmpSession:
     def _build_host_tools(self) -> tuple:
         """``omp_rpc.HostTool`` instances for every ``tool_table()`` entry,
         for ``RpcClient(custom_tools=...)``, which registers them via
-        ``set_host_tools`` itself once ``start()`` succeeds.
+        ``set_host_tools`` itself once ``start()`` succeeds. A tool named like
+        one of `omp`'s own is registered under ``_omp_name`` (see there); the
+        broker is still asked under the product's name for it.
         """
         return tuple(
             host_tool(
-                name=name,
+                name=_omp_name(name),
                 description=spec.description,
                 parameters=spec.schema,
                 execute=self._make_execute(name, spec),
@@ -860,12 +869,15 @@ class OmpSession:
             )
 
     def _on_tool_execution_start(self, event) -> None:
-        self._pending_tool_names[event.tool_call_id] = event.tool_name
+        # The product's name for a tool _omp_name renamed, so the page and the
+        # broker see the same names on every backend.
+        name = _product_name(event.tool_name, self._tool_table)
+        self._pending_tool_names[event.tool_call_id] = name
         args = event.args if isinstance(event.args, dict) else {}
         turn = self._turn
         self._loop.call_soon_threadsafe(
             self._emit,
-            ToolUse(turn=turn, tool_use_id=event.tool_call_id, name=event.tool_name, input=args),
+            ToolUse(turn=turn, tool_use_id=event.tool_call_id, name=name, input=args),
         )
 
     def _on_tool_execution_end(self, event) -> None:
@@ -1056,6 +1068,56 @@ class OmpSession:
 #: The token counts a turn's ``TurnEnd`` reports, as ``omp_rpc``'s
 #: ``TokenUsage`` names them.
 _TOKEN_KEYS = ("input", "output", "cache_read", "cache_write")
+
+#: `omp`'s own tool names (its built-in and hidden tools, 18.2, plus
+#: ``search``, which it reads as ``grep``). `omp` keys behaviour on some of
+#: these by name alone, whoever registered the tool: a successful result from
+#: any tool named ``checkpoint`` puts the session in a context checkpoint that
+#: re-samples the model until it calls ``rewind`` (Annealage Loom's own
+#: ``checkpoint`` tool looped a turn for minutes this way, and the state is
+#: restored from the session file on resume). A host tool with one of these
+#: names, in any case (`omp` folds case when it reads tool names), is
+#: therefore registered under ``_omp_name``.
+_OMP_TOOL_NAMES = frozenset(
+    (
+        "read security_scan bash edit ast_grep ast_edit ask debug eval github glob grep "
+        "find lsp checkpoint rewind context_notes new_context task hub todo web_search "
+        "write memory_edit retain recall reflect learn manage_skill think yield goal "
+        "delete move browser fetch search"
+    ).split()
+)
+
+
+def _omp_name(name: str) -> str:
+    """The name `omp` sees for host tool ``name``: unchanged, unless `omp`
+    has a tool of that name, in which case the product's server name is put
+    in front (``checkpoint`` becomes ``loom__checkpoint``), the same form a
+    remote server's tools take."""
+    if name.lower() in _OMP_TOOL_NAMES:
+        return host_tool_name(product.current().mcp_server_name, name)
+    return name
+
+
+def _product_name(omp_name: str, tool_table: dict) -> str:
+    """The inverse of ``_omp_name`` over ``tool_table``'s tools: the
+    product's name for a tool `omp` reports as ``omp_name``."""
+    for name in tool_table:
+        if _omp_name(name) == omp_name:
+            return name
+    return omp_name
+
+
+def _renamed_tools_note(tool_table: dict) -> Optional[str]:
+    """A line for the system prompt naming each tool ``_omp_name`` renamed,
+    so guidance written against the product's names still finds them."""
+    renamed = [(name, _omp_name(name)) for name in tool_table if _omp_name(name) != name]
+    if not renamed:
+        return None
+    return "On this agent backend these tools of %s are named differently: %s." % (
+        product.current().title,
+        ", ".join("`%s` is `%s`" % pair for pair in renamed),
+    )
+
 
 #: The id of the host tool call whose handler is running in this task
 #: (``_make_execute``), for ``OmpSession.end_turn_after_tool``.

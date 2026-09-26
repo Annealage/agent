@@ -716,14 +716,20 @@ class ViewerBus:
     out from under them; a model that goes on reading while paused is doing no
     harm and is better informed when the pause lifts.
 
-    **The turn counter and the notes.** ``turn`` is the number of human turns
-    the session has accepted (0 before the first), which a tool can stamp on
-    what it writes (Annealage Loom's ``Loom-Turn:`` commit trailer).
-    ``http/ws.py`` counts a turn through ``begin_turn``, which is also where
-    the notes ``queue_note`` collected are prefixed to it: one place in front
-    of every backend, so a note reaches the model the same way whichever one
-    runs. A viewer-only or external-agent run never accepts a turn, so its
-    ``turn`` stays 0 and its notes are never sent.
+    **The turn counter and the notes.** ``turn`` is the conversation's
+    current turn number: 0 before the first human turn of a new session, and
+    on a resumed one it continues from the last turn in the session's history
+    (``create_app`` seeds it from the event log), so the next turn never
+    reuses a number the page already shows. ``turn_at_open`` is that seed (0
+    for a new session), so ``turn - turn_at_open`` is how many turns this
+    process has accepted. A tool can stamp the number on what it writes
+    (Annealage Loom's ``Loom-Turn:`` commit trailer, which offsets it by
+    ``turn_at_open``). ``http/ws.py`` counts a turn through ``begin_turn``,
+    which is also where the notes ``queue_note`` collected are prefixed to
+    it: one place in front of every backend, so a note reaches the model the
+    same way whichever one runs. A viewer-only or external-agent run never
+    accepts a turn, so its ``turn`` stays at the seed and its notes are never
+    sent.
 
     ``attention`` publishes an ``Attention`` event through ``publish``, the
     app's event publisher (``None`` for a bus built outside ``create_app``,
@@ -743,13 +749,17 @@ class ViewerBus:
         url: str,
         timeout: float = CALL_TIMEOUT,
         publish: Optional[Any] = None,
+        turn: int = 0,
     ):
         self._registry = registry
         self._url = url
         self._timeout = timeout
         self._paused = False
         self._publish = publish
-        self._turn = 0
+        # A resumed session's last turn (create_app reads it off the event
+        # log), so the next one continues the numbering rather than reusing 1.
+        self._turn = int(turn)
+        self._turn_at_open = self._turn
         self._notes: list = []
         self._turn_start_callbacks: list = []
         self.end_turn_handler: Optional[Any] = None
@@ -771,8 +781,14 @@ class ViewerBus:
 
     @property
     def turn(self) -> int:
-        """The number of human turns the session has accepted."""
+        """The conversation's current turn number (class docstring)."""
         return self._turn
+
+    @property
+    def turn_at_open(self) -> int:
+        """``turn`` when this process opened the conversation: 0 for a new
+        session, the history's last turn for a resumed one."""
+        return self._turn_at_open
 
     def queue_note(self, text: str) -> None:
         """Prefix ``text`` to the next human turn sent to the model, as a

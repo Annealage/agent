@@ -92,6 +92,11 @@ class Replay:
     truncated: bool
 
 
+#: The event kinds whose ``turn`` numbers a conversation turn (``EventLog``
+#: reads a resumed session's turns from these alone).
+_TURN_KINDS = frozenset(("text_delta", "tool_use", "turn_end"))
+
+
 class EventLog:
     """Append-only event history for one session's lifetime.
 
@@ -111,12 +116,20 @@ class EventLog:
         self._ring: collections.deque = collections.deque(maxlen=RING_SIZE)
         self._seq = 0
         self._fd: Optional[int] = None
+        #: The highest turn number in the file, and every turn that has no
+        #: ``turn_end`` there (a process killed mid-turn): where a resumed
+        #: session's numbering continues and which turns ``app.create_app``
+        #: closes, so a new turn never reuses the number of one the page
+        #: already shows from history, nor does history look like it runs.
+        self.last_turn = 0
+        self.unfinished_turns: tuple = ()
         if self._path is not None:
             self._seq = self._recover_seq()
             self._fd = os.open(str(self._path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
 
     def _recover_seq(self) -> int:
-        """The highest seq already written to ``self._path``, or 0.
+        """The highest seq already written to ``self._path``, or 0, noting
+        the turns on the way (``last_turn``, ``unfinished_turns``).
 
         A new ``EventLog`` for a path that already has content must not
         restart numbering at 0: a client that saw seq 50 before a restart
@@ -131,15 +144,28 @@ class EventLog:
         if not self._path.exists():
             return 0
         highest = 0
+        started, ended = set(), set()
         with open(self._path, "r", encoding="utf-8") as f:
             for line in f:
                 try:
                     record = json.loads(line)
                 except ValueError:
                     continue
+                if not isinstance(record, dict):
+                    continue
                 seq = record.get("seq")
                 if isinstance(seq, int) and seq > highest:
                     highest = seq
+                event = record.get("event")
+                if not isinstance(event, dict) or event.get("kind") not in _TURN_KINDS:
+                    continue
+                turn = event.get("turn")
+                if isinstance(turn, int) and not isinstance(turn, bool):
+                    started.add(turn)
+                    if event["kind"] == "turn_end":
+                        ended.add(turn)
+        self.last_turn = max(started, default=0)
+        self.unfinished_turns = tuple(sorted(started - ended))
         return highest
 
     @property

@@ -86,7 +86,9 @@ def namespaced(server_name, name):
 def host_tool_name(server_name, name):
     """The name omp registers remote server ``server_name``'s tool ``name``
     under as a host tool: ``<server>__<tool>``. A product's own tools keep
-    their bare names there (``ToolServer.host_tool_table``)."""
+    their bare names there (``ToolServer.host_tool_table``), except one named
+    like an omp tool, which ``session/omp.py``'s ``_omp_name`` prefixes the
+    same way."""
     return "%s__%s" % (server_name, name)
 
 

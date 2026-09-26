@@ -170,6 +170,7 @@ class CodexSession:
         mcp_token: Optional[str] = None,
         mcp_remotes: tuple = (),
         instructions: Optional[str] = None,
+        turn: int = 0,
     ):
         self._on_event = on_event
         self.cwd = str(cwd)
@@ -208,7 +209,9 @@ class CodexSession:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread_id: Optional[str] = None
         self._active_turn_id: Optional[str] = None
-        self._turn = 0
+        # The last turn of a resumed session's history (launch passes
+        # bus.turn), so the next one continues its numbering.
+        self._turn = int(turn)
         self._closing = False
         self._viewers_seen = 0
         # Set by end_turn_after_tool: the next MCP tool call Codex reports

@@ -1286,21 +1286,21 @@ async def test_a_profile_the_omp_process_could_not_use_as_meant_is_refused(kwarg
 
 
 async def _checkpoint_session():
-    """A started session whose one tool, ``checkpoint``, ends the turn through
+    """A started session whose one tool, ``hand_back``, ends the turn through
     the real ``_wrap`` and ``ViewerBus`` path."""
 
-    async def checkpoint(args):
+    async def hand_back(args):
         return ok(text="Stop and wait for the human.", end_turn=True)
 
     bus = ViewerBus(None, url="http://127.0.0.1:8765/")
     wrapped = _wrap(
-        SdkMcpTool(name="checkpoint", description="hand back", input_schema={}, handler=checkpoint),
+        SdkMcpTool(name="hand_back", description="hand back", input_schema={}, handler=hand_back),
         bus=bus,
         gated=False,
         paused_message="paused",
     )
     table = dict(_tool_table())
-    table["checkpoint"] = ToolSpec(
+    table["hand_back"] = ToolSpec(
         schema={"type": "object", "properties": {}},
         description="hand back",
         handler=wrapped.handler,
@@ -1331,7 +1331,7 @@ async def test_a_tool_result_carrying_end_turn_aborts_the_turn_once_it_is_delive
     session, fake, recorder = await _checkpoint_session()
     try:
         await session.submit_turn(_text("draw it, then check in"))
-        result = await _run_tool(fake, "checkpoint", "call-cp")
+        result = await _run_tool(fake, "hand_back", "call-cp")
         # What omp receives is an ordinary result; the request travels apart.
         assert result == {
             "content": [{"type": "text", "text": "Stop and wait for the human."}],
@@ -1344,8 +1344,8 @@ async def test_a_tool_result_carrying_end_turn_aborts_the_turn_once_it_is_delive
         await _next_of(recorder, ToolResult)
         await _settle(fake, 1)
         assert fake.abort_calls == 0
-        # Once omp has the checkpoint's own result, the turn is stopped.
-        fake.push_tool_execution_end("call-cp", "checkpoint", result)
+        # Once omp has hand_back's own result, the turn is stopped.
+        fake.push_tool_execution_end("call-cp", "hand_back", result)
         await _next_of(recorder, ToolResult)
         await _settle(fake, 1)
         assert fake.abort_calls == 1
@@ -1362,7 +1362,7 @@ async def test_an_end_turn_request_whose_result_never_arrived_does_not_end_a_lat
     session, fake, recorder = await _checkpoint_session()
     try:
         await session.submit_turn(_text("check in"))
-        await _run_tool(fake, "checkpoint", "call-cp")
+        await _run_tool(fake, "hand_back", "call-cp")
         # The human interrupts; omp never reports that call's end, and the
         # run settles.
         fake.push_agent_end()
@@ -1413,5 +1413,213 @@ async def test_set_tool_table_registers_the_new_tools_with_the_running_omp():
         assert await session.set_tool_table(table) is True
         (registered,) = fake.set_custom_tools_calls
         assert {t.name for t in registered} == {"get_view", "add_note", "ds-wiki__search_parts"}
+    finally:
+        await session.close()
+
+
+# ---------------------------------------------------------------------------
+# a resumed session continues its history's turn numbering
+# ---------------------------------------------------------------------------
+
+
+def _history(tmp_path, events):
+    """A session whose events.jsonl already holds ``events``."""
+    from annealage_agent.session.events import EventLog
+
+    sid = sessions.create_session(tmp_path)
+    log = EventLog(str(sessions.events_path(tmp_path, sid)))
+    for event in events:
+        log.append(event)
+    log.close()
+    return sid
+
+
+def _resumed_omp_app(tmp_path, sid, monkeypatch):
+    from conftest import create_toy_app
+
+    from annealage_agent import settings as settings_module
+
+    clients = []
+
+    def factory(**kwargs):
+        clients.append(FakeRpcClient(**kwargs))
+        return clients[-1]
+
+    monkeypatch.setattr(omp_module, "RpcClient", factory)
+
+    def build_session(on_event, *, bus):
+        return launch.build_session(
+            "omp",
+            on_event,
+            bus=bus,
+            serve_dir=tmp_path,
+            session_id=sid,
+            resumed=True,
+            settings=settings_module.resolve(tmp_path),
+            mcp_host="127.0.0.1",
+            mcp_port=8765,
+            agent_token="agent-token",
+        )
+
+    app = create_toy_app(
+        tmp_path,
+        token="tok",
+        agent_token="agent-token",
+        session_id=sid,
+        build_session=build_session,
+    )
+    return app, clients
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_session_s_next_turn_follows_the_last_one_in_its_history(
+    tmp_path, monkeypatch
+):
+    """Five turns already in the log: the next human turn is 6 on the bus, on
+    the wire and in the log, never a second turn 1 the page would merge into
+    the replayed one."""
+    from annealage_agent.http import ws as ws_module
+    from annealage_agent.session.events import read_records
+
+    sid = _history(
+        tmp_path,
+        [TextDelta(turn=t, text="old %d" % t) for t in range(1, 6)]
+        + [TurnEnd(turn=t, stop_reason="end", cost_usd=0.0) for t in range(1, 6)],
+    )
+    app, clients = _resumed_omp_app(tmp_path, sid, monkeypatch)
+    bus, session = app.agent_bus, app.agent_session
+    assert bus.turn == 5
+    await session.start()
+    try:
+        fake = clients[0]
+
+        class _Sock:
+            async def send(self, payload):
+                pass
+
+        class _Registry:
+            async def touch(self, conn):
+                pass
+
+        frame = {"v": 1, "type": "turn", "blocks": [{"type": "text", "text": "hello again"}]}
+        await ws_module._dispatch(
+            _Sock(), SimpleNamespace(tab_id="t"), _Registry(), None, "tok", frame, session, bus
+        )
+        assert bus.turn == 6
+        fake.push_message_update({"type": "text_delta", "delta": "Hi"})
+        fake.push_agent_end()
+        for _ in range(100):
+            kinds = [
+                (r["event"]["kind"], r["event"].get("turn"), r["event"].get("stop_reason"))
+                for r in read_records(sessions.events_path(tmp_path, sid))
+            ]
+            if ("turn_end", 6, "end") in kinds:
+                break
+            await asyncio.sleep(0.01)
+        assert ("text_delta", 6, None) in kinds
+        assert ("turn_end", 6, "end") in kinds
+        # Nothing new was numbered below 6, and nothing was ended as steered.
+        assert not any(k[2] == "steered" for k in kinds)
+        assert [k for k in kinds[10:] if k[1] is not None and k[1] < 6] == []
+    finally:
+        await session.close()
+        app.agent_event_log.close()
+
+
+def test_a_turn_the_previous_process_never_finished_is_closed_on_resume(tmp_path, monkeypatch):
+    """Killed mid-turn: the history ends with turn 3 unfinished, which the page
+    would show as still running (and label Send as Steer). The resumed app
+    closes it, and the next turn is 4."""
+    from annealage_agent.session.events import read_records
+
+    sid = _history(
+        tmp_path,
+        [
+            TurnEnd(turn=2, stop_reason="end", cost_usd=0.0),
+            TextDelta(turn=3, text="half an answ"),
+        ],
+    )
+    app, _clients = _resumed_omp_app(tmp_path, sid, monkeypatch)
+    try:
+        assert app.agent_bus.turn == 3
+        last = list(read_records(sessions.events_path(tmp_path, sid)))[-1]["event"]
+        assert (last["kind"], last["turn"], last["stop_reason"]) == ("turn_end", 3, "interrupted")
+        # And it is in the replay a reconnecting tab gets.
+        replayed = [event for _seq, event in app.agent_event_log.replay(2).events]
+        assert replayed[-1]["stop_reason"] == "interrupted"
+    finally:
+        app.agent_event_log.close()
+
+
+def test_a_resumed_history_that_ended_cleanly_gets_no_new_event(tmp_path, monkeypatch):
+    """Every turn in the history ended: nothing is appended on resume, and the
+    bus says where this process's turns start."""
+    from annealage_agent.session.events import read_records
+
+    events = [TextDelta(turn=t, text="old") for t in (1, 2)]
+    events += [TurnEnd(turn=t, stop_reason="end", cost_usd=0.0) for t in (1, 2)]
+    sid = _history(tmp_path, events)
+    app, _clients = _resumed_omp_app(tmp_path, sid, monkeypatch)
+    try:
+        assert len(list(read_records(sessions.events_path(tmp_path, sid)))) == 4
+        assert (app.agent_bus.turn, app.agent_bus.turn_at_open) == (2, 2)
+    finally:
+        app.agent_event_log.close()
+
+
+def test_every_unfinished_turn_in_the_history_is_closed_on_resume(tmp_path, monkeypatch):
+    """An older log can hold an unfinished turn before the last one (a turn
+    number reused before the numbering was continued across resumes): each
+    is closed, once, and only the turn kinds count (a product event carrying
+    a ``turn`` of its own neither moves the numbering nor gets closed)."""
+    from annealage_agent.session.events import read_records
+
+    sid = _history(
+        tmp_path,
+        [
+            TextDelta(turn=1, text="a"),
+            TurnEnd(turn=1, stop_reason="end", cost_usd=0.0),
+            TextDelta(turn=2, text="never ended"),
+            TextDelta(turn=3, text="b"),
+            TurnEnd(turn=3, stop_reason="end", cost_usd=0.0),
+            TextDelta(turn=4, text="killed"),
+        ],
+    )
+    with open(sessions.events_path(tmp_path, sid), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"seq": 99, "event": {"kind": "project_change", "turn": 40}}) + "\n")
+    app, _clients = _resumed_omp_app(tmp_path, sid, monkeypatch)
+    try:
+        ends = [
+            (r["event"]["turn"], r["event"]["stop_reason"])
+            for r in read_records(sessions.events_path(tmp_path, sid))
+            if r["event"]["kind"] == "turn_end"
+        ]
+        assert ends == [(1, "end"), (3, "end"), (2, "interrupted"), (4, "interrupted")]
+        assert app.agent_bus.turn == 4
+    finally:
+        app.agent_event_log.close()
+
+
+@pytest.mark.asyncio
+async def test_a_tool_named_like_one_of_omp_s_own_is_registered_under_the_product_s_prefix():
+    """omp keys behaviour on some tool names whoever registered them (a
+    successful ``checkpoint`` result starts a context checkpoint that
+    re-samples the model until it calls ``rewind``, so the turn never ends).
+    A product's ``checkpoint`` goes to omp as ``toy__checkpoint``, the prompt
+    names the rename, and the page still sees the product's name."""
+    table = dict(_tool_table())
+    table["checkpoint"] = ToolSpec(
+        schema={"type": "object", "properties": {}},
+        description="hand back",
+        handler=_read_handler,
+        write=False,
+    )
+    session, fake, recorder, broker = await _started_session(tool_table=table)
+    try:
+        assert {t.name for t in fake.custom_tools} == {"get_view", "add_note", "toy__checkpoint"}
+        assert "`checkpoint` is `toy__checkpoint`" in fake.kwargs["append_system_prompt"]
+        await session.submit_turn(_text("check in"))
+        fake.push_tool_execution_start("call-1", "toy__checkpoint", {})
+        assert (await _next_of(recorder, ToolUse)).name == "checkpoint"
     finally:
         await session.close()

@@ -151,6 +151,7 @@ def build_session(
             # One more bridge per remote MCP server, each at /mcp/<remote>.
             mcp_remotes=tuple(r.name for r in bus.tools.remotes) if bus.tools is not None else (),
             instructions=instructions,
+            turn=getattr(bus, "turn", 0),
         )
 
     if backend == "omp":
@@ -181,6 +182,7 @@ def build_session(
             tool_table=bus.tools.host_tool_table(),
             on_sdk_session_id=_record_sdk_id,
             instructions=instructions,
+            turn=getattr(bus, "turn", 0),
             agent_dir=omp_agent_dir,
             config_dir=omp_config_dir,
             binary=omp_binary,
@@ -214,5 +216,7 @@ def build_session(
         # calls if it stops being true while the run is in progress.
         trusted_config_digest=trusted_config_digest,
         instructions=instructions,
+        # A resumed session continues its history's turn numbering.
+        turn=getattr(bus, "turn", 0),
         write_protected=getattr(bus, "write_protected", None),
     )

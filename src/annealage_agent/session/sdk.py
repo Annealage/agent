@@ -207,6 +207,7 @@ class SdkSession:
         trusted_config_digest=None,
         instructions=None,
         write_protected=None,
+        turn: int = 0,
     ):
         self._on_event = on_event
         self.cwd = str(cwd)
@@ -243,7 +244,9 @@ class SdkSession:
         self._client = None
         self._pump_task = None
         self._closing = False
-        self._turn = 0
+        # The last turn of a resumed session's history (launch passes
+        # bus.turn), so the next one continues its numbering.
+        self._turn = int(turn)
         # Set by end_turn_after_tool; the next tool result delivered to the
         # model interrupts the turn, and that turn ends as ended_by_tool.
         self._end_turn_pending = False
