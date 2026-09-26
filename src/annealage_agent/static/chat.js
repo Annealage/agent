@@ -602,8 +602,12 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     allowAlwaysBtn.addEventListener("click", () => decide("allow_always"));
     denyBtn.addEventListener("click", () => decide("deny"));
 
+    // A request the server never remembers (resolving one of the human's own
+    // review comments, say) is a question about this one call, so it gets
+    // no "always" button at all; the server downgrades one anyway.
+    const buttons = req.rememberable ? [allowBtn, allowAlwaysBtn, denyBtn] : [allowBtn, denyBtn];
     actions.appendChild(allowBtn);
-    actions.appendChild(allowAlwaysBtn);
+    if (req.rememberable) actions.appendChild(allowAlwaysBtn);
     actions.appendChild(reasonEl);
     actions.appendChild(denyBtn);
 
@@ -615,7 +619,6 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     card.appendChild(actions);
     card.appendChild(statusEl);
 
-    const buttons = [allowBtn, allowAlwaysBtn, denyBtn];
     return { card, toolEl, inputEl, statusEl, buttons, reasonEl };
   }
 
@@ -935,6 +938,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
           event.tool,
           event.input,
           event.suggestions,
+          event.rememberable,
         );
         break;
       case "permission_resolved":

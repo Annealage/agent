@@ -122,6 +122,15 @@ DEFAULT_NO_VIEWER_GRACE = 8.0
 # send ``allow_always`` for this tool regardless of what the UI offers.
 NEVER_REMEMBERED = frozenset({"Bash"})
 
+# A broker is also given names of its own that are never remembered
+# (``never_remembered``): requests whose every instance needs a fresh human
+# decision, such as resolving one of the human's review comments
+# (``review/tools.py``), where "always allow" would let the model close the
+# human's feedback unasked from then on. Unlike ``Bash`` above, the pane is
+# told (``PermissionRequest.rememberable``) and offers no "always" button for
+# them at all, since the request is a question about one comment rather than
+# about a tool.
+
 DEFAULT_DENY_MESSAGE = "the human reviewing this session denied the request"
 
 # The three templates below name the product (``%(product)s``, its lowercase
@@ -171,7 +180,10 @@ class PermissionBroker:
         timeout: float = DEFAULT_TIMEOUT,
         viewer_url: Optional[str] = None,
         no_viewer_grace: float = DEFAULT_NO_VIEWER_GRACE,
+        never_remembered=(),
     ):
+        # Beside the module-wide NEVER_REMEMBERED; see the comment there.
+        self._never_remembered: FrozenSet[str] = frozenset(never_remembered)
         self._on_event = on_event
         self._permissions_path = Path(permissions_path) if permissions_path is not None else None
         self._timeout = timeout
@@ -207,7 +219,9 @@ class PermissionBroker:
         # later decision or restart-time re-prompt self-heals). See
         # _remember's docstring.
         self._write_lock = asyncio.Lock()
-        self._granted_tools: FrozenSet[str] = _load_grants(self._permissions_path)
+        self._granted_tools: FrozenSet[str] = _load_grants(
+            self._permissions_path, self._never_remembered
+        )
 
     # -- can_use_tool itself ----------------------------------------------
 
@@ -240,7 +254,7 @@ class PermissionBroker:
         """
         if self._shutdown:
             return Decision(allow=False, message=_deny_message(_DENY_SHUTDOWN_TEMPLATE))
-        if tool_name in self._granted_tools:
+        if tool_name in self._granted_tools and tool_name not in self._never_remembered:
             return Decision(allow=True, remember_tool=tool_name)
         if self._viewer_count == 0:
             return Decision(allow=False, message=self._no_viewer_message())
@@ -248,7 +262,14 @@ class PermissionBroker:
         request_id = "pr_%d" % self._next_id
         self._next_id += 1
         future: asyncio.Future = asyncio.get_running_loop().create_future()
-        event = PermissionRequest(request_id=request_id, tool=tool_name, input=input_data)
+        event = PermissionRequest(
+            request_id=request_id,
+            tool=tool_name,
+            input=input_data,
+            # Absent (None) rather than True for an ordinary request, so the
+            # wire shape of every request that can be remembered is unchanged.
+            rememberable=False if tool_name in self._never_remembered else None,
+        )
         self._pending[request_id] = future
         self._open[request_id] = event
         try:
@@ -340,7 +361,7 @@ class PermissionBroker:
             )
         event = self._open.get(request_id)
         tool_name = event.tool if event is not None else ""
-        result, grant = _build_result(tool_name, decision, message)
+        result, grant = _build_result(tool_name, decision, message, self._never_remembered)
         self._outcomes[request_id] = decision
         future.set_result(result)
         if grant is not None:
@@ -366,7 +387,7 @@ class PermissionBroker:
         to completion out of order, which could otherwise leave the file
         holding only the first grant even though memory holds both.
         """
-        if tool_name in self._granted_tools:
+        if tool_name in self._granted_tools or tool_name in self._never_remembered:
             return
         self._granted_tools = self._granted_tools | {tool_name}
         if self._permissions_path is None:
@@ -502,15 +523,18 @@ class PermissionBroker:
 # ---------------------------------------------------------------------------
 
 
-def _build_result(tool_name: str, decision: str, message: str) -> Tuple[Decision, Optional[str]]:
+def _build_result(
+    tool_name: str, decision: str, message: str, never_remembered: FrozenSet[str] = frozenset()
+) -> Tuple[Decision, Optional[str]]:
     """The ``Decision`` for one decision, and the tool name to remember
-    afterward (``None`` if nothing should be persisted)."""
+    afterward (``None`` if nothing should be persisted). ``never_remembered``
+    is the broker's own set, beside the module-wide ``NEVER_REMEMBERED``."""
     if decision == "allow":
         return Decision(allow=True), None
     if decision == "deny":
         return Decision(allow=False, message=message or DEFAULT_DENY_MESSAGE), None
     if decision == "allow_always":
-        if tool_name in NEVER_REMEMBERED:
+        if tool_name in NEVER_REMEMBERED or tool_name in never_remembered:
             # The pane should never offer this button for this tool, but
             # this broker does not trust that it never will: downgraded to
             # a one-time allow rather than denied outright, because the
@@ -536,16 +560,20 @@ _FALLBACK_ARRAY_RE = re.compile(_GRANTS_KEY + r"\s*=\s*\[(.*?)\]", re.DOTALL)
 _FALLBACK_STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
 
-def _load_grants(path: Optional[Path]) -> FrozenSet[str]:
+def _load_grants(
+    path: Optional[Path], never_remembered: FrozenSet[str] = frozenset()
+) -> FrozenSet[str]:
     """The allow-always grants recorded in ``path``, or an empty set if
     there is no path, no file yet, or the file cannot be read or parsed.
 
     Every failure here falls back to "no grants", never to raising:
     losing a remembered grant only costs one re-prompt for a tool the
     human already trusted, which is the safe direction (fact 17's own
-    reasoning: fail toward more asking, not toward less). ``Bash`` is
-    filtered out even if present, so a hand-edited file cannot reintroduce
-    the one grant this module refuses to ever create itself.
+    reasoning: fail toward more asking, not toward less). ``Bash`` and the
+    broker's own ``never_remembered`` names are filtered out even if present,
+    so a hand-edited file, or one written before a name was made
+    never-rememberable, cannot reintroduce a grant this module refuses to
+    create.
     """
     if path is None:
         return frozenset()
@@ -565,7 +593,7 @@ def _load_grants(path: Optional[Path]) -> FrozenSet[str]:
             "warning: could not parse %s: %r; starting with no remembered grants\n" % (path, exc)
         )
         return frozenset()
-    return frozenset(t for t in tools if t not in NEVER_REMEMBERED)
+    return frozenset(t for t in tools if t not in NEVER_REMEMBERED and t not in never_remembered)
 
 
 def _parse_grants(text: str) -> List[str]:

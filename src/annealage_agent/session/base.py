@@ -153,11 +153,19 @@ class ToolResult(AgentEvent):
 
 @dataclasses.dataclass(frozen=True)
 class PermissionRequest(AgentEvent):
+    """A tool call waiting on the human's decision (``PermissionBroker.ask``).
+
+    ``rememberable`` is ``False`` for a request the broker will never
+    remember an "always allow" for (its ``never_remembered`` names), so the
+    pane offers no such button; absent otherwise.
+    """
+
     kind: ClassVar[str] = "permission_request"
     request_id: str
     tool: str
     input: dict
     suggestions: list = dataclasses.field(default_factory=list)
+    rememberable: Optional[bool] = None
     viewer: Optional[str] = None
 
 
@@ -296,6 +304,23 @@ class AgentError(AgentEvent):
     viewer: Optional[str] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class ReviewChanged(AgentEvent):
+    """The product's review changed: a comment or a callout was added,
+    resolved or deleted, by the model, the human or anything else writing the
+    review's files (``review/watcher.py`` publishes it).
+
+    Carries no payload: the page refetches the review for itself
+    (``static/review.js``, or a product's own route), which keeps the review
+    in the page to one writer; putting the changed content here would give it
+    a second. Generic rather than a product's own event, so every product's
+    page reacts to the same kind and none hand-rolls its own.
+    """
+
+    kind: ClassVar[str] = "review_changed"
+    viewer: Optional[str] = None
+
+
 #: Every event kind the agent layer emits itself. A product's own event
 #: classes (``Product.events``) are registered beside these by
 #: ``product.install`` and may not reuse one of their kinds: the chat pane and
@@ -314,6 +339,7 @@ GENERIC_EVENTS = (
     AgentModelChanged,
     SessionReset,
     AgentError,
+    ReviewChanged,
 )
 
 #: The installed product's event classes; see ``register_product_events``.

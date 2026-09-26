@@ -30,9 +30,11 @@ from . import settings as settings_module
 from .http.routes_chat import register_chat_routes
 from .http.routes_login import LoginNonces, register_login_routes
 from .http.routes_mcp import register_mcp_routes
+from .http.routes_review import register_review_routes
 from .http.routes_settings import register_settings_routes
 from .http.static import register_agent_static_routes
 from .http.ws import host_is_allowed, ping_forever, refusal, register_ws
+from .review.watcher import ReviewWatcher
 from .session.base import AgentModelChanged
 from .session.events import EventLog
 from .viewers import ViewerBus, ViewerRegistry
@@ -147,6 +149,7 @@ def create_app(
     register_routes=None,
     settings=None,
     login=None,
+    review_store=None,
 ):
     """Build a Microdot app serving ``serve_dir``, routes registered, not started.
 
@@ -183,6 +186,13 @@ def create_app(
     per plan section 3.4), or None for viewer-only; it is reported in the
     ``hello`` frame's ``session`` object and names the conversation the tool
     server writes out.
+
+    ``review_store`` is the product's ``review.ReviewStore``, or ``None`` for a
+    product that keeps no review. With one, ``GET``/``POST /review`` serve it
+    to the page, the product's tool builder finds it on ``bus.review_store``
+    (the same instance, so a change made by a tool reaches the watcher at
+    once), and ``app.agent_review_watcher`` is the ``ReviewWatcher`` that
+    ``serve`` runs beside the server to publish ``review_changed``.
 
     ``settings`` is the ``settings.Resolved`` this run started with, which
     the CLI builds because only it knows which flags were given. Passing
@@ -243,6 +253,7 @@ def create_app(
         bind=bind.address,
         port=port,
     )
+    register_review_routes(app, store=review_store, token=token, allowed_origins=allowed_origins)
 
     # Set after the session exists, since the broker it belongs to is built by
     # the session factory below; a list with one slot rather than a nonlocal so
@@ -295,6 +306,13 @@ def create_app(
     # actual contract this function relies on, not something to work around
     # here.
     tools = None
+    # The product's review store reaches its tool builder the same way the
+    # tool server and the broker cross between this function and the
+    # session factory (see below): on the bus, set before ``build_tools``
+    # reads it, ``None`` when the product keeps no review. One store instance
+    # for the tools, the routes and the watcher is what makes a tool's write
+    # notify the watcher directly rather than wait for its next sample.
+    bus.review_store = review_store
     if session_id is not None:
         tools = installed.build_tools(bus, serve_dir, session_id)
     # ``bus`` is the one object both this function and the CLI's
@@ -307,8 +325,9 @@ def create_app(
     # never rebuilt); ``broker`` flows the other way, set by that closure at
     # the exact point it already constructs ``PermissionBroker``, read below
     # once ``build_session`` has returned, so the same broker instance gates
-    # both the session's own approval flow and a write-class call arriving
-    # through ``/mcp``.
+    # the session's own approval flow, a write-class call arriving through
+    # ``/mcp``, and the one approval a review tool asks for itself (resolving
+    # a human's comment, ``review/tools.py``), which reads it at call time.
     bus.tools = tools
     bus.broker = None
     session_info = {
@@ -331,6 +350,15 @@ def create_app(
     app.agent_event_log = event_log
     app.agent_bus = bus
     app.agent_tools = tools
+    app.agent_review_store = review_store
+    # Its own publisher rather than the session's: the watcher runs whether
+    # or not a session exists (a viewer-only run has a review too), and it
+    # has no reason to see the session's hello-frame bookkeeping.
+    app.agent_review_watcher = (
+        ReviewWatcher(review_store, _event_publisher(registry, event_log))
+        if review_store is not None
+        else None
+    )
 
     # ``build_session`` is called with the callback a session must use to
     # publish an event, plus the bus its tools drive the browser through, and
@@ -522,10 +550,12 @@ async def serve(app, host, port, on_ready=None, background=()):
     of running it inline on the loop that is meant to already be serving.
 
     ``background`` is the product's own long-running coroutine functions
-    (Mesh: its file watchers' ``run``), each called and started as a task once
-    the session has started, and cancelled on the way out. Functions rather
-    than coroutines, so nothing is created that a failed bind would leave
-    never awaited.
+    (Mesh: its models watcher's ``run``), each called and started as a task
+    once the session has started, and cancelled on the way out. Functions
+    rather than coroutines, so nothing is created that a failed bind would
+    leave never awaited. The review watcher (``app.agent_review_watcher``)
+    is started the same way without being listed, since ``create_app``
+    built it.
 
     ``start_serving()`` alone is enough to keep the server accepting
     connections; nothing further needs to run for that to continue, so this
@@ -564,6 +594,8 @@ async def serve(app, host, port, on_ready=None, background=()):
     # in one; a task per constructed app would leak a task per test.
     tasks = [asyncio.ensure_future(start()) for start in background]
     tasks.append(asyncio.ensure_future(ping_forever(app.agent_registry)))
+    if app.agent_review_watcher is not None:
+        tasks.append(asyncio.ensure_future(app.agent_review_watcher.run()))
     if on_ready is not None:
         result = on_ready()
         if inspect.isawaitable(result):

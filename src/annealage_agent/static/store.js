@@ -378,7 +378,9 @@ function queueChatUserTurn(blocks) {
 // Adds a permission_request to the pending list unless its request_id is
 // already there. Replay re-emits every still-unanswered request on
 // reconnect, so this call is not proof of a first sighting.
-function addChatPermissionRequest(requestId, tool, input, suggestions) {
+// `rememberable` is false for a request the server will never remember an
+// "always allow" for, so its card offers no such button.
+function addChatPermissionRequest(requestId, tool, input, suggestions, rememberable = true) {
   commit(() => {
     const chat = state.chat;
     if (chat.pending.some((p) => p.request_id === requestId)) return;
@@ -387,6 +389,7 @@ function addChatPermissionRequest(requestId, tool, input, suggestions) {
       tool,
       input,
       suggestions: suggestions || null,
+      rememberable: rememberable !== false,
     });
     state = {
       ...state,

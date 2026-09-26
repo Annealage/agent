@@ -41,6 +41,12 @@ down, and ``_verify`` refuses to build a server whose tools do not match it
 exactly, so a tool added to a product without being graded fails at startup
 rather than defaulting into a posture nobody chose.
 
+One kind of tool is graded by the agent layer instead: one whose handler asks
+the human itself, per call, with a question only it can phrase (resolving one
+of the human's review comments). ``asks_the_human`` marks it, and the server
+treats it as read-grade whatever the product said, so no transport asks a
+vaguer question first; the product must still grade it, like any tool.
+
 Every handler returns one of ``ok`` or ``fail`` and nothing else. A tool
 result reaches the model as text, so what a handler returns is prose it will
 read: ``ok`` renders a payload as indented JSON, because coordinates and part
@@ -190,6 +196,29 @@ def _verify(tools, grading):
         )
 
 
+# The attribute ``asks_the_human`` sets on a tool's handler function.
+_ASKS_THE_HUMAN = "_annealage_asks_the_human"
+
+
+def asks_the_human(tool_def):
+    """Mark ``tool_def`` as a tool whose handler asks the human itself, and
+    return it.
+
+    Such a tool decides per call whether a call needs a card (resolving one
+    of the human's review comments does, resolving the model's own callout
+    does not; ``review/tools.py``), and asks the ``PermissionBroker`` itself
+    with a request that says what it is about. So ``ToolServer`` treats it as
+    read-grade whatever grade the product gave it: pre-allowed, never marked
+    write in ``tool_table``, so no transport asks a second, less specific,
+    question first, and not pause-gated, since every call that changes
+    anything the human cares about asks them anyway. Its model-visible and
+    bare names are the server's ``never_remembered``: no "always allow" may
+    stand in for the question it asks.
+    """
+    setattr(tool_def.handler, _ASKS_THE_HUMAN, True)
+    return tool_def
+
+
 def _wrap(tool_def, *, bus, gated, paused_message):
     """Apply the pause gate and the failure mapping to one tool.
 
@@ -267,6 +296,10 @@ class ToolServer:
     grades, ``bus`` the ``ViewerBus`` holding the pause switch, and
     ``paused_message`` what a gated tool answers while it is on.
 
+    A tool marked ``asks_the_human`` is moved to the read grade whatever
+    ``grading`` says (see that function); ``self.grading`` is the grading
+    after that move, the one every derived list is built from.
+
     The server is named after the installed product's ``mcp_server_name``,
     and so is ``mcp_servers``' one key, deliberately: the key is what the
     model-visible ``mcp__<key>__<tool>`` name is built from, so a key that
@@ -278,8 +311,16 @@ class ToolServer:
         _verify(tools, grading)
         installed = product.current()
         self.name = installed.mcp_server_name
-        self.grading = grading
-        gated = set(grading.pause_gated)
+        self.asks_the_human = tuple(
+            t.name for t in tools if getattr(t.handler, _ASKS_THE_HUMAN, False)
+        )
+        moved = set(self.asks_the_human)
+        self.grading = Grading(
+            read=tuple(n for n in grading.read if n not in moved) + self.asks_the_human,
+            view=tuple(n for n in grading.view if n not in moved),
+            write=tuple(n for n in grading.write if n not in moved),
+        )
+        gated = set(self.grading.pause_gated)
         self.tools = tuple(
             _wrap(tool_def, bus=bus, gated=tool_def.name in gated, paused_message=paused_message)
             for tool_def in tools
@@ -298,6 +339,14 @@ class ToolServer:
         ``allowed_tools`` a Claude session is built with. Write-grade tools are
         absent, which is what makes each of them reach the broker."""
         return tuple(namespaced(self.name, tool) for tool in self.grading.pre_allowed)
+
+    @property
+    def never_remembered(self):
+        """The names no "always allow" may cover: every ``asks_the_human``
+        tool, namespaced (as Claude, ``/mcp`` and the handler itself ask the
+        broker) and bare (as omp's host-tool gate does), for the session's
+        ``PermissionBroker`` (``launch.py``)."""
+        return tuple(namespaced(self.name, n) for n in self.asks_the_human) + self.asks_the_human
 
     def tool_table(self):
         """``{name: ToolSpec(schema, description, handler, write)}`` off the

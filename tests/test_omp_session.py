@@ -696,6 +696,75 @@ async def test_already_granted_write_class_tool_needs_no_extension_ui_request_at
 
 
 # ---------------------------------------------------------------------------
+# resolving one of the human's review comments: asked once per call through
+# the omp host-tool path, whatever the product graded it, and never
+# remembered (review/tools.py).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grade", ["read", "view", "write"])
+async def test_resolving_a_human_comment_asks_once_per_call_and_is_never_remembered(
+    tmp_path, grade
+):
+    from toy_product import TOY_PAUSED_MESSAGE, toy_review_store
+
+    from annealage_agent.review.tools import review_tools
+    from annealage_agent.tools import Grading, ToolServer
+
+    store = toy_review_store(tmp_path)
+    for text in ("one", "two"):
+        store.add_comment(anchor={"card": "back", "x": 1, "y": 1}, text=text, author="human")
+    store.add_comment(anchor={"card": "back", "x": 2, "y": 2}, text="mine", author="model")
+
+    names = {"read": ["list_comments"], "view": ["add_callout"], "write": ["delete_callout"]}
+    names[grade].append("resolve_comment")
+    bus = SimpleNamespace(paused=False, review_store=store, broker=None)
+    server = ToolServer(
+        review_tools(store, bus=bus),
+        grading=Grading(*(tuple(names[g]) for g in ("read", "view", "write"))),
+        bus=bus,
+        paused_message=TOY_PAUSED_MESSAGE,
+    )
+    # The broker's own recorder: its events are the cards.
+    recorder = EventRecorder()
+    broker = PermissionBroker(
+        recorder, timeout=2.0, no_viewer_grace=0.05, never_remembered=server.never_remembered
+    )
+    bus.broker = broker
+    session, fake, _session_events, _broker = await _started_session(
+        tool_table=server.tool_table(), broker=broker
+    )
+    try:
+        execute = fake.tool("resolve_comment").execute
+        loop = asyncio.get_running_loop()
+
+        first = loop.run_in_executor(None, execute, {"id": 1}, None)
+        request = await recorder.next()
+        assert isinstance(request, PermissionRequest)
+        assert (request.tool, request.rememberable) == ("mcp__toy__resolve_comment", False)
+        await session.decide_permission(request.request_id, "allow_always")
+        await first
+        assert isinstance(await recorder.next(), PermissionResolved)
+
+        # The next human comment is asked about again, exactly once.
+        second = loop.run_in_executor(None, execute, {"id": 2}, None)
+        again = await recorder.next()
+        assert isinstance(again, PermissionRequest)
+        await session.decide_permission(again.request_id, "allow")
+        await second
+        assert isinstance(await recorder.next(), PermissionResolved)
+
+        # The model's own callout resolves with no card.
+        before = len(recorder.all)
+        await loop.run_in_executor(None, execute, {"id": 3}, None)
+        assert not any(isinstance(e, PermissionRequest) for e in recorder.all[before:])
+        assert store.list_comments(status="open").comments == ()
+    finally:
+        await session.close()
+
+
+# ---------------------------------------------------------------------------
 # no-viewer grace path: nobody is left to answer, so a write-class call must
 # deny immediately, without ever creating a card.
 # ---------------------------------------------------------------------------

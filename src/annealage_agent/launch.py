@@ -71,6 +71,11 @@ def build_session(
         on_event,
         permissions_path=sessions.state_dir(serve_dir) / "permissions.toml",
         viewer_url=bus.url,
+        # The tools that ask the human themselves (tools.asks_the_human):
+        # their requests are never remembered, and a grant for one of their
+        # names already in permissions.toml is ignored. A bus with no tool
+        # server has none.
+        never_remembered=bus.tools.never_remembered if bus.tools is not None else (),
     )
     # app.py reads this back once build_session returns, to gate a
     # write-class tool call arriving through /mcp with the exact same

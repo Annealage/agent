@@ -15,12 +15,12 @@
  * the product shows. What the product needs from the socket it hands in to
  * `initWs` (the product's main module is where the two meet):
  *
- * - `onEvent`, `{kind: fn(event)}`, handles the product's own event kinds
- *   (the ones the product registered server-side, e.g. Mesh's
- *   `callouts_changed`). A kind listed there goes to its handler and nowhere
- *   else; the server already refuses a product kind that collides with a
- *   generic one, so this map can only ever take kinds the chat pane has no
- *   use for.
+ * - `onEvent`, `{kind: fn(event)}`, handles the event kinds the chat pane has
+ *   no use for: the product's own (the ones it registered server-side, e.g.
+ *   Mesh's `models_changed`) and `review_changed`, which review.js's
+ *   `onEvent` handles for a product that uses it. A kind listed there goes to
+ *   its handler and nowhere else; the server already refuses a product kind
+ *   that collides with a generic one.
  * - `onLive` runs on every successful handshake, the first and every
  *   reconnect, after the connection is marked live: the product stops its
  *   fallback poll there and refetches whatever an event it missed while the

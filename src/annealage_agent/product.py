@@ -77,7 +77,10 @@ parentheses are Annealage Mesh's, as an example:
     app (``app.py``'s ``create_app``, the only reader), and only then,
     so a viewer-only run never imports an agent SDK. A product with none
     (``None``) can serve viewer-only; building an agent-mode app for it is
-    refused at startup.
+    refused at startup. A product that keeps a review hands its
+    ``review.ReviewStore`` to ``create_app`` and finds it here on
+    ``bus.review_store``, to build the shared review tools
+    (``review/tools.py``) over it beside its own.
 ``settings_keys``
     Extra ``settings.Key`` rows the product adds to the generic key set (Mesh:
     ``up_axis``), registered by ``install``. A key's ``section`` names the
@@ -88,9 +91,10 @@ parentheses are Annealage Mesh's, as an example:
     ``load``-effect value to the page is the product front end's own job
     (Mesh's ``main.js`` passes ``initSettings`` an ``onLoad`` hook for it).
 ``events``
-    The product's own ``AgentEvent`` subclasses (Mesh: ``callouts_changed``,
-    ``models_changed``), registered by ``install`` so a kind that collides with
-    a generic one is refused before anything is published under it.
+    The product's own ``AgentEvent`` subclasses (Mesh: ``models_changed``),
+    registered by ``install`` so a kind that collides with a generic one is
+    refused before anything is published under it. A change to the review is
+    the generic ``review_changed``, not a product event.
 ``inbound_frames``
     ``{type: protocol.FrameSpec}`` for browser-to-server frames the product's
     page sends beyond the generic protocol (Mesh: ``state``), registered by

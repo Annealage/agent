@@ -379,7 +379,7 @@ def atomic_replace(target, data, default_mode=0o644):
     Windows. Two writers therefore leave one complete file rather than one's
     bytes overlaid on the other's, and a reader either sees the old contents or
     the new ones. That matters for every file in the served directory that
-    something else polls: a product's watcher (Mesh's callouts watcher) samples
+    something else polls: the review watcher (``review/watcher.py``) samples
     a digest several times a second, and the page fetches the file the moment
     it changes.
 

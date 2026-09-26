@@ -199,6 +199,43 @@ async def test_allow_always_for_bash_is_downgraded_and_never_persisted(tmp_path,
     assert second_result.message == "no"
 
 
+async def test_a_broker_s_own_never_remembered_names_are_never_remembered(tmp_path):
+    """The per-broker set beside Bash: the card says so, allow_always buys
+    one call and writes nothing, the next call asks again, and a grant for
+    the name already on disk (from before, or by hand) is ignored while the
+    file's other grants stand."""
+    name = "mcp__toy__resolve_comment"
+    permissions_path = tmp_path / ".toy" / "permissions.toml"
+    permissions_path.parent.mkdir()
+    original = 'allow_always_tools = ["%s", "Write"]\n' % name
+    permissions_path.write_text(original, encoding="utf-8")
+    broker, events = _broker(permissions_path=permissions_path, never_remembered=(name,))
+    broker.viewer_connected()
+    _assert_remembers(await broker.ask("Write", {}, None), "Write")
+
+    task, request = await _pending_request(broker, events, tool_name=name)
+    assert request.to_wire()["rememberable"] is False
+    await broker.decide(request.request_id, "allow_always")
+    result = await task
+    _assert_allow(result)
+    assert result.remember_tool is None
+    assert permissions_path.read_text(encoding="utf-8") == original, "nothing was remembered"
+
+    second_task, second_request = await _pending_request(broker, events, tool_name=name)
+    await broker.decide(second_request.request_id, "deny", "no")
+    _assert_deny(await second_task)
+
+    # An ordinary request's wire shape is unchanged: no rememberable key. And
+    # the next grant written drops the stale one from the file, since it was
+    # never loaded.
+    edit_task, edit_request = await _pending_request(broker, events, tool_name="Edit")
+    assert "rememberable" not in edit_request.to_wire()
+    await broker.decide(edit_request.request_id, "allow_always")
+    await edit_task
+    written = permissions_path.read_text(encoding="utf-8")
+    assert '"Write"' in written and '"Edit"' in written and name not in written
+
+
 # ---------------------------------------------------------------------------
 # viewer presence
 # ---------------------------------------------------------------------------

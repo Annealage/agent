@@ -236,10 +236,11 @@ TRANSCRIPT_INCLUDE = ("text", "full")
 
 # The least inclusive TRANSCRIPT_INCLUDE level at which each AgentEvent kind
 # appears in a transcript. A kind absent from this table never appears in a
-# transcript at any level: callouts_changed, models_changed, pause_changed
-# and viewer_primary describe the browser's view of a running server, not
-# the conversation, and agent_status, session_reset and agent_error describe
-# the session's own lifecycle rather than anything said or done within it.
+# transcript at any level: review_changed, a product's own events (Mesh's
+# models_changed), pause_changed and viewer_primary describe the browser's
+# view of a running server, not the conversation, and agent_status,
+# session_reset and agent_error describe the session's own lifecycle rather
+# than anything said or done within it.
 _KIND_MIN_INCLUDE = {
     "text_delta": "text",
     "tool_use": "text",

@@ -31,10 +31,15 @@ Layout:
     session/       AgentSession, generic events, the Claude, Codex, omp and
                    fake sessions, permissions, workspace trust, secret paths,
                    turn images, the event log, the Codex stdio MCP bridge
+    review/        the shared review model: Comment, AnchorSpace, ReviewStore
+                   and its capabilities, the native JsonReviewStore, the
+                   review watcher (review_changed) and the review tools with
+                   their approval policy
     http/          shared route helpers, /ws, /login, chat (/upload, /asset,
-                   export), /settings, /mcp and /agent/static/ routes
-    static/        the chat pane's front end (ES modules and agent.css),
-                   served at /agent/static/
+                   export), /settings, /review, /mcp and /agent/static/ routes
+    static/        the chat pane's front end (ES modules and agent.css) and
+                   the page's review client (review.js), served at
+                   /agent/static/
 
 This code was developed inside Annealage Mesh and extracted from it (Mesh
 commit 59036ba). Comments that cite "plan section N", a ``planning/`` file or
