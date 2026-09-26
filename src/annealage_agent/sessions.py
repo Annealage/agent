@@ -122,6 +122,10 @@ class SessionInfo:
     run that never had one); such a session is still resumable as a product
     session id, just not as a conversation the SDK can pick back up, and
     the caller resolving it is the one that decides what to do about that.
+
+    ``omp_session_file`` is the omp backend's own conversation file (its
+    ``sessionFile``), which is what omp resumes by (``switch_session``);
+    ``None`` for another backend's session or one omp never reported.
     """
 
     session_id: str
@@ -130,6 +134,7 @@ class SessionInfo:
     turn_count: int
     cost_usd: float
     first_user_text: Optional[str]
+    omp_session_file: Optional[str] = None
 
 
 def _read_json(path: Path) -> Optional[dict]:
@@ -221,6 +226,16 @@ def set_sdk_session_id(project_dir, sid: str, sdk_session_id: str) -> None:
     _write_json_atomic(path, meta)
 
 
+def set_omp_session_file(project_dir, sid: str, session_file: str) -> None:
+    """Record the omp backend's conversation file for ``sid`` once omp
+    reports it, so a later ``-c``/``-r`` resumes that conversation
+    (``session/omp.py``). Like ``set_sdk_session_id``, never fabricated."""
+    path = meta_path(project_dir, sid)
+    meta = _read_json(path) or {"session_id": sid}
+    meta["omp_session_file"] = session_file
+    _write_json_atomic(path, meta)
+
+
 def record_first_user_text(project_dir, sid: str, text: str) -> None:
     """Record a snippet of the first inbound turn, once, for ``-r``'s
     listing. A call after the first is a no-op: the field exists to answer
@@ -264,6 +279,7 @@ def get_session_info(project_dir, sid: str) -> Optional[SessionInfo]:
         turn_count=turn_count,
         cost_usd=cost_usd,
         first_user_text=meta.get("first_user_text"),
+        omp_session_file=meta.get("omp_session_file"),
     )
 
 

@@ -278,6 +278,7 @@ def test_an_unreachable_remote_is_skipped_and_the_tool_server_still_builds(
     finally:
         listener.close()
     assert tools.remotes == ()
+    assert [r.name for r in tools.unreached] == ["gone"]
     assert list(tools.mcp_servers) == ["toy"]
     assert all(name.startswith("mcp__toy__") for name in tools.pre_allowed)
     assert tools.remote_instructions is None
@@ -465,6 +466,111 @@ def test_a_remote_s_instructions_are_cut_to_the_cap(fake, bus, tmp_path, monkeyp
     text = _tools(bus, tmp_path, _fake(fake)).remote_instructions
     assert text.endswith(INSTRUCTIONS[:10] + "\n\n[cut at 10 characters]")
     assert INSTRUCTIONS[10:] not in text
+
+
+# ---------------------------------------------------------------------------
+# a remote unreachable at startup, tried again while the session runs
+# ---------------------------------------------------------------------------
+
+
+def _unreachable_at_first(monkeypatch, fake, tmp_path):
+    """A ViewerBus and a tool server whose one remote, ``fake``, could not be
+    reached when it was built; the remote answers from now on."""
+    from annealage_agent.viewers import ViewerBus
+
+    real_discover = remote_module._discover
+    monkeypatch.setattr(
+        remote_module, "_discover", lambda servers: [OSError("unreachable")] * len(servers)
+    )
+    bus = ViewerBus(None, url="http://127.0.0.1:8765/")
+    tools = _tools(bus, tmp_path, _fake(fake))
+    monkeypatch.setattr(remote_module, "_discover", real_discover)
+    assert tools.remotes == () and [r.name for r in tools.unreached] == ["fake"]
+    return bus, tools
+
+
+@pytest.mark.asyncio
+async def test_a_remote_unreachable_at_startup_is_reached_by_reconnect(
+    fake, tmp_path, monkeypatch, capsys
+):
+    bus, tools = _unreachable_at_first(monkeypatch, fake, tmp_path)
+    reached = await tools.reconnect()
+    assert [r.name for r in reached] == ["fake"]
+    assert tools.unreached == ()
+    assert {"fake__%s" % name for name in PROXIED} <= set(tools.host_tool_table())
+    assert "the fake MCP server, unreachable until now, has been reached" in capsys.readouterr().err
+    assert await tools.reconnect() == ()
+
+
+@pytest.mark.asyncio
+async def test_serve_s_retry_gives_an_omp_session_the_remote_on_the_first_turn(
+    fake, tmp_path, monkeypatch
+):
+    from annealage_agent import app as app_module
+
+    class _OmpLike:
+        def __init__(self):
+            self.tables = []
+
+        async def set_tool_table(self, table):
+            self.tables.append(table)
+            return True
+
+    bus, tools = _unreachable_at_first(monkeypatch, fake, tmp_path)
+    session = _OmpLike()
+    # The first turn arrives long before the timer would fire.
+    retrying = asyncio.ensure_future(app_module.retry_remotes(tools, bus, session, interval=60))
+    blocks = bus.begin_turn([{"type": "text", "text": "find me an LDO"}])
+    await asyncio.wait_for(retrying, 15)
+
+    (table,) = session.tables
+    assert "fake__lookup" in table and "list_notes" in table
+    # The model hears of it on its next turn, with what the remote says of itself.
+    (note, _typed) = bus.begin_turn([{"type": "text", "text": "and now?"}])
+    assert "The fake MCP server, which could not be reached" in note["text"]
+    assert INSTRUCTIONS in note["text"]
+    assert len(blocks) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_session_that_cannot_take_new_tools_is_told_nothing_it_cannot_use(
+    fake, tmp_path, monkeypatch, capsys
+):
+    """Claude's SDK servers and Codex's bridges are fixed when the session
+    starts: the remote's tools wait for the next start, and the model is not
+    told of tools it does not have."""
+    from annealage_agent import app as app_module
+
+    bus, tools = _unreachable_at_first(monkeypatch, fake, tmp_path)
+    bus.first_turn.set()
+    await asyncio.wait_for(app_module.retry_remotes(tools, bus, object(), interval=60), 15)
+    assert "cannot take new tools mid-session" in capsys.readouterr().err
+    assert bus.begin_turn([{"type": "text", "text": "hi"}]) == [{"type": "text", "text": "hi"}]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_hand_off_to_the_session_is_tried_again_rather_than_lost(
+    fake, tmp_path, monkeypatch
+):
+    from annealage_agent import app as app_module
+
+    class _Flaky:
+        def __init__(self):
+            self.attempts = 0
+
+        async def set_tool_table(self, table):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("set_host_tools timed out")
+            return True
+
+    bus, tools = _unreachable_at_first(monkeypatch, fake, tmp_path)
+    bus.first_turn.set()
+    session = _Flaky()
+    await asyncio.wait_for(app_module.retry_remotes(tools, bus, session, interval=0.05), 15)
+    assert session.attempts == 2
+    (note, _typed) = bus.begin_turn([{"type": "text", "text": "hi"}])
+    assert "The fake MCP server, which could not be reached" in note["text"]
 
 
 def _importable(module):

@@ -132,6 +132,7 @@ def build_hello(
     agent_status: str,
     paused: bool = False,
     model: Optional[str] = None,
+    steers: bool = False,
 ) -> dict:
     """The greeting sent once, immediately after a successful upgrade.
 
@@ -153,6 +154,10 @@ def build_hello(
     a wrong default. It is not corrected here on a later live switch; an
     ``AgentModelChanged`` event (``session/base.py``) is what a connected
     client updates its picker from once ``set_model`` actually takes effect.
+
+    ``steers`` says a message sent while a turn is running redirects that
+    turn rather than waiting behind it (the omp backend), so the page can
+    label its Send button for what it will do.
     """
     return {
         "v": PROTOCOL_VERSION,
@@ -165,6 +170,7 @@ def build_hello(
             "agent": agent_status,
             "model": model,
             "paused": bool(paused),
+            "steers": bool(steers),
         },
         "protocol": PROTOCOL_VERSION,
     }

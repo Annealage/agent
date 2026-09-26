@@ -41,6 +41,8 @@ def build_session(
     mcp_port,
     agent_token,
     trusted_config_digest=None,
+    omp_agent_dir=None,
+    omp_binary=None,
 ):
     """The session ``backend`` names, constructed and not yet started.
 
@@ -61,6 +63,20 @@ def build_session(
     ``bus.url``, which carries no token either.
     ``trusted_config_digest`` is the Claude configuration digest the startup
     trust gate accepted, if it ran.
+
+    ``omp_agent_dir`` and ``omp_binary`` are the omp backend's profile
+    directory (its ``PI_CODING_AGENT_DIR``: its own config, auth and models,
+    and none of the user's context files) and an absolute path to the omp
+    executable; ``None`` uses omp as installed on ``PATH``, with the user's
+    own profile. A service running under its own account passes both. They
+    are arguments rather than settings keys because a settings key is
+    writable from the page (``PUT /settings``), and neither an executable
+    nor a profile directory is something a browser should choose. The omp
+    conversation is kept under ``<state dir>/omp`` and resumed from the file
+    recorded in the session's ``meta.json``.
+
+    The session's write-protected patterns are ``bus.write_protected``, the
+    app's (``create_app``); a stand-in bus without them takes the product's.
     """
     if backend not in settings_module.BACKENDS:
         raise AssertionError("unreachable: settings.py validates backend's choices")
@@ -140,6 +156,10 @@ def build_session(
         # require it to be installed.
         from .session.omp import OmpSession
 
+        def _record_session_file(path):
+            sessions.set_omp_session_file(serve_dir, session_id, path)
+
+        info = sessions.get_session_info(serve_dir, session_id) if resumed else None
         return OmpSession(
             on_event,
             cwd=serve_dir,
@@ -156,6 +176,11 @@ def build_session(
             tool_table=bus.tools.host_tool_table(),
             on_sdk_session_id=_record_sdk_id,
             instructions=instructions,
+            agent_dir=omp_agent_dir,
+            binary=omp_binary,
+            session_dir=sessions.state_dir(serve_dir) / "omp",
+            resume=info.omp_session_file if info is not None else None,
+            on_session_file=_record_session_file,
         )
 
     from .session.sdk import SdkSession
@@ -183,4 +208,5 @@ def build_session(
         # calls if it stops being true while the run is in progress.
         trusted_config_digest=trusted_config_digest,
         instructions=instructions,
+        write_protected=getattr(bus, "write_protected", None),
     )

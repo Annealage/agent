@@ -206,6 +206,7 @@ class SdkSession:
         on_sdk_session_id=None,
         trusted_config_digest=None,
         instructions=None,
+        write_protected=None,
     ):
         self._on_event = on_event
         self.cwd = str(cwd)
@@ -230,12 +231,23 @@ class SdkSession:
         # default system prompt is empty (it passes --system-prompt ""), so
         # this becomes the whole of it, and a session with none keeps that.
         self._instructions = instructions or None
+        # The app's write-protected patterns (create_app's write_protected,
+        # through launch.build_session); None takes the product's.
+        self._write_protected = (
+            tuple(write_protected)
+            if write_protected is not None
+            else product.current().write_protected
+        )
 
         self._status = AGENT_CONNECTING
         self._client = None
         self._pump_task = None
         self._closing = False
         self._turn = 0
+        # Set by end_turn_after_tool; the next tool result delivered to the
+        # model interrupts the turn, and that turn ends as ended_by_tool.
+        self._end_turn_pending = False
+        self._stop_reason = None
         self._stderr_lines = []
         # Predicted now so the banner, printed once at startup, is right on a
         # machine that plainly cannot sandbox. Corrected by the child if it
@@ -367,6 +379,13 @@ class SdkSession:
             # either already finished or the child is gone, and both of those
             # surface through the pump.
             sys.stderr.write("warning: interrupt failed: %r\n" % (exc,))
+
+    def end_turn_after_tool(self) -> None:
+        """A tool result asked to end the turn (``tools.ok``'s ``end_turn``).
+        Called from the tool's handler, before the CLI has its result; the
+        turn is interrupted once that result comes back in the message stream
+        (``_handle``), so the conversation keeps it."""
+        self._end_turn_pending = True
 
     async def set_model(self, model: str) -> None:
         """Switch the live conversation to ``model``, no reconnect.
@@ -571,7 +590,7 @@ class SdkSession:
             reason = secret_paths.refusal(
                 tool_name, tool_input, self.cwd
             ) or secret_paths.protected_refusal(
-                tool_name, tool_input, self.cwd, product.current().write_protected
+                tool_name, tool_input, self.cwd, self._write_protected
             )
         except Exception as exc:
             sys.stderr.write("warning: could not check the call's paths: %r\n" % (exc,))
@@ -699,8 +718,10 @@ class SdkSession:
                 # it again would double every reply in the pane.
             return
         if isinstance(message, UserMessage):
+            delivered = False
             for block in message.content or []:
                 if isinstance(block, ToolResultBlock):
+                    delivered = True
                     self._emit(
                         ToolResult(
                             tool_use_id=block.tool_use_id,
@@ -708,16 +729,27 @@ class SdkSession:
                             text=_content_to_text(block.content),
                         )
                     )
+            if delivered and self._end_turn_pending:
+                # The result that asked for it is in the conversation now (a
+                # tool result arrives here once the CLI has it), so the turn
+                # can stop without losing it.
+                self._end_turn_pending = False
+                self._stop_reason = "ended_by_tool"
+                asyncio.ensure_future(self.interrupt())
             return
         if isinstance(message, ResultMessage):
             self._remember_sdk_session(getattr(message, "session_id", None))
             self._emit(
                 TurnEnd(
                     turn=self._turn,
-                    stop_reason=message.stop_reason or message.subtype or "end_turn",
+                    stop_reason=self._stop_reason
+                    or message.stop_reason
+                    or message.subtype
+                    or "end_turn",
                     cost_usd=message.total_cost_usd,
                 )
             )
+            self._stop_reason = None
             return
         if isinstance(message, SystemMessage):
             self._handle_system(message)

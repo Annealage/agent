@@ -141,6 +141,9 @@ def test_build_hello_round_trips():
             # with no agent session yet (or one this project's settings never
             # set a model for) reports that honestly rather than a guess.
             "model": None,
+            # Present and false unless the backend steers (omp), so the page
+            # labels Send as Send.
+            "steers": False,
         },
         "protocol": PROTOCOL_VERSION,
     }

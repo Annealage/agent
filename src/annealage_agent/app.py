@@ -35,6 +35,7 @@ from .http.routes_settings import register_settings_routes
 from .http.static import register_agent_static_routes
 from .http.ws import host_is_allowed, ping_forever, refusal, register_ws
 from .review.watcher import ReviewWatcher
+from .session import secret_paths
 from .session.base import AgentModelChanged
 from .session.events import EventLog
 from .viewers import ViewerBus, ViewerRegistry
@@ -144,6 +145,8 @@ def create_app(
     agent_token=None,
     host=net.DEFAULT_HOST,
     extra_origins=(),
+    extra_hosts=(),
+    write_protected=None,
     session_id=None,
     build_session=None,
     register_routes=None,
@@ -167,11 +170,18 @@ def create_app(
     gives the app a fresh one of its own.
 
     ``host`` is an address already resolved (``net.resolve_bind`` does the
-    resolving, in the product's CLI), and together with ``port`` and
-    ``extra_origins`` it decides the exact ``Origin`` and ``Host`` values this
-    app accepts. Computing those here, from the bind, is what lets a remote
-    viewer work at all: an allowlist hardcoded to localhost would refuse
-    every tailnet client.
+    resolving, in the product's CLI), and together with ``port``,
+    ``extra_origins`` and ``extra_hosts`` it decides the exact ``Origin`` and
+    ``Host`` values this app accepts. Computing those here, from the bind, is
+    what lets a remote viewer work at all: an allowlist hardcoded to
+    localhost would refuse every tailnet client. ``extra_origins`` and
+    ``extra_hosts`` add the name a proxy or ``tailscale serve`` fronts the
+    server under (``https://box.tailnet.ts.net`` and ``box.tailnet.ts.net``).
+
+    ``write_protected`` is this app's write-protected patterns (glob patterns
+    relative to ``serve_dir``, as ``Product.write_protected`` documents),
+    checked here and handed to the session through ``bus.write_protected``;
+    ``None`` takes the product's.
 
     ``token`` is the browser token: the only credential ``/ws``, the chat
     routes, ``/settings`` and every product route that asks for one accept.
@@ -181,7 +191,8 @@ def create_app(
     request. The two are kept apart because the agent token is handed to a
     process beside the agent's own shell (the Codex stdio bridge) and the
     browser token authorises permission decisions, so a run whose two tokens
-    are equal is refused here rather than built.
+    are equal is refused here rather than built. ``net.load_token`` keeps a
+    browser token in a file for a service whose link must survive restarts.
 
     ``session_id`` is the id the CLI resolved for this run (fresh or resumed,
     per plan section 3.4), or None for viewer-only; it is reported in the
@@ -218,10 +229,17 @@ def create_app(
             "permission requests"
         )
     configure_request_limits()
+    if write_protected is None:
+        write_protected = product.current().write_protected
+    else:
+        # Checked before tuple(): a bare string would otherwise become one
+        # pattern per character, each of which passes the check.
+        secret_paths.check_write_protected(write_protected)
+        write_protected = tuple(write_protected)
     csp_value = content_security_policy(page_html)
     bind = net.bind_from_address(host)
     allowed_origins = net.allowed_origins(bind, port, extra_origins)
-    allowed_hosts = net.allowed_hosts(bind, port)
+    allowed_hosts = net.allowed_hosts(bind, port, extra_hosts)
     installed = product.current()
     server_header = installed.server_header
     if (session_id is not None or external_agents) and installed.build_tools is None:
@@ -293,7 +311,10 @@ def create_app(
     # pause control.
     # The tokenless address: ViewerBus's docstring says why the browser token
     # must not appear in anything a tool or the broker says to the model.
-    bus = ViewerBus(registry, url=net.server_url(bind, port))
+    bus = ViewerBus(
+        registry, url=net.server_url(bind, port), publish=_event_publisher(registry, event_log)
+    )
+    bus.write_protected = write_protected
     # The product's tool server, built once, here, whether or not this backend
     # is Claude: both the in-process driver's own ``.mcp_servers`` (Claude,
     # read out of ``bus.tools`` by ``build_session``'s own closure - see
@@ -359,6 +380,7 @@ def create_app(
         # field itself is documented as a snapshot -- the corrected value
         # written back here is what makes it stay one that is current).
         "model": settings.get("model"),
+        "steers": False,
     }
     app.agent_registry = registry
     app.agent_event_log = event_log
@@ -411,6 +433,10 @@ def create_app(
         # tab that connects later sees a ready agent rather than the
         # connecting state this dict was built with.
         session_info["agent"] = session.agent_status()
+        session_info["steers"] = bool(getattr(session, "steers", False))
+        # A tool result's end_turn (tools.ok) reaches the session through
+        # the bus; a session that cannot stop a turn has no handler.
+        bus.end_turn_handler = getattr(session, "end_turn_after_tool", None)
         # /mcp is mounted here, not unconditionally above, for the same
         # reason register_ws's own bus= is None until a session exists: a
         # viewer-only app has no tools and no broker to gate them, so there
@@ -565,6 +591,72 @@ def _event_publisher(registry, event_log, session_info=None):
     return publish
 
 
+#: How often ``serve`` tries a remote MCP server that could not be reached
+#: again, after the one immediate retry the session's first turn triggers.
+REMOTE_RETRY_INTERVAL = 60.0
+
+
+async def retry_remotes(tools, bus, session, interval=REMOTE_RETRY_INTERVAL):
+    """Try the tool server's unreached remotes again until none is left: once
+    as soon as the session's first turn arrives (``bus.first_turn``), and
+    every ``interval`` seconds. A remote reached is handed to the session
+    through its ``set_tool_table``, and, when the session took it, the model
+    is told through a note on its next turn (with what the remote says about
+    its own tools, which the system prompt could not carry). Only omp can take
+    new tools mid-session: a Claude session's SDK servers and allow list, and
+    Codex's bridge entries and tool list, are fixed when it starts, so there
+    the remote's tools arrive with the next session start (a restart, which
+    ``-c`` resumes)."""
+    # Imported here: the tool module loads the agent SDK, which a viewer-only
+    # run never does, and this runs only for an agent session with remotes.
+    from .tools import instructions_of
+
+    first_turn_seen = False
+    # Reached, but not yet handed to the session: a failed set_tool_table is
+    # tried again next tick rather than lost, since reconnect has already
+    # moved these out of tools.unreached.
+    pending = ()
+    while tools.unreached or pending:
+        if first_turn_seen:
+            await asyncio.sleep(interval)
+        else:
+            try:
+                await asyncio.wait_for(bus.first_turn.wait(), interval)
+                first_turn_seen = True
+            except asyncio.TimeoutError:
+                pass
+        if tools.unreached:
+            try:
+                pending += await tools.reconnect()
+            except Exception as exc:
+                sys.stderr.write("warning: retrying the remote MCP servers failed: %r\n" % (exc,))
+        if not pending:
+            continue
+        names = ", ".join(r.name for r in pending)
+        set_tool_table = getattr(session, "set_tool_table", None)
+        try:
+            taken = set_tool_table is not None and await set_tool_table(tools.host_tool_table())
+        except Exception as exc:
+            sys.stderr.write(
+                "warning: could not give the agent %s's tools yet, trying again: %r\n"
+                % (names, exc)
+            )
+            continue
+        reached, pending = pending, ()
+        if not taken:
+            sys.stderr.write(
+                "warning: %s can be reached now, but this agent backend cannot take new tools "
+                "mid-session; they arrive when the session is next started\n" % names
+            )
+            continue
+        note = (
+            "The %s MCP server, which could not be reached when this session started, "
+            "has been reached: its tools are available to you now." % names
+        )
+        instructions = instructions_of(reached)
+        bus.queue_note(note + ("\n\n" + instructions if instructions else ""))
+
+
 async def serve(app, host, port, on_ready=None, background=()):
     """Serve ``app`` on ``host``:``port`` until interrupted.
 
@@ -627,6 +719,10 @@ async def serve(app, host, port, on_ready=None, background=()):
     tasks.append(asyncio.ensure_future(ping_forever(app.agent_registry)))
     if app.agent_review_watcher is not None:
         tasks.append(asyncio.ensure_future(app.agent_review_watcher.run()))
+    if app.agent_session is not None and app.agent_tools is not None and app.agent_tools.unreached:
+        tasks.append(
+            asyncio.ensure_future(retry_remotes(app.agent_tools, app.agent_bus, app.agent_session))
+        )
     if on_ready is not None:
         result = on_ready()
         if inspect.isawaitable(result):

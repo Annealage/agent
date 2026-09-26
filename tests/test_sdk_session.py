@@ -34,6 +34,7 @@ from claude_agent_sdk import (
     Transport,
 )
 from claude_agent_sdk.types import PermissionRuleValue
+from conftest import create_toy_app
 from toy_product import build_toy_tools
 
 from annealage_agent.session import sdk as sdk_module
@@ -137,7 +138,7 @@ class FakeTransport(Transport):
         self.written.append(obj)
         if obj.get("type") == "control_request":
             subtype = obj["request"].get("subtype")
-            if subtype in ("initialize", "set_model"):
+            if subtype in ("initialize", "set_model", "interrupt"):
                 self._queue.put_nowait(
                     {
                         "type": "control_response",
@@ -645,6 +646,117 @@ async def test_result_message_becomes_turn_end_with_its_cost():
         assert end.cost_usd == 0.031
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_tool_result_carrying_end_turn_interrupts_the_turn_once_the_cli_has_it():
+    """``tools.ok(..., end_turn=True)`` reaches the session as
+    ``end_turn_after_tool`` while the tool runs; the interrupt waits for the
+    tool result to come back through the stream, so the conversation keeps
+    it, and the turn then ends as ``ended_by_tool``."""
+    session, transport, recorder = await _started_session()
+
+    def interrupts():
+        return [
+            w
+            for w in transport.written
+            if w.get("type") == "control_request" and w["request"].get("subtype") == "interrupt"
+        ]
+
+    try:
+        session._turn = 1
+        session.end_turn_after_tool()
+        assert interrupts() == []
+        transport.push(
+            {
+                "type": "user",
+                "message": {
+                    "content": [{"type": "tool_result", "tool_use_id": "tu_1", "content": "wait"}]
+                },
+            }
+        )
+        assert isinstance(await recorder.next(), ToolResult)
+        for _ in range(50):
+            if interrupts():
+                break
+            await asyncio.sleep(0.01)
+        assert len(interrupts()) == 1
+        transport.push(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "duration_ms": 1,
+                "duration_api_ms": 1,
+                "is_error": False,
+                "num_turns": 1,
+                "session_id": "sdk-sess-1",
+                "total_cost_usd": 0.01,
+            }
+        )
+        end = await recorder.next()
+        assert isinstance(end, TurnEnd)
+        assert (end.turn, end.stop_reason) == (1, "ended_by_tool")
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.filterwarnings("ignore::claude_agent_sdk.CanUseToolShadowedWarning")
+async def test_each_app_s_write_protected_patterns_reach_its_claude_session(tmp_path):
+    """``create_app(write_protected=...)`` is the app's own set, relative to
+    the directory it serves, in place of the product's (the toy protects
+    nothing): what ``launch.build_session`` gives the session's hook."""
+    from annealage_agent import launch, sessions
+    from annealage_agent import settings as settings_module
+
+    sid = sessions.create_session(tmp_path)
+    built = []
+
+    def build_session(on_event, *, bus):
+        built.append(
+            launch.build_session(
+                "claude",
+                on_event,
+                bus=bus,
+                serve_dir=tmp_path,
+                session_id=sid,
+                resumed=False,
+                settings=settings_module.resolve(tmp_path),
+                mcp_host="127.0.0.1",
+                mcp_port=8765,
+                agent_token="agent",
+            )
+        )
+        return built[0]
+
+    create_toy_app(
+        tmp_path,
+        token="tok",
+        agent_token="agent",
+        session_id=sid,
+        build_session=build_session,
+        write_protected=("designs/*.review.json",),
+    )
+
+    async def decision(tool_name, tool_input):
+        result = await built[0]._guard_secret_paths(
+            {"tool_name": tool_name, "tool_input": tool_input}, "tu_1", None
+        )
+        return result.get("hookSpecificOutput", {}).get("permissionDecision")
+
+    assert await decision("Write", {"file_path": "designs/amp.review.json"}) == "deny"
+    assert await decision("Read", {"file_path": "designs/amp.review.json"}) is None
+    assert await decision("Write", {"file_path": "designs/amp.sketch.json"}) is None
+
+
+def test_a_write_protected_pattern_outside_the_served_directory_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="relative to the served directory"):
+        create_toy_app(tmp_path, token="tok", write_protected=("../elsewhere/*.json",))
+
+
+def test_a_bare_string_for_write_protected_is_refused_not_split_into_characters(tmp_path):
+    with pytest.raises(ValueError, match="tuple of glob patterns"):
+        create_toy_app(tmp_path, token="tok", write_protected="Makefile")
 
 
 def test_sandbox_status_missing_list_comes_from_the_childs_own_words(monkeypatch):

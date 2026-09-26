@@ -20,10 +20,13 @@ machine running the suite.
 import dataclasses
 import ipaddress
 import json
+import os
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
+from pathlib import Path
 from typing import Sequence
 
 from . import product
@@ -295,11 +298,59 @@ def generate_token(explicit=None):
     otherwise 16 fresh random bytes as 22 URL-safe characters.
 
     Regenerated every run, and never written to a config file, so a token
-    that leaks is worthless as soon as the process it belonged to exits.
+    that leaks is worthless as soon as the process it belonged to exits. A
+    service that must keep one link working across restarts uses
+    ``load_token`` instead.
     """
     if explicit:
         return explicit
     return secrets.token_urlsafe(16)
+
+
+def load_token(path):
+    """The browser token kept in the file at ``path``, created (16 random
+    bytes, URL-safe, mode 0600) when it does not exist yet: for a service
+    whose bookmarked link must survive a restart.
+
+    Refuses (``ValueError``) a symlink, a file owned by another user, one
+    other users can read or write, and an empty one: the token approves the
+    agent's write-class calls. The checks and the read go through one file
+    descriptor, so the file checked is the file read. Never rewrites an
+    existing file: rotating the token is deleting the file.
+    """
+    path = Path(path)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
+    except FileExistsError:
+        fd = None
+    if fd is not None:
+        token = secrets.token_urlsafe(16)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(token + "\n")
+        return token
+    try:
+        fd = os.open(path, os.O_RDONLY | nofollow)
+    except OSError as exc:
+        raise ValueError(
+            "the token file %s cannot be opened as a plain file (%s); it must not be "
+            "a symlink" % (path, exc.strerror or exc)
+        ) from None
+    with os.fdopen(fd, "r", encoding="utf-8") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("the token file %s is not a regular file" % path)
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            raise ValueError("the token file %s is owned by another user" % path)
+        if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            raise ValueError(
+                "the token file %s is readable or writable by other users (mode %o); "
+                "chmod 600 it" % (path, stat.S_IMODE(st.st_mode))
+            )
+        token = f.read().strip()
+    if not token:
+        raise ValueError("the token file %s is empty; delete it to have one made" % path)
+    return token
 
 
 def allowed_origins(bind, port, extra_origins=()):
@@ -333,7 +384,7 @@ def allowed_origins(bind, port, extra_origins=()):
     return origins
 
 
-def allowed_hosts(bind, port):
+def allowed_hosts(bind, port, extra_hosts=()):
     """The exact set of ``Host`` header values any route accepts.
 
     Same shape as the Origin set and for the same reason, minus the scheme.
@@ -360,6 +411,11 @@ def allowed_hosts(bind, port):
     so on any other port a portless ``Host`` cannot have come from a browser,
     and on port 80 an attacker's rebound name still arrives as that name and
     still is not in this set.
+
+    ``extra_hosts`` are further ``Host`` values taken verbatim, for the name
+    a reverse proxy or ``tailscale serve`` fronts this server under (a
+    MagicDNS name, with or without a port): as with ``extra_origins``, this
+    process cannot derive it from its own bind.
     """
     hosts = set()
     if bind.is_loopback:
@@ -369,6 +425,7 @@ def allowed_hosts(bind, port):
     for name in names:
         hosts.add(name)
         hosts.add("%s:%d" % (name, port))
+    hosts.update(extra_hosts)
     return hosts
 
 

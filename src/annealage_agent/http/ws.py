@@ -32,7 +32,7 @@ from microdot import Response
 from microdot.websocket import WebSocket, WebSocketError, websocket_upgrade
 
 from .. import protocol
-from ..session.base import PauseChanged, UnknownRequest
+from ..session.base import AGENT_READY, PauseChanged, UnknownRequest
 from ..viewers import ViewerRegistry
 
 # Inbound frame ceiling, and a line that must stay. Microdot's default,
@@ -163,6 +163,7 @@ def register_ws(
                         session_info.get("agent", "unavailable"),
                         paused=bus.paused if bus is not None else False,
                         model=session_info.get("model"),
+                        steers=session_info.get("steers", False),
                     )
                 )
             )
@@ -435,7 +436,17 @@ async def _dispatch(ws, conn, registry, event_log, token, frame, session=None, b
         # reading the interrupt frame that ends it.
         try:
             if kind == "turn":
-                await session.submit_turn(frame["blocks"], viewer=conn.tab_id)
+                blocks = frame["blocks"]
+                # Counted, and the product's queued notes put in front of it,
+                # here in front of every backend (ViewerBus.begin_turn), and
+                # only for a ready session: a connecting or unavailable one
+                # refuses the turn (Codex while its thread starts), and a note
+                # must not be spent, nor bus.turn move, for a turn that never
+                # reached the model. A running turn leaves the session ready,
+                # so a steer counts.
+                if bus is not None and session.agent_status() == AGENT_READY:
+                    blocks = bus.begin_turn(blocks)
+                await session.submit_turn(blocks, viewer=conn.tab_id)
             elif kind == "interrupt":
                 await session.interrupt()
             elif kind == "set_model":

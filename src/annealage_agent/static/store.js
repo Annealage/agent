@@ -352,13 +352,13 @@ function setChatToolResult(toolUseId, isError, text) {
   }, ["chat"]);
 }
 
-function endChatTurn(turn, stopReason, costUsd) {
+function endChatTurn(turn, stopReason, costUsd, tokens = null) {
   commit(() => {
     const chat = state.chat;
     const { turns, pendingUser, idx } = ensureTurn(chat, turn);
     const nextTurns = Object.freeze(
       turns.map((t, i) =>
-        i === idx ? Object.freeze({ ...t, stopReason, costUsd, complete: true }) : t,
+        i === idx ? Object.freeze({ ...t, stopReason, costUsd, tokens, complete: true }) : t,
       ),
     );
     state = { ...state, chat: Object.freeze({ ...chat, turns: nextTurns, pendingUser }) };

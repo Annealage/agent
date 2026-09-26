@@ -88,6 +88,7 @@ from openai_codex.generated.v2_all import (
     ItemCompletedNotification,
     ItemStartedNotification,
     LoginAccountParams,
+    McpToolCallThreadItem,
     PatchApplyStatus,
     SandboxMode,
     ThreadResumeParams,
@@ -210,6 +211,10 @@ class CodexSession:
         self._turn = 0
         self._closing = False
         self._viewers_seen = 0
+        # Set by end_turn_after_tool: the next MCP tool call Codex reports
+        # complete interrupts the turn, which then ends as ended_by_tool.
+        self._end_turn_pending = False
+        self._stop_reason: Optional[str] = None
 
         # See this module's docstring: one pool for one-shot control calls,
         # a second, separate one for the long-lived per-turn drain, so an
@@ -366,6 +371,13 @@ class CodexSession:
             # already finished or the child is gone, and both surface
             # through the drain loop's own failure handling.
             sys.stderr.write("warning: interrupt failed: %r\n" % (exc,))
+
+    def end_turn_after_tool(self) -> None:
+        """A tool result asked to end the turn (``tools.ok``'s ``end_turn``).
+        Called from the tool's handler behind ``/mcp``, before Codex has its
+        result; the turn is interrupted once Codex reports that MCP tool call
+        complete (``_handle_item_completed``)."""
+        self._end_turn_pending = True
 
     async def set_model(self, model: str) -> None:
         """Store the new model; the next ``TurnStartParams`` construction in
@@ -837,6 +849,11 @@ class CodexSession:
         self, payload: ItemCompletedNotification, viewer: Optional[str]
     ) -> None:
         item = payload.item.root
+        if isinstance(item, McpToolCallThreadItem) and self._end_turn_pending:
+            self._end_turn_pending = False
+            self._stop_reason = "ended_by_tool"
+            asyncio.ensure_future(self.interrupt())
+            return
         if isinstance(item, CommandExecutionThreadItem):
             self._emit(
                 ToolResult(
@@ -863,9 +880,8 @@ class CodexSession:
         # Codex has no per-turn cost figure comparable to the Claude API's
         # total_cost_usd (subscription billing does not meter a turn this
         # way); 0.0 is an honest "not applicable" rather than a guess.
-        self._emit(
-            TurnEnd(turn=self._turn, stop_reason=turn.status.value, cost_usd=0.0, viewer=viewer)
-        )
+        stop_reason, self._stop_reason = self._stop_reason or turn.status.value, None
+        self._emit(TurnEnd(turn=self._turn, stop_reason=stop_reason, cost_usd=0.0, viewer=viewer))
 
     # -- failure ---------------------------------------------------------------
 

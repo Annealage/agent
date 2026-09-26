@@ -31,7 +31,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from claude_agent_sdk import SdkMcpTool
+from omp_rpc import RpcClient
 
+from annealage_agent import launch, sessions
+from annealage_agent.session import omp as omp_module
 from annealage_agent.session.base import (
     AGENT_READY,
     AGENT_UNAVAILABLE,
@@ -40,9 +44,11 @@ from annealage_agent.session.base import (
     AgentStatus,
     PermissionRequest,
     PermissionResolved,
+    SessionReset,
     TextDelta,
     ToolResult,
     ToolUse,
+    TurnEnd,
 )
 from annealage_agent.session.omp import (
     OmpSession,
@@ -52,7 +58,8 @@ from annealage_agent.session.omp import (
     _write_agent_dir,
 )
 from annealage_agent.session.permissions import PermissionBroker
-from annealage_agent.tools import ToolSpec
+from annealage_agent.tools import ToolSpec, _wrap, ok
+from annealage_agent.viewers import ViewerBus
 
 
 class FakeRpcClient:
@@ -69,8 +76,16 @@ class FakeRpcClient:
         self.confirmations = []
         self.cancellations = []
         self.set_model_calls = []
+        self.switch_calls = []
+        self.set_custom_tools_calls = []
         self._listeners = {}
         self.session_id = "omp-sess-1"
+        self.session_file = "/sessions/omp-sess-1.jsonl"
+        # What the next prompt raises, if anything (a refusal or a dead process).
+        self.prompt_error = None
+        # The cumulative figures get_session_stats reports.
+        self.cost = 0.0
+        self.tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
 
     def start(self):
         self.started = True
@@ -80,10 +95,28 @@ class FakeRpcClient:
         self.stopped = True
 
     def get_state(self):
-        return SimpleNamespace(session_id=self.session_id)
+        return SimpleNamespace(session_id=self.session_id, session_file=self.session_file)
 
-    def prompt(self, message, *, images=None):
-        self.prompt_calls.append(SimpleNamespace(message=message, images=images))
+    def get_session_stats(self):
+        return SimpleNamespace(cost=self.cost, tokens=SimpleNamespace(**self.tokens))
+
+    def switch_session(self, session_path):
+        self.switch_calls.append(session_path)
+        self.session_file = str(session_path)
+        self.session_id = "omp-resumed"
+        return SimpleNamespace(cancelled=False)
+
+    def set_custom_tools(self, tools):
+        self.set_custom_tools_calls.append(tuple(tools))
+        self.custom_tools = tuple(tools)
+        return tuple(t.name for t in tools)
+
+    def prompt(self, message, *, images=None, streaming_behavior=None):
+        if self.prompt_error is not None:
+            raise self.prompt_error
+        self.prompt_calls.append(
+            SimpleNamespace(message=message, images=images, streaming_behavior=streaming_behavior)
+        )
 
     def abort(self):
         self.abort_calls += 1
@@ -106,6 +139,9 @@ class FakeRpcClient:
 
     def on_ui_request(self, listener):
         self._listeners["ui_request"] = listener
+
+    def on_protocol_error(self, listener):
+        self._listeners["protocol_error"] = listener
 
     def send_ui_confirmation(self, request_id, confirmed):
         self.confirmations.append((request_id, confirmed))
@@ -141,6 +177,14 @@ class FakeRpcClient:
         ``loop.run_in_executor``, never awaited directly -- see this
         module's docstring."""
         self._listeners["ui_request"](request)
+
+    def push_agent_end(self, is_terminal=True):
+        self._listeners["agent_end"](SimpleNamespace(is_terminal=is_terminal))
+
+    def push_protocol_error(self, command, remote_error):
+        self._listeners["protocol_error"](
+            SimpleNamespace(command=command, remote_error=remote_error)
+        )
 
 
 class FakeUiRequest:
@@ -909,5 +953,453 @@ async def test_set_model_to_the_current_model_is_a_no_op():
         await session.set_model("llama-70b")
         assert fake.set_model_calls == []
         assert not any(isinstance(e, AgentModelChanged) for e in recorder.all)
+    finally:
+        await session.close()
+
+
+# ---------------------------------------------------------------------------
+# steering, refused messages, and what a turn end reports
+# ---------------------------------------------------------------------------
+
+
+class RpcCommandError(Exception):
+    """Named like ``omp_rpc``'s: a command omp answered with an error."""
+
+
+class RpcProcessExitError(Exception):
+    """Named like ``omp_rpc``'s: the omp process is gone."""
+
+
+async def _next_of(recorder, kind):
+    while True:
+        event = await recorder.next()
+        if isinstance(event, kind):
+            return event
+
+
+def _text(text):
+    return [{"type": "text", "text": text}]
+
+
+@pytest.mark.asyncio
+async def test_a_message_sent_while_a_turn_runs_steers_it_and_the_session_stays_ready():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn(_text("draw the regulator"))
+        fake.push_message_update({"type": "text_delta", "delta": "Working"})
+        assert (await _next_of(recorder, TextDelta)).turn == 1
+
+        await session.submit_turn(_text("use the LDO instead"))
+        # Both as a steer-capable prompt: omp starts a turn with the first and
+        # redirects the running one with the second, never refusing either.
+        assert [(c.message, c.streaming_behavior) for c in fake.prompt_calls] == [
+            ("draw the regulator", "steer"),
+            ("use the LDO instead", "steer"),
+        ]
+        steered = await _next_of(recorder, TurnEnd)
+        assert (steered.turn, steered.stop_reason) == (1, "steered")
+        assert session.agent_status() == AGENT_READY
+
+        # The agent's further output belongs to the steering message's turn,
+        # which omp's one agent_end for the whole run ends.
+        fake.push_message_update({"type": "text_delta", "delta": "Switching"})
+        assert (await _next_of(recorder, TextDelta)).turn == 2
+        fake.push_agent_end()
+        ended = await _next_of(recorder, TurnEnd)
+        assert (ended.turn, ended.stop_reason) == (2, "end")
+
+        # Idle again: the next message ends nothing before it starts.
+        await session.submit_turn(_text("thanks"))
+        assert [e.turn for e in recorder.all if isinstance(e, TurnEnd)] == [1, 2]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_refused_message_is_reported_and_leaves_the_session_ready():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        fake.prompt_error = RpcCommandError("No model selected")
+        await session.submit_turn(_text("hello"))
+        error = await _next_of(recorder, AgentError)
+        assert error.stderr == "No model selected"
+        assert "still ready" in error.remediation
+        # The turn the message would have started is closed, so the pane is
+        # not left waiting on it.
+        ended = await _next_of(recorder, TurnEnd)
+        assert (ended.turn, ended.stop_reason) == (1, "rejected")
+        assert session.agent_status() == AGENT_READY
+
+        fake.prompt_error = None
+        await session.submit_turn(_text("hello again"))
+        assert [c.message for c in fake.prompt_calls] == ["hello again"]
+        assert not any(isinstance(e, TurnEnd) and e.stop_reason == "steered" for e in recorder.all)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_message_refused_after_omp_acknowledged_it_is_reported_the_same_way():
+    """``omp://rpc.md``: a prompt's scheduling can fail after its immediate
+    success response, as an error response nothing is waiting on."""
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn(_text("hello"))
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, fake.push_protocol_error, "set_model", "unrelated")
+        await loop.run_in_executor(None, fake.push_protocol_error, "prompt", "quota exhausted")
+        error = await _next_of(recorder, AgentError)
+        assert error.stderr == "quota exhausted"
+        ended = await _next_of(recorder, TurnEnd)
+        assert (ended.turn, ended.stop_reason) == (1, "rejected")
+        assert session.agent_status() == AGENT_READY
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_only_a_dead_omp_process_makes_a_sent_message_mark_the_session_unavailable():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        fake.prompt_error = RpcProcessExitError("RPC process stopped")
+        await session.submit_turn(_text("hello"))
+        assert session.agent_status() == AGENT_UNAVAILABLE
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_turn_end_reports_that_turn_s_cost_and_tokens_from_the_session_stats():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn(_text("one"))
+        fake.cost = 0.25
+        fake.tokens = {"input": 1000, "output": 200, "cache_read": 50, "cache_write": 10}
+        fake.push_agent_end()
+        first = await _next_of(recorder, TurnEnd)
+        assert first.cost_usd == pytest.approx(0.25)
+        assert first.tokens == {"input": 1000, "output": 200, "cache_read": 50, "cache_write": 10}
+
+        await session.submit_turn(_text("two"))
+        fake.cost = 0.40
+        fake.tokens = {"input": 1600, "output": 260, "cache_read": 950, "cache_write": 10}
+        fake.push_agent_end()
+        second = await _next_of(recorder, TurnEnd)
+        # This turn's share, not the session's running total.
+        assert second.cost_usd == pytest.approx(0.15)
+        assert second.tokens == {"input": 600, "output": 60, "cache_read": 900, "cache_write": 0}
+    finally:
+        await session.close()
+
+
+# ---------------------------------------------------------------------------
+# the conversation file: recorded, and resumed by switch_session
+# ---------------------------------------------------------------------------
+
+
+def _omp_launch(tmp_path, recorder, *, resumed, base_url):
+    """``launch.build_session``'s omp session for ``tmp_path``'s session."""
+    sid = sessions.resolve_continue(tmp_path) if resumed else sessions.create_session(tmp_path)
+    sessions.record_last_session(tmp_path, sid)
+    tools = SimpleNamespace(
+        host_tool_table=_tool_table, never_remembered=(), remote_instructions=None
+    )
+    return launch.build_session(
+        "omp",
+        recorder,
+        bus=SimpleNamespace(tools=tools, broker=None, url="http://127.0.0.1:8765/"),
+        serve_dir=tmp_path,
+        session_id=sid,
+        resumed=resumed,
+        settings={"model": None, "omp_base_url": base_url, "omp_api_key": None},
+        mcp_host="127.0.0.1",
+        mcp_port=8765,
+        agent_token="agent-token",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("base_url", [None, "http://127.0.0.1:11434/v1"])
+async def test_the_conversation_file_is_recorded_and_a_resume_switches_to_it(
+    tmp_path, monkeypatch, base_url
+):
+    """In both provider modes: omp's own configuration, and a custom endpoint,
+    whose throwaway agent directory ``close()`` deletes and so must never hold
+    the conversation."""
+    clients = []
+
+    def factory(**kwargs):
+        fake = FakeRpcClient(**kwargs)
+        # What omp does with --session-dir: its conversation file lives there.
+        fake.session_file = str(Path(kwargs["session_dir"]) / "conversation.jsonl")
+        Path(fake.session_file).write_text("{}\n")
+        clients.append(fake)
+        return fake
+
+    monkeypatch.setattr(omp_module, "RpcClient", factory)
+    first = _omp_launch(tmp_path, EventRecorder(), resumed=False, base_url=base_url)
+    await first.start()
+    launched = clients[0]
+    session_dir = sessions.state_dir(tmp_path) / "omp"
+    assert launched.kwargs["session_dir"] == str(session_dir)
+    assert "no_session" not in launched.kwargs
+    conversation = launched.session_file
+    sid = sessions.resolve_continue(tmp_path)
+    assert sessions.get_session_info(tmp_path, sid).omp_session_file == conversation
+    agent_dir = launched.kwargs["env"].get("PI_CODING_AGENT_DIR")
+    assert (agent_dir is not None) == (base_url is not None)
+    await first.close()
+    if agent_dir is not None:
+        assert not Path(agent_dir).exists()
+    assert Path(conversation).is_file()
+
+    recorder = EventRecorder()
+    resumed = _omp_launch(tmp_path, recorder, resumed=True, base_url=base_url)
+    await resumed.start()
+    try:
+        assert clients[1].switch_calls == [conversation]
+        assert resumed.agent_status() == AGENT_READY
+        assert not any(isinstance(e, SessionReset) for e in recorder.all)
+    finally:
+        await resumed.close()
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_file_omp_never_wrote_is_nothing_to_resume(tmp_path):
+    """omp names its file at start and writes it with the first message, so a
+    session that ended before one leaves none; that is a fresh start, not a
+    failed resume."""
+    session, fake, recorder, broker = await _started_session(
+        session_dir=tmp_path / "omp", resume=str(tmp_path / "never-written.jsonl")
+    )
+    try:
+        assert fake.switch_calls == []
+        assert not any(isinstance(e, SessionReset) for e in recorder.all)
+        assert session.agent_status() == AGENT_READY
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_omp_cannot_open_is_reported_and_the_session_starts_fresh(
+    tmp_path, monkeypatch
+):
+    broken = tmp_path / "broken.jsonl"
+    broken.write_text("not a session\n")
+
+    def refuse(self, session_path):
+        raise RpcCommandError("Invalid session file")
+
+    monkeypatch.setattr(FakeRpcClient, "switch_session", refuse)
+    session, fake, recorder, broker = await _started_session(
+        session_dir=tmp_path / "omp", resume=str(broken)
+    )
+    try:
+        reset = next(e for e in recorder.all if isinstance(e, SessionReset))
+        assert str(broken) in reset.reason and "Invalid session file" in reset.reason
+        assert session.agent_status() == AGENT_READY
+    finally:
+        await session.close()
+
+
+# ---------------------------------------------------------------------------
+# a profile and a binary of the product's own
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_agent_dir_and_binary_reach_the_omp_command_line_and_environment(tmp_path):
+    seen = {}
+
+    def factory(**kwargs):
+        # The real client builds the argv it would spawn; only running it is
+        # left to the fake.
+        seen["command"] = RpcClient(**kwargs).command
+        seen["env"] = dict(kwargs["env"])
+        return FakeRpcClient(**kwargs)
+
+    session = OmpSession(
+        EventRecorder(),
+        cwd=tmp_path,
+        session_id="s-1",
+        tool_table=_tool_table(),
+        client_factory=factory,
+        agent_dir=str(tmp_path / "profile"),
+        binary="/opt/omp/bin/omp",
+        session_dir=tmp_path / "state" / "omp",
+    )
+    await session.start()
+    try:
+        command = seen["command"]
+        assert command[:3] == ("/opt/omp/bin/omp", "--mode", "rpc")
+        assert command[command.index("--session-dir") + 1] == str(tmp_path / "state" / "omp")
+        assert "--no-session" not in command
+        assert seen["env"]["PI_CODING_AGENT_DIR"] == str(tmp_path / "profile")
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kwargs, reason",
+    [
+        ({"binary": "bin/omp"}, "absolute path"),
+        (
+            {"agent_dir": "/srv/loom/omp", "base_url": "http://127.0.0.1:11434/v1"},
+            "PI_CODING_AGENT_DIR",
+        ),
+    ],
+)
+async def test_a_relative_binary_or_a_profile_beside_a_custom_endpoint_is_refused(kwargs, reason):
+    launched = []
+    recorder = EventRecorder()
+    session = OmpSession(
+        recorder,
+        cwd="/proj/root",
+        session_id="s-1",
+        tool_table=_tool_table(),
+        client_factory=lambda **kw: launched.append(kw),
+        **kwargs,
+    )
+    await session.start()
+    assert launched == []
+    assert session.agent_status() == AGENT_UNAVAILABLE
+    assert reason in next(e for e in recorder.all if isinstance(e, AgentError)).remediation
+    await session.close()
+
+
+# ---------------------------------------------------------------------------
+# a tool result that ends the turn, and a tool table replaced mid-session
+# ---------------------------------------------------------------------------
+
+
+async def _checkpoint_session():
+    """A started session whose one tool, ``checkpoint``, ends the turn through
+    the real ``_wrap`` and ``ViewerBus`` path."""
+
+    async def checkpoint(args):
+        return ok(text="Stop and wait for the human.", end_turn=True)
+
+    bus = ViewerBus(None, url="http://127.0.0.1:8765/")
+    wrapped = _wrap(
+        SdkMcpTool(name="checkpoint", description="hand back", input_schema={}, handler=checkpoint),
+        bus=bus,
+        gated=False,
+        paused_message="paused",
+    )
+    table = dict(_tool_table())
+    table["checkpoint"] = ToolSpec(
+        schema={"type": "object", "properties": {}},
+        description="hand back",
+        handler=wrapped.handler,
+        write=False,
+    )
+    session, fake, recorder, broker = await _started_session(tool_table=table)
+    bus.end_turn_handler = session.end_turn_after_tool
+    return session, fake, recorder
+
+
+async def _run_tool(fake, name, call_id, params=None):
+    """Run host tool ``name`` as omp's per-call thread would, for ``call_id``."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, fake.tool(name).execute, params or {}, SimpleNamespace(tool_call_id=call_id)
+    )
+
+
+async def _settle(fake, expected_aborts):
+    for _ in range(50):
+        if fake.abort_calls >= expected_aborts:
+            break
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_a_tool_result_carrying_end_turn_aborts_the_turn_once_it_is_delivered():
+    session, fake, recorder = await _checkpoint_session()
+    try:
+        await session.submit_turn(_text("draw it, then check in"))
+        result = await _run_tool(fake, "checkpoint", "call-cp")
+        # What omp receives is an ordinary result; the request travels apart.
+        assert result == {
+            "content": [{"type": "text", "text": "Stop and wait for the human."}],
+            "details": {},
+        }
+        # A sibling tool running in parallel finishes first: not the result
+        # that asked, so nothing stops yet.
+        sibling = await _run_tool(fake, "get_view", "call-2", {"q": "x"})
+        fake.push_tool_execution_end("call-2", "get_view", sibling)
+        await _next_of(recorder, ToolResult)
+        await _settle(fake, 1)
+        assert fake.abort_calls == 0
+        # Once omp has the checkpoint's own result, the turn is stopped.
+        fake.push_tool_execution_end("call-cp", "checkpoint", result)
+        await _next_of(recorder, ToolResult)
+        await _settle(fake, 1)
+        assert fake.abort_calls == 1
+        fake.push_agent_end()
+        ended = await _next_of(recorder, TurnEnd)
+        assert (ended.turn, ended.stop_reason) == (1, "ended_by_tool")
+        assert session.agent_status() == AGENT_READY
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_an_end_turn_request_whose_result_never_arrived_does_not_end_a_later_turn():
+    session, fake, recorder = await _checkpoint_session()
+    try:
+        await session.submit_turn(_text("check in"))
+        await _run_tool(fake, "checkpoint", "call-cp")
+        # The human interrupts; omp never reports that call's end, and the
+        # run settles.
+        fake.push_agent_end()
+        await _next_of(recorder, TurnEnd)
+
+        await session.submit_turn(_text("carry on"))
+        result = await _run_tool(fake, "get_view", "call-cp", {"q": "x"})
+        fake.push_tool_execution_end("call-cp", "get_view", result)
+        await _next_of(recorder, ToolResult)
+        await _settle(fake, 1)
+        assert fake.abort_calls == 0
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_run_s_end_that_the_loop_sees_after_a_new_message_settles_only_its_own_turn():
+    """omp ends run 1, and a new message's submit begins before the loop has
+    handled that end: turn 1 ends as steered, and the late settle must not
+    close turn 2, whose own run settles it."""
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn(_text("one"))
+        fake.push_agent_end()  # queued on the loop, not yet handled
+        await session.submit_turn(_text("two"))
+        await asyncio.sleep(0.05)
+        ends = [(e.turn, e.stop_reason) for e in recorder.all if isinstance(e, TurnEnd)]
+        assert ends == [(1, "steered")]
+        fake.push_agent_end()
+        await asyncio.sleep(0.05)
+        ends = [(e.turn, e.stop_reason) for e in recorder.all if isinstance(e, TurnEnd)]
+        assert ends == [(1, "steered"), (2, "end")]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_set_tool_table_registers_the_new_tools_with_the_running_omp():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        table = dict(_tool_table())
+        table["ds-wiki__search_parts"] = ToolSpec(
+            schema={"type": "object", "properties": {}},
+            description="search",
+            handler=_read_handler,
+            write=False,
+        )
+        assert await session.set_tool_table(table) is True
+        (registered,) = fake.set_custom_tools_calls
+        assert {t.name for t in registered} == {"get_view", "add_note", "ds-wiki__search_parts"}
     finally:
         await session.close()

@@ -19,7 +19,7 @@ broker. Streamable HTTP only: no command or stdio entry, so nothing a
 declaration names is ever spawned, the property ``strict_mcp_config`` exists
 for.
 
-**Discovery, once, when the tool server is built.** For each remote:
+**Discovery, when the tool server is built.** For each remote:
 connect, ``initialize``, make the optional ``prime`` call (a server that
 advertises more tools once a first tool has been called, as some do until
 their getting-started tool is called, lists only a few before it), then
@@ -29,9 +29,10 @@ tools, which ``tools._verify`` holds to their grading exactly, a remote's
 tool set changes without the product changing, so a listed tool its grading
 does not name is left out and a graded one it does not list is skipped, each
 with a warning, and neither stops the session. Nor does a remote that cannot
-be reached within ``DISCOVERY_TIMEOUT``: the session starts without it. A
-tool set is fixed at startup; a remote's later ``tools/list_changed`` is not
-followed.
+be reached within ``DISCOVERY_TIMEOUT``: the session starts without it, and
+``ToolServer.reconnect`` tries it again later (``app.serve`` does, on a timer
+and on the first turn). A reached remote's tool set is fixed from then on; its
+later ``tools/list_changed`` is not followed.
 
 ``ToolServer`` is built synchronously, inside ``create_app``, which products
 call from within their running event loop. Discovery therefore runs on a
@@ -120,23 +121,33 @@ class RemoteServer(
 Connected = namedtuple("Connected", "name grading tools server instructions")
 
 
-def connect(servers, *, product_server, bus, paused_message):
-    """The ``Connected`` remotes of ``servers``, in order, leaving out any
-    that could not be reached (with a warning). Refuses, before connecting to
-    anything, a remote named like ``product_server``, two remotes with one
-    name, a name no backend can carry, or a grading naming a tool twice."""
+def connect(servers, *, product_server, bus, paused_message, retry=False):
+    """``(connected, unreached)``: the ``Connected`` remotes of ``servers``,
+    in order, and the ``RemoteServer``s that could not be reached. Refuses,
+    before connecting to anything, a remote named like ``product_server``, two
+    remotes with one name, a name no backend can carry, or a grading naming a
+    tool twice.
+
+    ``retry`` is a second attempt at remotes already reported unreachable
+    (``ToolServer.reconnect``): one still unreachable is not reported again,
+    and one reached now is."""
     _check(servers, product_server)
     listings = _discover(servers)
     version = product.current().version
     connected = []
+    unreached = []
     for server, listing in zip(servers, listings, strict=True):
         if isinstance(listing, BaseException):
-            _warn(
-                "the %s MCP server could not be reached (%s), so this session starts "
-                "without its tools"
-                % (server.name, _reason(listing, DISCOVERY_TIMEOUT) or repr(_leaf(listing)))
-            )
+            unreached.append(server)
+            if not retry:
+                _warn(
+                    "the %s MCP server could not be reached (%s), so this session starts "
+                    "without its tools; it is tried again while the session runs"
+                    % (server.name, _reason(listing, DISCOVERY_TIMEOUT) or repr(_leaf(listing)))
+                )
             continue
+        if retry:
+            _warn("the %s MCP server, unreachable until now, has been reached" % server.name)
         instructions, listed = listing
         listed = {tool.name: tool for tool in listed}
         graded = set(server.grading.read) | set(server.grading.view) | set(server.grading.write)
@@ -172,7 +183,7 @@ def connect(servers, *, product_server, bus, paused_message):
                 instructions=(instructions or "").strip() or None,
             )
         )
-    return tuple(connected)
+    return tuple(connected), tuple(unreached)
 
 
 def _check(servers, product_server):

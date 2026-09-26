@@ -279,6 +279,40 @@ async def test_generate_token_passes_through_explicit_value(net):
     assert net.generate_token("my-fixed-token") == "my-fixed-token"
 
 
+async def test_load_token_makes_a_private_token_file_once_and_reads_it_back(net, tmp_path):
+    path = tmp_path / "token"
+    token = net.load_token(path)
+    assert len(token) >= 22
+    assert path.stat().st_mode & 0o777 == 0o600
+    # A restart gets the same token, so a bookmarked link keeps working.
+    assert net.load_token(path) == token
+
+
+async def test_load_token_refuses_a_file_other_users_can_read(net, tmp_path):
+    path = tmp_path / "token"
+    path.write_text("shared-token\n")
+    path.chmod(0o644)
+    with pytest.raises(ValueError, match="chmod 600"):
+        net.load_token(path)
+
+
+async def test_load_token_refuses_a_symlink_even_to_a_private_file(net, tmp_path):
+    target = tmp_path / "elsewhere"
+    target.write_text("someone-elses-token\n")
+    target.chmod(0o600)
+    link = tmp_path / "token"
+    link.symlink_to(target)
+    with pytest.raises(ValueError, match="symlink"):
+        net.load_token(link)
+
+
+async def test_allowed_hosts_includes_extra_hosts_verbatim(net):
+    bind = net.resolve_bind("127.0.0.1")
+    hosts = net.allowed_hosts(bind, 8765, extra_hosts=("loom.tail1234.ts.net",))
+    assert "loom.tail1234.ts.net" in hosts
+    assert "127.0.0.1:8765" in hosts
+
+
 # ---------------------------------------------------------------------------
 # Allowed origins.
 # ---------------------------------------------------------------------------

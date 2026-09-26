@@ -207,6 +207,7 @@ export function initWs({
   let ws = null;
   let opened = false; // true once this attempt's WebSocket has reached readyState OPEN
   let lastSeq = 0;
+  let liveAfter = 0;
   let attempt = 0;
   let stopped = false; // permanently done trying: protocol mismatch or a confirmed 403
   let fallbackFired = false; // whether this downtime episode has already switched to polling
@@ -401,6 +402,9 @@ export function initWs({
       return;
     }
     lastSeq = frame.seq;
+    // Everything up to here is replay of what already happened; only a later
+    // seq is live (chat.js raises no notification for a replayed attention).
+    liveAfter = frame.seq;
     attempt = 0;
     fallbackFired = false;
     clearTimeout(fallbackTimer);
@@ -428,7 +432,7 @@ export function initWs({
     } else if (productHandlers.has(kind)) {
       productHandlers.get(kind)(event);
     } else {
-      onAgentEvent(event);
+      onAgentEvent(event, { replayed: frame.seq <= liveAfter });
     }
   }
 

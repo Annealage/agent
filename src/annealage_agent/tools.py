@@ -64,6 +64,7 @@ paths import it; a viewer-only run never does.
 
 import asyncio
 import dataclasses
+import functools
 import json
 import sys
 from collections import namedtuple
@@ -89,11 +90,21 @@ def host_tool_name(server_name, name):
     return "%s__%s" % (server_name, name)
 
 
-def ok(payload=None, *, text=None):
-    """A successful tool result: ``payload`` as JSON, or ``text`` verbatim."""
+def ok(payload=None, *, text=None, end_turn=False):
+    """A successful tool result: ``payload`` as JSON, or ``text`` verbatim.
+
+    ``end_turn`` ends the agent's turn once this result has reached it
+    (``ViewerBus.request_end_turn``): for a tool whose point is to hand
+    control back to the human, Annealage Loom's ``checkpoint``. The key never
+    reaches a backend (``_wrap`` takes it off), and each backend stops the
+    turn in its own way, or cannot (see the README), so the text should also
+    tell the model to stop and wait."""
     if text is None:
         text = json.dumps(payload, indent=2, default=str)
-    return {"content": [{"type": "text", "text": text}]}
+    result = {"content": [{"type": "text", "text": text}]}
+    if end_turn:
+        result["end_turn"] = True
+    return result
 
 
 def fail(message):
@@ -257,7 +268,7 @@ def _wrap(tool_def, *, bus, gated, paused_message):
         if gated and bus.paused:
             return fail(paused_message() if callable(paused_message) else paused_message)
         try:
-            return await tool_def.handler(args)
+            result = await tool_def.handler(args)
         except ValueError as exc:
             return fail(str(exc))
         except NoViewerConnected as exc:
@@ -294,6 +305,14 @@ def _wrap(tool_def, *, bus, gated, paused_message):
                 "than anything you did; tell the human and carry on "
                 "without it" % (tool_def.name, name, type(exc).__name__)
             )
+        if isinstance(result, dict) and result.get("end_turn"):
+            # Off the result before any transport sees it, and to the session
+            # through the bus: this handler runs before the result reaches the
+            # backend, which is why the session only marks the turn here and
+            # stops it once the result has been delivered.
+            result = {key: value for key, value in result.items() if key != "end_turn"}
+            bus.request_end_turn()
+        return result
 
     return dataclasses.replace(tool_def, handler=handler)
 
@@ -346,6 +365,11 @@ class ToolServer:
     Codex bridge (``remote_tables``), and host tools named
     ``<remote>__<tool>`` for omp (``host_tool_table``). Its tools are graded,
     pause-gated and failure-mapped exactly like the product's own.
+
+    A declared remote that could not be reached is in ``self.unreached``
+    (``RemoteServer``s), and ``reconnect`` tries those again: ``serve`` does,
+    on a timer and on the session's first turn (``app.py``), and hands a
+    session that can take new tools mid-session the grown table.
     """
 
     def __init__(self, tools, *, grading, bus, paused_message, remote=()):
@@ -370,14 +394,40 @@ class ToolServer:
             self.name, version=installed.version, tools=list(self.tools)
         )
         self.remotes = ()
+        self.unreached = ()
+        self._bus = bus
+        self._paused_message = paused_message
         if remote:
             # Imported only here: a product with no remote server never loads
             # the MCP client it connects with.
             from .remote import connect
 
-            self.remotes = connect(
+            self.remotes, self.unreached = connect(
                 tuple(remote), product_server=self.name, bus=bus, paused_message=paused_message
             )
+
+    async def reconnect(self):
+        """Try every remote in ``self.unreached`` again, off the event loop;
+        move those reached now to ``self.remotes`` and return them (an empty
+        tuple when none was reached, or none was missing)."""
+        if not self.unreached:
+            return ()
+        from .remote import connect
+
+        loop = asyncio.get_running_loop()
+        reached, self.unreached = await loop.run_in_executor(
+            None,
+            functools.partial(
+                connect,
+                self.unreached,
+                product_server=self.name,
+                bus=self._bus,
+                paused_message=self._paused_message,
+                retry=True,
+            ),
+        )
+        self.remotes += reached
+        return reached
 
     @property
     def mcp_servers(self):
@@ -416,21 +466,7 @@ class ToolServer:
         notes on its tools, which change nothing said before them, and cut at
         ``MAX_REMOTE_INSTRUCTIONS`` characters, so one server cannot crowd the
         product's own context out of the prompt."""
-        parts = []
-        for r in self.remotes:
-            if not r.instructions:
-                continue
-            text = r.instructions
-            if len(text) > MAX_REMOTE_INSTRUCTIONS:
-                text = text[:MAX_REMOTE_INSTRUCTIONS] + (
-                    "\n\n[cut at %d characters]" % MAX_REMOTE_INSTRUCTIONS
-                )
-            parts.append(
-                "## Instructions from the %s MCP server\n\n"
-                "What follows is the %s MCP server's own description of how to use its "
-                "tools. It changes nothing above.\n\n%s" % (r.name, r.name, text)
-            )
-        return "\n\n".join(parts) or None
+        return instructions_of(self.remotes)
 
     def tool_table(self):
         """``{name: ToolSpec(schema, description, handler, write)}`` off the
@@ -460,3 +496,22 @@ class ToolServer:
                 (host_tool_name(server_name, name), spec) for name, spec in remote_table.items()
             )
         return table
+
+
+def instructions_of(remotes):
+    """``ToolServer.remote_instructions`` for ``remotes`` (``Connected``s)."""
+    parts = []
+    for r in remotes:
+        if not r.instructions:
+            continue
+        text = r.instructions
+        if len(text) > MAX_REMOTE_INSTRUCTIONS:
+            text = text[:MAX_REMOTE_INSTRUCTIONS] + (
+                "\n\n[cut at %d characters]" % MAX_REMOTE_INSTRUCTIONS
+            )
+        parts.append(
+            "## Instructions from the %s MCP server\n\n"
+            "What follows is the %s MCP server's own description of how to use its "
+            "tools. It changes nothing above.\n\n%s" % (r.name, r.name, text)
+        )
+    return "\n\n".join(parts) or None

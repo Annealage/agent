@@ -127,16 +127,44 @@ constructor knobs of its own; a custom OpenAI-compatible provider is
 `models.yml`"), loaded only from ``<agent dir>/models.yml``/``.yaml``
 (`omp://models.md`'s "Config file location") -- there is no `--config`
 overlay path or per-project file for it. ``PI_CODING_AGENT_DIR`` relocates
-that entire agent directory (auth store, sessions, cache, and the model
-config alongside it), so this session gives every launch its own throwaway
-temp directory via that env var, writes a ``models.yml`` there, and tears
-the directory down in ``close()``. This keeps the human's own `omp` install
+that entire agent directory (auth store, cache, and the model config
+alongside it), so this session gives every launch its own throwaway temp
+directory via that env var, writes a ``models.yml`` there, and tears the
+directory down in ``close()``. This keeps the human's own `omp` install
 (auth, other providers, saved sessions) completely untouched by a
-product-launched local-backend run. The file is written as ``json.dumps(...)``
-rather than through a YAML library: JSON is valid YAML, `omp`'s config
-loader accepts a `.yml` path with JSON content without complaint, and this
-avoids adding a YAML dependency for a one-off machine-generated file no
-human ever hand-edits.
+product-launched local-backend run. The conversation itself is never kept
+there: it lives in ``session_dir`` (``--session-dir``), below. The file is
+written as ``json.dumps(...)`` rather than through a YAML library: JSON is
+valid YAML, `omp`'s config loader accepts a `.yml` path with JSON content
+without complaint, and this avoids adding a YAML dependency for a one-off
+machine-generated file no human ever hand-edits.
+
+**A profile of its own.** ``agent_dir`` points ``PI_CODING_AGENT_DIR`` at a
+directory the product names (a service's own auth, settings and
+``models.yml``, and none of the human's global context files); it and
+``omp_base_url`` are exclusive, since both would own that variable (a
+profile names its custom endpoint in its own ``models.yml``). ``binary`` is
+an absolute path to the `omp` executable, for a service whose ``PATH`` does
+not have it; never relative, which would resolve inside the served
+directory.
+
+**Steering and resuming.** Every human message is sent as ``prompt`` with
+``streamingBehavior: "steer"``: an idle `omp` starts a turn with it, a busy
+one queues it to redirect the running turn (``omp://rpc.md``, "While
+streaming"; a prompt with no streaming behaviour is refused while a turn
+runs). Sending the steer form every time rather than choosing from this
+session's own idea of whether a turn is running means a race between the
+two can never turn a message into a refusal. The pane shows a steer as the
+next turn: the running turn ends as ``steered`` and the agent's further
+output carries the new turn number. A message `omp` refuses is reported in
+the chat and leaves the session ready; only a dead `omp` process marks it
+unavailable. With ``session_dir`` given, `omp` keeps its conversation there
+(``--session-dir``, in the workspace's state directory, never in the
+throwaway agent directory), the conversation file it reports
+(``get_state``'s ``sessionFile``) is recorded through ``on_session_file``,
+and ``resume`` names such a file to switch to at start (``switch_session``).
+Tokens and cost per turn are the difference between two
+``get_session_stats`` readings, one at each turn's end.
 
 ``omp_api_key``, when set, is never written into ``models.yml`` as a
 literal string: `omp`'s own ``apiKey`` resolution (`omp://providers.md`)
@@ -154,9 +182,11 @@ not fighting it.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import hashlib
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -176,6 +206,7 @@ from .base import (
     AgentModelChanged,
     AgentStatus,
     SandboxStatus,
+    SessionReset,
     TextDelta,
     ToolResult,
     ToolUse,
@@ -234,7 +265,17 @@ class OmpSession:
     `omp` host tools rather than through a second transport (unlike Codex,
     which needs its own stdio-to-HTTP MCP bridge -- see this file's module
     docstring). A write-grade call asks the broker under that same name.
+    ``set_tool_table`` replaces it mid-session (a remote reached late).
+
+    ``agent_dir``, ``binary``, ``session_dir``, ``resume`` and
+    ``on_session_file`` are this module's docstring's profile, executable,
+    conversation directory, conversation file to resume, and the callback
+    that records the conversation file `omp` reports. Without
+    ``session_dir`` the conversation is not kept (``--no-session``).
     """
+
+    #: A message sent while a turn runs redirects it (``hello``'s ``steers``).
+    steers = True
 
     def __init__(
         self,
@@ -250,6 +291,11 @@ class OmpSession:
         on_sdk_session_id=None,
         client_factory: Optional[Callable[..., Any]] = None,
         instructions: Optional[str] = None,
+        agent_dir=None,
+        binary: Optional[str] = None,
+        session_dir=None,
+        resume: Optional[str] = None,
+        on_session_file=None,
     ):
         self._on_event = on_event
         self.cwd = str(cwd)
@@ -266,12 +312,36 @@ class OmpSession:
         self._tool_table = dict(tool_table or {})
         self._on_sdk_session_id = on_sdk_session_id
         self._client_factory = client_factory or RpcClient
+        self._profile_dir = (
+            os.path.abspath(os.path.expanduser(str(agent_dir))) if agent_dir else None
+        )
+        self._binary = os.path.expanduser(binary) if binary else None
+        self._session_dir = Path(session_dir) if session_dir is not None else None
+        self._resume = resume or None
+        self._on_session_file = on_session_file
+        self.session_file: Optional[str] = None
 
         self._status = AGENT_CONNECTING
         self._client = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._agent_dir: Optional[Path] = None
+        # The throwaway PI_CODING_AGENT_DIR an omp_base_url run writes its
+        # models.yml into, removed by close(); never where a conversation is.
+        self._temp_agent_dir: Optional[Path] = None
         self._turn = 0
+        # Whether a turn is running, as far as this session knows: set when a
+        # message is sent, cleared by omp's terminal agent_end. Decides only
+        # whether a new message ends the running turn as "steered" in the
+        # pane; omp itself decides what the message does (see the module
+        # docstring on why every message is sent the steer way).
+        self._running = False
+        # end_turn_after_tool's tool call ids, read on the reader thread once
+        # that call's result is delivered (_on_tool_execution_end), and the
+        # stop reason the turn it ends reports.
+        self._end_turn_calls: set = set()
+        self._stop_reason: Optional[str] = None
+        # The session's cumulative cost and tokens at the last turn end (or
+        # at start), which the next turn's figures are the difference from.
+        self._usage: Optional[dict] = None
         self._closing = False
         self._viewers_seen = 0
         # tool_call_id -> tool_name for whichever host-tool calls are
@@ -326,7 +396,14 @@ class OmpSession:
             self._viewers_seen -= 1
 
     async def submit_turn(self, blocks: list, viewer: Optional[str] = None) -> None:
-        """Send one prompt to `omp` and return once it is accepted.
+        """Send one human message to `omp` and return once it is accepted.
+
+        Always as a steer-capable prompt (this module's docstring says why):
+        with no turn running it starts one, with one running it redirects
+        it, and the running turn ends in the pane as ``steered`` while its
+        further output carries this message's turn number. A message `omp`
+        refuses is reported (``_refused``) and the session stays ready; only
+        a dead `omp` process marks it unavailable.
 
         Unlike Codex's per-turn notification scope, `omp`'s event listeners
         (registered once in ``start()``) keep delivering
@@ -346,16 +423,69 @@ class OmpSession:
                 )
             )
             return
+        steering = self._running
+        if steering:
+            self._emit(TurnEnd(turn=self._turn, stop_reason="steered", cost_usd=0.0))
+        # Before sending, not after: omp may start streaming the new turn
+        # before it answers the prompt, and those events must carry this
+        # turn's number.
         self._turn += 1
+        self._running = True
+        turn = self._turn
         try:
             loop = asyncio.get_running_loop()
             expanded = await loop.run_in_executor(
                 None, turn_images.expand_turn_blocks, blocks, self.cwd
             )
             message, images = _to_omp_prompt(expanded)
-            await self._run_blocking(self._client.prompt, message, images=images)
+            await self._run_blocking(
+                self._client.prompt, message, images=images, streaming_behavior="steer"
+            )
         except Exception as exc:
-            self._fail(exc, viewer=viewer)
+            if _process_gone(exc):
+                self._running = False
+                self._fail(exc, viewer=viewer)
+            else:
+                self._refused(str(exc) or type(exc).__name__, turn, ends_turn=not steering)
+
+    def _refused(self, reason: str, turn: int, *, ends_turn: bool) -> None:
+        """`omp` refused a message (at once, or later: ``_on_protocol_error``).
+        Reported in the chat; the session stays ready. ``ends_turn`` closes
+        the turn the message would have started, so the pane does not wait on
+        it; a refused steer leaves the running turn running."""
+        self._emit(
+            AgentError(
+                stderr=reason,
+                remediation="omp did not accept that message, so the agent never saw it; "
+                "the session is still ready, so send it again",
+            )
+        )
+        if ends_turn:
+            self._running = False
+            self._emit(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=0.0))
+
+    def end_turn_after_tool(self) -> None:
+        """A tool result asked to end the turn (``tools.ok``'s ``end_turn``).
+        Called from the tool's handler, before omp has its result; omp's
+        ``tool_execution_end`` for that same tool call (``_on_tool_execution_end``)
+        is when the result is in the conversation, and the turn is aborted
+        then. Keyed on the call's id, so a sibling tool running in parallel
+        cannot trigger it, and forgotten when the turn settles, so a request
+        whose end never came cannot end a later turn."""
+        tool_call_id = _TOOL_CALL_ID.get()
+        if tool_call_id is not None:
+            self._end_turn_calls.add(tool_call_id)
+
+    async def set_tool_table(self, tool_table: dict) -> bool:
+        """Register ``tool_table`` (``ToolServer.host_tool_table()``'s shape)
+        as this session's host tools in place of the old set, through omp's
+        ``set_host_tools``, which applies before the next model call. False
+        when `omp` is not running to take them."""
+        self._tool_table = dict(tool_table)
+        if self._client is None:
+            return False
+        await self._run_blocking(self._client.set_custom_tools, self._build_host_tools())
+        return True
 
     async def decide_permission(self, request_id: str, decision: str, message: str = "") -> None:
         """Route a human's decision to the broker. Identical to
@@ -448,53 +578,54 @@ class OmpSession:
 
     async def start(self) -> None:
         """Write this run's throwaway agent dir (if ``omp_base_url`` is
-        set), launch `omp`, and register every listener; never raise. See
-        ``SdkSession.start``'s docstring for why: the HTTP server starts
-        independently and must keep serving the viewer whatever the agent
-        does.
+        set), launch `omp`, register every listener, switch to the
+        conversation to resume (if any) and record the one `omp` is in;
+        never raise. See ``SdkSession.start``'s docstring for why: the HTTP
+        server starts independently and must keep serving the viewer whatever
+        the agent does.
         """
         self._loop = asyncio.get_running_loop()
-        if self._api_key and not self._base_url:
-            self._fail(
-                ValueError(
-                    "omp_api_key is set without omp_base_url; omp_api_key only "
-                    "applies to an arbitrary omp_base_url endpoint, since a provider "
-                    "omp already knows about carries its own credentials"
-                )
-            )
+        refusal = self._configuration_refusal()
+        if refusal is not None:
+            self._fail(ValueError(refusal))
             return
         try:
             if self._base_url:
                 # An arbitrary/self-hosted OpenAI-compatible endpoint `omp`
                 # does not already know about: synthesize this session's own
-                # throwaway custom provider (models.yml) pointing at it, the
-                # same as before this method grew the branch below.
+                # throwaway custom provider (models.yml) pointing at it.
                 model_id = self._model or _DEFAULT_MODEL_ID
-                self._agent_dir, api_key_env = _write_agent_dir(
+                self._temp_agent_dir, api_key_env = _write_agent_dir(
                     self._base_url, self._api_key, model_id, self.session_id
                 )
-                env = {"PI_CODING_AGENT_DIR": str(self._agent_dir)}
+                env = {"PI_CODING_AGENT_DIR": str(self._temp_agent_dir)}
                 env.update(api_key_env)
                 model_arg = "%s/%s" % (_provider_id(), model_id)
             else:
-                # No omp_base_url: use `omp` exactly as already configured
-                # on this host -- no PI_CODING_AGENT_DIR override, so its own
-                # provider registry and credential resolution are untouched.
+                # No omp_base_url: `omp`'s own provider registry and
+                # credentials, from the profile ``agent_dir`` names or, with
+                # none, the human's own (no PI_CODING_AGENT_DIR override).
                 # `self._model` (e.g. "titan/qwen3.8-27b", or None to take
                 # omp's own default) is passed straight through to
                 # ``--model``, the same fuzzy provider/model reference a
                 # human would type at the CLI. `RpcClient.start()` merges
                 # `env` onto `os.environ` rather than replacing it
-                # (confirmed by reading ``omp_rpc/client.py``), so the empty
-                # dict here changes nothing about the child's environment.
+                # (confirmed by reading ``omp_rpc/client.py``).
                 env = {}
+                if self._profile_dir is not None:
+                    env["PI_CODING_AGENT_DIR"] = self._profile_dir
                 model_arg = self._model
-            extra_client_kwargs = (
-                {"append_system_prompt": self._instructions} if self._instructions else {}
-            )
+            client_kwargs = {}
+            if self._instructions:
+                client_kwargs["append_system_prompt"] = self._instructions
+            if self._session_dir is not None:
+                self._session_dir.mkdir(parents=True, exist_ok=True)
+                client_kwargs["session_dir"] = str(self._session_dir)
+            else:
+                client_kwargs["no_session"] = True
             self._client = self._client_factory(
-                **extra_client_kwargs,
-                executable="omp",
+                **client_kwargs,
+                executable=self._binary or "omp",
                 model=model_arg,
                 cwd=self.cwd,
                 env=env,
@@ -507,7 +638,6 @@ class OmpSession:
                 # docstring on the permission design this makes possible.
                 tools=(),
                 custom_tools=self._build_host_tools(),
-                no_session=True,
                 extra_args=("--auto-approve", "--no-extensions"),
             )
             self._register_listeners()
@@ -529,15 +659,63 @@ class OmpSession:
             self._discard_agent_dir()
             self._fail(exc)
             return
+        if self._resume:
+            await self._switch_to(self._resume)
         try:
             state = await self._run_blocking(self._client.get_state)
             self._remember_sdk_session(state.session_id)
+            self._remember_session_file(state.session_file)
         except Exception as exc:
-            # Cosmetic only (the hello frame's own session id field): a
-            # session that cannot fetch this still works, it just reports
-            # None until something else updates it.
-            sys.stderr.write("warning: could not read the omp session id: %r\n" % (exc,))
+            # A session that cannot read this still works; what it costs is
+            # the hello frame's session id and a later -c resuming it.
+            sys.stderr.write("warning: could not read the omp session state: %r\n" % (exc,))
+        self._usage = await self._read_usage()
         self._set_status(AGENT_READY)
+
+    def _configuration_refusal(self) -> Optional[str]:
+        """Why this session's configuration cannot start, or None."""
+        if self._api_key and not self._base_url:
+            return (
+                "omp_api_key is set without omp_base_url; omp_api_key only "
+                "applies to an arbitrary omp_base_url endpoint, since a provider "
+                "omp already knows about carries its own credentials"
+            )
+        if self._base_url and self._profile_dir is not None:
+            return (
+                "omp_base_url and an omp agent directory are both set, and both "
+                "would own omp's PI_CODING_AGENT_DIR; name the endpoint in the agent "
+                "directory's own models.yml instead"
+            )
+        if self._binary is not None and not os.path.isabs(self._binary):
+            return (
+                "the omp binary must be an absolute path, not %r, which would be "
+                "looked for relative to the served directory" % self._binary
+            )
+        return None
+
+    async def _switch_to(self, session_file: str) -> None:
+        """Resume the conversation in ``session_file``; a conversation that
+        cannot be resumed is reported (``SessionReset``) and this one goes on
+        as a new conversation. A file that does not exist is nothing to
+        resume rather than a failure: `omp` names the file at start but
+        writes it with the first message, so a session that never had one
+        leaves no file behind."""
+        if not await self._run_blocking(os.path.isfile, session_file):
+            return
+        reason = None
+        try:
+            result = await self._run_blocking(self._client.switch_session, session_file)
+            if getattr(result, "cancelled", False):
+                reason = "omp cancelled the switch to %s" % session_file
+        except Exception as exc:
+            reason = "omp could not open %s (%s)" % (session_file, exc)
+        if reason is not None:
+            self._emit(
+                SessionReset(
+                    reason="asked to resume the previous omp conversation, but %s; "
+                    "this is a new conversation" % reason
+                )
+            )
 
     async def close(self) -> None:
         self._closing = True
@@ -557,9 +735,9 @@ class OmpSession:
         self._set_status(AGENT_UNAVAILABLE)
 
     def _discard_agent_dir(self) -> None:
-        if self._agent_dir is not None:
-            shutil.rmtree(self._agent_dir, ignore_errors=True)
-            self._agent_dir = None
+        if self._temp_agent_dir is not None:
+            shutil.rmtree(self._temp_agent_dir, ignore_errors=True)
+            self._temp_agent_dir = None
 
     # -- host tools -------------------------------------------------------------
 
@@ -599,8 +777,13 @@ class OmpSession:
         write = spec.write
         handler = spec.handler
 
-        def execute(params, _context):
+        def execute(params, context):
+            tool_call_id = getattr(context, "tool_call_id", None)
+
             async def run():
+                # Seen by end_turn_after_tool if this tool's handler asks to
+                # end the turn: the task running this coroutine carries it.
+                _TOOL_CALL_ID.set(tool_call_id)
                 if write and self._broker is not None:
                     decision = await self._broker.ask(name, dict(params), None)
                     if not decision.allow:
@@ -623,6 +806,7 @@ class OmpSession:
         client.on_tool_execution_end(self._on_tool_execution_end)
         client.on_agent_end(self._on_agent_end)
         client.on_ui_request(self._on_ui_request)
+        client.on_protocol_error(self._on_protocol_error)
 
     def _on_message_update(self, event) -> None:
         """Runs on `omp_rpc`'s reader thread; every emit crosses back onto
@@ -669,21 +853,81 @@ class OmpSession:
             self._emit,
             ToolResult(tool_use_id=event.tool_call_id, is_error=bool(event.is_error), text=text),
         )
+        if event.tool_call_id in self._end_turn_calls:
+            # The result that asked to end the turn is in the conversation
+            # now (a sibling tool's end, running in parallel, is not this
+            # one), so aborting keeps it; omp's RPC has no way for a host
+            # tool to end the turn itself, so this is the abort a human's
+            # interrupt sends.
+            self._end_turn_calls.discard(event.tool_call_id)
+            self._loop.call_soon_threadsafe(self._end_turn_now)
+
+    def _end_turn_now(self) -> None:
+        self._stop_reason = "ended_by_tool"
+        asyncio.ensure_future(self.interrupt())
 
     def _on_agent_end(self, event) -> None:
         if event.is_terminal is False:
             # Maintenance/async delivery scheduled more work; not the turn's
             # true final settle (omp://rpc.md's Event Stream Schema).
             return
+        # Read here, on the reader thread, in wire order: the turn this run
+        # ended in, whatever the loop has done by the time the settle runs.
         turn = self._turn
-        self._loop.call_soon_threadsafe(self._emit_turn_end, turn)
+        self._loop.call_soon_threadsafe(self._turn_settled, turn)
 
-    def _emit_turn_end(self, turn: int) -> None:
-        # No per-turn cost figure is available from an arbitrary
-        # OpenAI-compatible endpoint the way a metered subscription reports
-        # one; 0.0 is an honest "not applicable", the same reasoning
-        # CodexSession's own TurnEnd uses for subscription billing.
-        self._emit(TurnEnd(turn=turn, stop_reason="end", cost_usd=0.0))
+    def _turn_settled(self, turn: int) -> None:
+        """On the loop, for omp's terminal ``agent_end`` of a run that ended
+        in ``turn``. Its ``TurnEnd`` follows once its cost is read.
+
+        A settle for a turn no longer current is dropped: a message sent
+        between omp ending the run and this callback already ended that turn
+        as ``steered`` and started a run of its own, whose own ``agent_end``
+        settles it."""
+        if turn != self._turn:
+            return
+        self._running = False
+        self._end_turn_calls.clear()
+        stop_reason, self._stop_reason = self._stop_reason or "end", None
+        asyncio.ensure_future(self._emit_turn_end(turn, stop_reason))
+
+    async def _emit_turn_end(self, turn: int, stop_reason: str) -> None:
+        cost, tokens = 0.0, None
+        usage = await self._read_usage()
+        if usage is not None and self._usage is not None:
+            cost = max(0.0, usage["cost"] - self._usage["cost"])
+            tokens = {key: usage[key] - self._usage[key] for key in _TOKEN_KEYS}
+        if usage is not None:
+            self._usage = usage
+        self._emit(TurnEnd(turn=turn, stop_reason=stop_reason, cost_usd=cost, tokens=tokens))
+
+    async def _read_usage(self) -> Optional[dict]:
+        """The session's cumulative cost and token counts so far
+        (``get_session_stats``), or None when omp cannot say."""
+        try:
+            stats = await self._run_blocking(self._client.get_session_stats)
+        except Exception as exc:
+            sys.stderr.write("warning: could not read the omp session's usage: %r\n" % (exc,))
+            return None
+        usage = {key: int(getattr(stats.tokens, key)) for key in _TOKEN_KEYS}
+        usage["cost"] = float(stats.cost)
+        return usage
+
+    def _on_protocol_error(self, error) -> None:
+        """Runs on `omp_rpc`'s reader thread for an error response nothing
+        was waiting on. For ``prompt`` that is `omp` refusing a message it
+        had already acknowledged (``omp://rpc.md``: async prompt scheduling
+        can fail after the immediate success response)."""
+        if getattr(error, "command", None) != "prompt":
+            return
+        reason = getattr(error, "remote_error", None) or str(error)
+        turn = self._turn
+        self._loop.call_soon_threadsafe(self._prompt_refused_late, reason, turn)
+
+    def _prompt_refused_late(self, reason: str, turn: int) -> None:
+        """Reported whatever the turn; the turn is closed only if it is still
+        the current one (a later message has otherwise already moved on)."""
+        self._refused(reason, turn, ends_turn=self._running and turn == self._turn)
 
     def _on_ui_request(self, request) -> None:
         """Runs on `omp_rpc`'s reader thread. See this module's docstring on
@@ -753,6 +997,18 @@ class OmpSession:
                 except Exception as exc:
                     sys.stderr.write("warning: could not record the omp session id: %r\n" % (exc,))
 
+    def _remember_session_file(self, session_file: Optional[str]) -> None:
+        """Record `omp`'s conversation file, what a later ``-c`` resumes."""
+        if session_file and session_file != self.session_file:
+            self.session_file = session_file
+            if self._on_session_file is not None:
+                try:
+                    self._on_session_file(session_file)
+                except Exception as exc:
+                    sys.stderr.write(
+                        "warning: could not record the omp conversation file: %r\n" % (exc,)
+                    )
+
     def _fail(self, exc: BaseException, viewer: Optional[str] = None) -> None:
         """Report a failure as an event and mark the session unavailable.
         Never raises. Identical in intent to ``SdkSession._fail``/
@@ -771,6 +1027,24 @@ class OmpSession:
             self._on_event(event)
         except Exception as exc:
             sys.stderr.write("warning: could not deliver %s: %r\n" % (type(event).__name__, exc))
+
+
+#: The token counts a turn's ``TurnEnd`` reports, as ``omp_rpc``'s
+#: ``TokenUsage`` names them.
+_TOKEN_KEYS = ("input", "output", "cache_read", "cache_write")
+
+#: The id of the host tool call whose handler is running in this task
+#: (``_make_execute``), for ``OmpSession.end_turn_after_tool``.
+_TOOL_CALL_ID: contextvars.ContextVar = contextvars.ContextVar("omp_tool_call_id", default=None)
+
+
+def _process_gone(exc: BaseException) -> bool:
+    """Whether ``exc`` means the `omp` process itself is gone, which is the
+    one failure of a sent message that makes the session unavailable; a
+    command `omp` answered with an error, or one it did not answer in time,
+    leaves a running process that can take the next message. Matched by
+    class name, like ``_remediation_for``."""
+    return type(exc).__name__ == "RpcProcessExitError" or isinstance(exc, BrokenPipeError)
 
 
 # ---------------------------------------------------------------------------
@@ -948,8 +1222,9 @@ def _remediation_for(exc: BaseException) -> str:
     name = type(exc).__name__
     if name == "FileNotFoundError":
         return (
-            "the omp CLI could not be found on PATH; install it (see "
-            "https://omp.sh/) before using backend=omp"
+            "the omp CLI could not be found, on PATH or at the omp binary path "
+            "this product was given; install it (see https://omp.sh/) before "
+            "using backend=omp"
         )
     if name == "RpcTimeoutError":
         return (

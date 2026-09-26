@@ -44,6 +44,7 @@
  * turn's composer blocks do not change after the turn is sent.
  */
 
+import { initAttention, notifyAttention } from "./attention.js";
 import { store } from "./store.js";
 import { uploadImage } from "./uploads.js";
 import { toast } from "./ui.js";
@@ -308,6 +309,10 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
   // The session this pane belongs to, learned from the hello frame. Null until
   // then, and null for a viewer-only run, which has no conversation to write.
   let sessionId = null;
+  // Whether a message sent while a turn runs redirects it (the hello's
+  // `steers`, the omp backend), which is what the Send button then says.
+  let steers = false;
+  initAttention(root);
 
   // turn number -> {row, textEl, toolsEl, metaEl, userEl, tools: Map<tool_use_id, {card, resultEl}>}
   const turnEls = new Map();
@@ -531,7 +536,10 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     }
 
     if (t.complete) {
-      rec.metaEl.textContent = "Stop: " + t.stopReason + " · $" + t.costUsd.toFixed(4);
+      const tokens = t.tokens
+        ? " · " + t.tokens.input + " in / " + t.tokens.output + " out"
+        : "";
+      rec.metaEl.textContent = "Stop: " + t.stopReason + " · $" + t.costUsd.toFixed(4) + tokens;
     } else {
       rec.metaEl.textContent = "";
     }
@@ -775,10 +783,14 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
   function renderSendButton(chat) {
     const unavailable = chat.agentStatus === "unavailable";
     const uploading = chat.attachments.some((a) => a.state === "uploading");
+    const busy = chat.pendingUser.length > 0 || chat.turns.some((t) => !t.complete);
+    const steering = steers && busy && !unavailable;
     chatSendBtn.disabled = unavailable || uploading;
+    chatSendBtn.textContent = steering ? "Steer" : "Send";
     chatSendBtn.title = uploading
       ? "Waiting for an attachment to finish uploading"
-      : (unavailable ? titles.unavailable : "");
+      : (unavailable ? titles.unavailable
+        : (steering ? "The agent is working: this message redirects it now" : ""));
   }
 
   function renderBanner(chat) {
@@ -914,10 +926,12 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     // writing out. Viewer-only runs report "viewer-only" here and have no
     // conversation to export, which the button reflects by staying disabled.
     sessionId = session && session.id ? session.id : null;
+    steers = !!(session && session.steers);
+    renderSendButton(store.getState().chat);
     renderExportButton();
   }
 
-  function handleEvent(event) {
+  function handleEvent(event, meta = {}) {
     if (!event) return;
     switch (event.kind) {
       case "text_delta":
@@ -930,7 +944,14 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
         store.setChatToolResult(event.tool_use_id, !!event.is_error, event.text);
         break;
       case "turn_end":
-        store.endChatTurn(event.turn, event.stop_reason, event.cost_usd);
+        store.endChatTurn(event.turn, event.stop_reason, event.cost_usd, event.tokens || null);
+        break;
+      case "attention":
+        // History on a reconnect is not a call for the human now.
+        if (!meta.replayed) {
+          notifyAttention(event.title, event.body);
+          store.setChatBanner("info", event.title + ": " + event.body);
+        }
         break;
       case "permission_request":
         store.addChatPermissionRequest(

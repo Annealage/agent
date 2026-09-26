@@ -341,6 +341,75 @@ async def test_a_session_factory_that_returns_none_builds_a_working_app(tmp_path
 
 
 # ---------------------------------------------------------------------------
+# What the bus gives a product's tools: attention, and ending a turn
+# ---------------------------------------------------------------------------
+
+
+async def test_attention_is_published_to_the_page_and_recorded_in_the_event_log(tmp_path):
+    from annealage_agent import sessions
+    from annealage_agent.session.fake import FakeSession
+
+    sid = sessions.create_session(tmp_path)
+    app = create_toy_app(
+        tmp_path,
+        token="tok",
+        session_id=sid,
+        build_session=lambda on_event, *, bus: FakeSession(on_event, session_id=sid),
+    )
+    app.agent_bus.attention("Checkpoint: circuit", "Is the power tree right?")
+    replay = app.agent_event_log.replay(0)
+    assert [event for _seq, event in replay.events] == [
+        {"kind": "attention", "title": "Checkpoint: circuit", "body": "Is the power tree right?"}
+    ]
+    assert '"kind": "attention"' in sessions.events_path(tmp_path, sid).read_text()
+
+
+async def test_a_tool_s_end_turn_reaches_the_session_that_can_stop_its_turn(tmp_path):
+    from annealage_agent import sessions
+    from annealage_agent.session.fake import FakeSession
+
+    class _Stoppable(FakeSession):
+        ended = 0
+
+        def end_turn_after_tool(self):
+            self.ended += 1
+
+    sid = sessions.create_session(tmp_path)
+    app = create_toy_app(
+        tmp_path,
+        token="tok",
+        session_id=sid,
+        build_session=lambda on_event, *, bus: _Stoppable(on_event, session_id=sid),
+    )
+    app.agent_bus.request_end_turn()
+    assert app.agent_session.ended == 1
+
+
+# ---------------------------------------------------------------------------
+# A fixed token, and the name and origin a proxy fronts the server under
+# ---------------------------------------------------------------------------
+
+
+async def test_an_app_behind_a_proxy_accepts_the_host_and_origin_it_is_given(tmp_path):
+    from microdot.test_client import TestClient
+
+    name, origin = "loom.tail1234.ts.net", "https://loom.tail1234.ts.net"
+    app = create_toy_app(tmp_path, token="kept-token", extra_origins=(origin,), extra_hosts=(name,))
+    proxied = TestClient(app, host=name)
+    res = await proxied.get("/settings?t=kept-token", headers={"Origin": origin})
+    assert res.status_code == 200
+    res = await proxied.get("/settings?t=other-token", headers={"Origin": origin})
+    assert res.status_code != 200
+
+    # The same request to an app not told the name is refused before any route.
+    plain = create_toy_app(tmp_path, token="kept-token")
+    res = await TestClient(plain, host=name).get(
+        "/settings?t=kept-token", headers={"Origin": origin}
+    )
+    assert res.status_code != 200
+
+
+# ---------------------------------------------------------------------------
 # The content security policy
 # ---------------------------------------------------------------------------
 

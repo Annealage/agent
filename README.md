@@ -315,6 +315,24 @@ A product describes itself with one `annealage_agent.product.Product`, installed
 
 `app.create_app` takes the product's page (`page_html`, whose inline scripts the Content-Security-Policy hashes at startup), a `register_routes(app, allowed_origins)` for its own routes, the two tokens, the session factory and, optionally, a `review_store` and `external_agents=True` (below). `app.serve` binds, starts the session once the socket is listening, runs the product's background tasks and shuts it all down on Ctrl-C.
 
+For a service that runs persistently (behind `tailscale serve`, say), `create_app` also takes:
+
+- `token`: the browser token, given explicitly. `net.load_token(path)` keeps one in a 0600 file, creating it on first use, so a bookmarked link survives restarts; `net.generate_token()` is the per-run default.
+- `host` and `port`: the bind. `extra_origins` and `extra_hosts`: the `Origin` (`https://box.tailnet.ts.net`) and `Host` (`box.tailnet.ts.net`) a proxy fronts the server under, accepted verbatim beside what the bind allows.
+- `write_protected`: this app's write-protected patterns, relative to the served directory, in place of `Product.write_protected` (`None`, the default, keeps the product's).
+
+`launch.build_session` takes `omp_agent_dir` (the omp profile directory, set as `PI_CODING_AGENT_DIR`: its own config, auth and models, none of the user's context files) and `omp_binary` (an absolute path to `omp`). They are arguments for the product's CLI to pass, not settings keys, because settings are writable from the page. An omp conversation is kept under `<state dir>/omp`, the session's `meta.json` records omp's conversation file, and `-c`/`-r` resume it with `switch_session`, whether omp uses its own providers or `omp_base_url`. `OmpSession` itself takes these as `agent_dir`, `binary`, `session_dir`, `resume` and `on_session_file`.
+
+What the bus gives a product's tools beyond `call`:
+
+- `bus.turn`: how many human turns the session has accepted (0 before the first, and in a viewer-only or external-agent run).
+- `bus.queue_note(text)`: text put in front of the next human turn, as a text block of its own marked as a note from the product rather than the human, on every backend (omp joins it to the message text; marker strings inside a note are defused, so a note cannot close itself early). Several notes go together; none is sent twice. A turn counts, and takes the notes, only when it goes to a ready session.
+- `bus.on_turn_start(callback)`: `callback(turn)` runs synchronously as each human turn is accepted, with the new turn number, before that turn's notes are taken, so a note it queues goes with the same turn. A callback that raises is logged and does not stop the turn.
+- `bus.attention(title, body)`: an `attention` event. The page shows a browser notification (permission is asked on the first click) and flashes its title until focused; a replayed one does neither.
+- `tools.ok(..., end_turn=True)`: the result ends the agent's turn once the backend has it. omp aborts after its `tool_execution_end`, Claude interrupts once the tool result comes back through the stream, Codex interrupts once the MCP tool call completes. The turn ends as `ended_by_tool`. The text should still tell the model to stop and wait.
+
+On omp, a message sent while a turn runs steers it (the page's Send button reads "Steer" then), a message omp refuses is reported and leaves the session ready, and each turn's cost and tokens come from `get_session_stats`. A remote MCP server that could not be reached at startup is tried again on the first turn and every minute; omp gets its tools at once (`set_host_tools`) and the model a note saying so. Claude's SDK servers and allow list, and Codex's bridges and tool list, are fixed when the session starts, so there the remote's tools arrive with the next start.
+
 ## The front end
 
 The page loads the pane's modules through one import map entry, `"agent/": "/agent/static/"`, and its stylesheet from `/agent/static/agent.css`. Nothing is bundled, and the page's own inline scripts are allowed by hash, so the product needs no build step either.

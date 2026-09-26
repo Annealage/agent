@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 from typing import Any, Dict, Optional
 
-from . import protocol
+from . import product, protocol
 from .protocol import CLOSE_OVERFLOW, build_call, build_event, close_with_code
-from .session.base import ViewerPrimary
+from .session.base import Attention, ViewerPrimary
 
 # Per-connection outbound queue depth (plan section 3.3). Deep enough to
 # absorb a burst of tool-result and text-delta events between two 30 ms
@@ -52,6 +53,19 @@ NO_VIEWER_MESSAGE = (
 # short enough that a model waiting on a page that will never answer learns so
 # while the human is still watching the same turn.
 CALL_TIMEOUT = 10.0
+
+# The markers ``ViewerBus.begin_turn`` wraps the product's notes in, and the
+# pattern that finds either inside a note's own text (any case, any spacing
+# after the bracket), which ``_neutralise_markers`` defuses.
+_NOTE_OPEN = "[System note from %s, not written by the human]"
+_NOTE_CLOSE = "[End of system note]"
+_MARKER_RE = re.compile(r"\[(\s*(?:end\s+of\s+system\s+note|system\s+note\s+from))", re.IGNORECASE)
+
+
+def _neutralise_markers(text: str) -> str:
+    """``text`` with every opening bracket of a note marker turned into a
+    quoted form, so text inside a note can neither close it nor open one."""
+    return _MARKER_RE.sub(r"(quoted \1", text)
 
 
 class NoViewerConnected(Exception):
@@ -701,13 +715,50 @@ class ViewerBus:
     can line up a view or edit a pin comment without the agent moving things
     out from under them; a model that goes on reading while paused is doing no
     harm and is better informed when the pause lifts.
+
+    **The turn counter and the notes.** ``turn`` is the number of human turns
+    the session has accepted (0 before the first), which a tool can stamp on
+    what it writes (Annealage Loom's ``Loom-Turn:`` commit trailer).
+    ``http/ws.py`` counts a turn through ``begin_turn``, which is also where
+    the notes ``queue_note`` collected are prefixed to it: one place in front
+    of every backend, so a note reaches the model the same way whichever one
+    runs. A viewer-only or external-agent run never accepts a turn, so its
+    ``turn`` stays 0 and its notes are never sent.
+
+    ``attention`` publishes an ``Attention`` event through ``publish``, the
+    app's event publisher (``None`` for a bus built outside ``create_app``,
+    whose ``attention`` then does nothing). ``request_end_turn`` is how a tool
+    result's ``end_turn`` (``tools.ok``) reaches the session, through
+    ``end_turn_handler``, which ``create_app`` sets to the session's
+    ``end_turn_after_tool`` when it has one.
+
+    ``write_protected`` is the app's write-protected patterns
+    (``create_app``), which ``launch.build_session`` hands to the session.
     """
 
-    def __init__(self, registry: ViewerRegistry, *, url: str, timeout: float = CALL_TIMEOUT):
+    def __init__(
+        self,
+        registry: ViewerRegistry,
+        *,
+        url: str,
+        timeout: float = CALL_TIMEOUT,
+        publish: Optional[Any] = None,
+    ):
         self._registry = registry
         self._url = url
         self._timeout = timeout
         self._paused = False
+        self._publish = publish
+        self._turn = 0
+        self._notes: list = []
+        self._turn_start_callbacks: list = []
+        self.end_turn_handler: Optional[Any] = None
+        # None: no app set it, so the session takes the product's patterns.
+        self.write_protected: Optional[tuple] = None
+        # Set by the first ``begin_turn``: the app's remote-server retry waits
+        # on it, so a remote unreachable at startup is tried again the moment
+        # the session is first used rather than only on its timer.
+        self.first_turn = asyncio.Event()
 
     @property
     def url(self) -> str:
@@ -717,6 +768,65 @@ class ViewerBus:
     @property
     def paused(self) -> bool:
         return self._paused
+
+    @property
+    def turn(self) -> int:
+        """The number of human turns the session has accepted."""
+        return self._turn
+
+    def queue_note(self, text: str) -> None:
+        """Prefix ``text`` to the next human turn sent to the model, as a
+        marked system note (see ``begin_turn``). Notes queued before one turn
+        all go with it, in order, and none goes twice."""
+        text = str(text).strip()
+        if text:
+            self._notes.append(text)
+
+    def on_turn_start(self, callback) -> None:
+        """Run ``callback(turn)`` (synchronous) each time a human turn is
+        accepted, with the new turn number, before that turn's notes are
+        taken: a note the callback queues goes with this very turn. A
+        callback that raises is logged and never stops the turn."""
+        self._turn_start_callbacks.append(callback)
+
+    def begin_turn(self, blocks: list) -> list:
+        """Count one human turn, run the ``on_turn_start`` callbacks, and
+        return ``blocks`` with every queued note in front of them, as one text
+        block of its own marked as coming from the product rather than the
+        human. Clears the queue. ``http/ws.py`` calls it only once the turn is
+        going to a ready session.
+
+        A note can carry text the product did not write (a remote MCP
+        server's own instructions, ``app.retry_remotes``), and a backend may
+        join the blocks into one message (omp's prompt text), so both marker
+        strings are neutralised inside the notes: nothing in a note can end
+        the note early and have what follows read as the human's."""
+        self._turn += 1
+        self.first_turn.set()
+        for callback in list(self._turn_start_callbacks):
+            try:
+                callback(self._turn)
+            except Exception as exc:
+                sys.stderr.write("warning: a turn-start callback failed: %r\n" % (exc,))
+        notes, self._notes = self._notes, []
+        if not notes:
+            return blocks
+        opening = _NOTE_OPEN % product.current().title
+        body = "\n\n".join(_neutralise_markers(note) for note in notes)
+        text = "%s\n\n%s\n\n%s" % (opening, body, _NOTE_CLOSE)
+        return [{"type": "text", "text": text}] + list(blocks)
+
+    def attention(self, title: str, body: str) -> None:
+        """Tell the human the agent needs them: a browser notification and a
+        flashing title on every open page, and a record in the event log."""
+        if self._publish is not None:
+            self._publish(Attention(title=str(title), body=str(body)))
+
+    def request_end_turn(self) -> None:
+        """A tool result asked to end the agent's turn (``tools.ok``'s
+        ``end_turn``); called from inside that tool's handler."""
+        if self.end_turn_handler is not None:
+            self.end_turn_handler()
 
     def set_paused(self, paused: bool) -> bool:
         """Record the human's choice; return True if it changed anything.

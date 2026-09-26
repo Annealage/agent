@@ -201,11 +201,21 @@ class PermissionResolved(AgentEvent):
 
 @dataclasses.dataclass(frozen=True)
 class TurnEnd(AgentEvent):
+    """A turn ended. ``cost_usd`` is what this turn cost, 0.0 where the
+    backend reports none; ``tokens``, where the backend reports them (omp),
+    is this turn's ``{"input", "output", "cache_read", "cache_write"}``
+    token counts. ``stop_reason`` is the backend's own, or one of the
+    session's: ``steered`` (omp: the human sent another message while this
+    turn was running, and the agent carries on under the next turn number),
+    ``rejected`` (the backend refused the message that started it) or
+    ``ended_by_tool`` (a tool result carried ``end_turn``, ``tools.ok``)."""
+
     kind: ClassVar[str] = "turn_end"
     turn: int
     stop_reason: str
     cost_usd: float
     viewer: Optional[str] = None
+    tokens: Optional[dict] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -321,6 +331,21 @@ class ReviewChanged(AgentEvent):
     viewer: Optional[str] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class Attention(AgentEvent):
+    """Something needs the human: the agent has stopped and is waiting on
+    them (Annealage Loom's ``checkpoint`` tool), published through
+    ``ViewerBus.attention``. The page shows a browser notification and
+    flashes its title until it is focused, for a live event only: a replayed
+    one is history, not a call for attention now. Recorded in the event log
+    like every event, so the session's history says when the agent asked."""
+
+    kind: ClassVar[str] = "attention"
+    title: str
+    body: str
+    viewer: Optional[str] = None
+
+
 #: Every event kind the agent layer emits itself. A product's own event
 #: classes (``Product.events``) are registered beside these by
 #: ``product.install`` and may not reuse one of their kinds: the chat pane and
@@ -340,6 +365,7 @@ GENERIC_EVENTS = (
     SessionReset,
     AgentError,
     ReviewChanged,
+    Attention,
 )
 
 #: The installed product's event classes; see ``register_product_events``.
@@ -394,6 +420,22 @@ class AgentSession(Protocol):
     constructor for every event it produces. Whatever builds a session
     (``http/ws.py`` or ``app.py``) is responsible for making that callback
     append to an ``EventLog`` and broadcast through a ``ViewerRegistry``.
+
+    Three optional members, outside the Protocol so a session without them
+    (a test's fake, an older product's) still is one, and read with
+    ``getattr`` where they are used:
+
+    - ``steers``: true when a turn sent while one is running redirects it
+      (omp) rather than waiting behind it; the ``hello`` frame reports it so
+      the page labels its Send button.
+    - ``end_turn_after_tool()``: a tool result asked to end the turn
+      (``tools.ok(..., end_turn=True)``, via ``ViewerBus.request_end_turn``).
+      Called from inside the tool's handler, before its result reaches the
+      backend; the session stops the turn once that result is delivered.
+    - ``set_tool_table(table)``: replace the tools the model sees mid-session
+      (``ToolServer.host_tool_table()``'s shape), returning True if the
+      backend took them; used when a remote MCP server that was unreachable at
+      startup is reached later (``ToolServer.reconnect``). Only omp can.
     """
 
     session_id: str
