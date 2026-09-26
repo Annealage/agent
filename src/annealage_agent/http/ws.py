@@ -32,7 +32,7 @@ from microdot import Response
 from microdot.websocket import WebSocket, WebSocketError, websocket_upgrade
 
 from .. import protocol
-from ..session.base import AGENT_READY, PauseChanged, UnknownRequest
+from ..session.base import AGENT_READY, PauseChanged, TurnEnd, UnknownRequest, UserTurn
 from ..viewers import ViewerRegistry
 
 # Inbound frame ceiling, and a line that must stay. Microdot's default,
@@ -153,6 +153,13 @@ def register_ws(
             # move its resync position backwards, and replay the same events
             # again on its next reconnect. With nothing registered yet, there
             # is no second writer for those frames to race.
+            # The agent's status is read from the session itself, not the
+            # snapshot session_info took at startup: the page takes the status,
+            # and why the agent is down, from this frame and from live events
+            # only (a replayed one may be an earlier process's), so both have
+            # to be as they are now.
+            agent = session.agent_status() if session is not None else None
+            agent = agent or session_info.get("agent", "unavailable")
             await ws.send(
                 json.dumps(
                     protocol.build_hello(
@@ -160,14 +167,17 @@ def register_ws(
                         session_info["id"],
                         session_info.get("sdk_session_id"),
                         session_info["cwd"],
-                        session_info.get("agent", "unavailable"),
+                        agent,
                         paused=bus.paused if bus is not None else False,
                         model=session_info.get("model"),
                         steers=session_info.get("steers", False),
+                        agent_error=(
+                            session_info.get("agent_error") if agent != AGENT_READY else None
+                        ),
                     )
                 )
             )
-            if not await _greet(ws, event_log, token):
+            if not await _greet(ws, event_log, token, session_info["id"]):
                 return Response.already_handled
             conn = await registry.add(ws)
             await _serve_connection(ws, conn, registry, event_log, token, session, bus)
@@ -253,7 +263,7 @@ def _origin_is_allowed(req, allowed_origins):
     return origin in allowed_origins
 
 
-async def _greet(ws, event_log, token):
+async def _greet(ws, event_log, token, session_id=None):
     """Read the client's ``hello`` and answer it, before any writer exists.
 
     Returns False if the connection was closed here, in which case the caller
@@ -261,6 +271,21 @@ async def _greet(ws, event_log, token):
     frame first is answered with a refusal and asked again, because ``hello``
     is what carries the resync position and there is nothing useful to do
     without it.
+
+    The answer is the history since the client's ``last_seq``: the ring's,
+    and before that the event log's file, read off the event loop, which is
+    what brings a reloaded page, or any page after a restart, the whole
+    conversation (``EventLog.replay_async``). A ``last_seq`` is a position in
+    one session's log, so one the client does not say belongs to this
+    session (``session_id``, this server's) is no position here, and the
+    client is answered from the start. Events appended while the history is
+    being read or sent (a turn streaming meanwhile) are caught up with here
+    too, round after round, each starting where the last one's snapshot
+    ended, until one finds nothing new. A broadcast scheduled before that
+    last round may still reach the connection once it is registered, with an
+    event this replay already sent; the page drops any event at or below the
+    last seq it has (``static/ws.js``). A history that really is unavailable
+    (an in-memory log whose ring has moved on) is said so, once.
 
     A client that connects and then says nothing is never registered, so it
     receives no events and consumes no writer task. That is the right outcome
@@ -290,18 +315,26 @@ async def _greet(ws, event_log, token):
                 ws, protocol.CLOSE_VERSION_MISMATCH, "hello token does not match"
             )
             return False
-        replay = event_log.replay(frame.get("last_seq"))
-        for seq, event_wire in replay.events:
-            await ws.send(json.dumps(protocol.build_event(seq, event_wire)))
-        if replay.truncated:
-            await ws.send(
-                json.dumps(
-                    protocol.build_refused(
-                        "history before this point is not in the live ring; page it over HTTP"
+        position = frame.get("last_seq")
+        if frame.get("session_id") != session_id:
+            position = None
+        told = False
+        while True:
+            replay = await event_log.replay_async(position)
+            position = replay.through
+            if not replay.events and not replay.truncated:
+                return True
+            for seq, event_wire in replay.events:
+                await ws.send(json.dumps(protocol.build_event(seq, event_wire)))
+            if replay.truncated and not told:
+                told = True
+                await ws.send(
+                    json.dumps(
+                        protocol.build_refused(
+                            "the history before this point is no longer kept, so it is not shown"
+                        )
                     )
                 )
-            )
-        return True
 
 
 #: Returned by _parse when it has already closed the connection.
@@ -410,10 +443,12 @@ async def _dispatch(ws, conn, registry, event_log, token, frame, session=None, b
         # Announced to every viewer, not answered to this one, because the
         # switch is one property of the server and each tab has a control
         # showing it. Through the log, so the seq stays part of the one
-        # monotonic stream a reconnecting client replays from.
+        # monotonic stream a reconnecting client replays from, and scheduled
+        # behind any broadcast a session has already scheduled, so it reaches
+        # each page in seq order (see ViewerRegistry._broadcast_primary).
         event = PauseChanged(paused=bus.paused)
         seq = event_log.append(event)
-        await registry.broadcast(protocol.build_event(seq, event.to_wire()))
+        await asyncio.ensure_future(registry.broadcast(protocol.build_event(seq, event.to_wire())))
         return
     if kind in ("turn", "interrupt", "permission", "set_model"):
         if session is None:
@@ -424,7 +459,8 @@ async def _dispatch(ws, conn, registry, event_log, token, frame, session=None, b
             await ws.send(
                 json.dumps(
                     protocol.build_refused(
-                        "this server is running viewer-only, so %s frames are not served" % kind
+                        "this server is running viewer-only, so %s frames are not served" % kind,
+                        frame.get("client_id"),
                     )
                 )
             )
@@ -434,20 +470,11 @@ async def _dispatch(ws, conn, registry, event_log, token, frame, session=None, b
         # events, which arrive over this same socket through the registry, and
         # blocking this connection's read loop on the whole turn would stop it
         # reading the interrupt frame that ends it.
+        if kind == "turn":
+            await _submit_turn(ws, conn, registry, event_log, frame, session, bus)
+            return
         try:
-            if kind == "turn":
-                blocks = frame["blocks"]
-                # Counted, and the product's queued notes put in front of it,
-                # here in front of every backend (ViewerBus.begin_turn), and
-                # only for a ready session: a connecting or unavailable one
-                # refuses the turn (Codex while its thread starts), and a note
-                # must not be spent, nor bus.turn move, for a turn that never
-                # reached the model. A running turn leaves the session ready,
-                # so a steer counts.
-                if bus is not None and session.agent_status() == AGENT_READY:
-                    blocks = bus.begin_turn(blocks)
-                await session.submit_turn(blocks, viewer=conn.tab_id)
-            elif kind == "interrupt":
+            if kind == "interrupt":
                 await session.interrupt()
             elif kind == "set_model":
                 await session.set_model(frame["model"])
@@ -482,6 +509,80 @@ async def _dispatch(ws, conn, registry, event_log, token, frame, session=None, b
             )
         return
     await ws.send(json.dumps(protocol.build_refused("unhandled frame type: %s" % kind)))
+
+
+async def _submit_turn(ws, conn, registry, event_log, frame, session, bus):
+    """Hand one ``turn`` frame to the session, logging what the human sent.
+
+    Counted, and the product's queued notes put in front of it, here in front
+    of every backend (``ViewerBus.begin_turn``), and only for a ready session.
+    A turn to a connecting or unavailable session (omp while ``-c`` resumes,
+    Codex while its thread starts) is refused here and never reaches the
+    session: every backend numbers the turns it is given, so a turn it saw
+    that ``bus.turn`` did not count would leave every later ``user_turn`` one
+    behind the reply it belongs to, and a message the page was told was not
+    sent must not then be answered. A running turn leaves the session ready,
+    so a steer counts.
+
+    At that same moment, and before the session sees the turn, the human's
+    own blocks go into the event log as a ``user_turn`` numbered ``bus.turn``
+    (the number the backend gives the reply), so the history holds them
+    ahead of everything the turn produces and every tab, a reload and a
+    restart show the human's side of the conversation. A turn that is not
+    taken is refused back to this tab with its ``client_id``, so the page
+    puts the message back rather than showing it against a later turn. A
+    logged turn the session then fails on is ended as ``rejected``, or the
+    page would show it running until a restart closed it.
+
+    Published the way a session publishes (``app._event_publisher``): the
+    broadcast is scheduled behind any a streaming session has already
+    scheduled, so the page receives events in seq order even when a steer
+    lands mid-stream.
+    """
+    blocks = frame["blocks"]
+    client_id = frame.get("client_id")
+    status = session.agent_status()
+    if status != AGENT_READY:
+        await ws.send(
+            json.dumps(
+                protocol.build_refused(
+                    "the agent is %s, so this message was not sent" % status, client_id
+                )
+            )
+        )
+        return
+    turn = None
+    if bus is not None:
+        blocks_to_send = bus.begin_turn(blocks)
+        turn = bus.turn
+        _publish(
+            event_log,
+            registry,
+            UserTurn(turn=turn, blocks=blocks, client_id=client_id, viewer=conn.tab_id),
+        )
+    else:
+        blocks_to_send = blocks
+    try:
+        await session.submit_turn(blocks_to_send, viewer=conn.tab_id)
+    except Exception as exc:
+        # A session that fails must not take the socket with it: the viewer
+        # half of this page keeps working whatever the agent does.
+        sys.stderr.write("warning: session could not handle a turn frame: %r\n" % (exc,))
+        if turn is not None:
+            _publish(event_log, registry, TurnEnd(turn=turn, stop_reason="rejected", cost_usd=0.0))
+        await ws.send(
+            json.dumps(
+                protocol.build_refused(
+                    "the agent could not handle that turn frame; see the server output", client_id
+                )
+            )
+        )
+
+
+def _publish(event_log, registry, event):
+    """Append ``event`` to the log and schedule its broadcast to every viewer."""
+    seq = event_log.append(event)
+    asyncio.ensure_future(registry.broadcast(protocol.build_event(seq, event.to_wire())))
 
 
 def build_registry(**kwargs):

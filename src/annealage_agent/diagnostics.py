@@ -64,6 +64,7 @@ import urllib.request
 from pathlib import Path
 
 from . import backends, files, lock, net, product, sessions, settings
+from .session import logfiles
 
 # Generous for a "--version" query and nothing more: a tool that cannot
 # answer this within five seconds is not going to answer it, and doctor
@@ -88,6 +89,7 @@ def collect(
     backend=None,
     omp_base_url=None,
     omp_api_key=None,
+    backend_logs=None,
     run=subprocess.run,
     which=shutil.which,
     urlopen=urllib.request.urlopen,
@@ -119,6 +121,13 @@ def collect(
     binary. ``urlopen`` is the equivalent seam for the omp backend's
     endpoint-reachability probe, which is a network call rather than a
     subprocess one.
+
+    ``backend_logs`` is the running session's ``backend_logs`` method, and
+    the ``backend_logs`` fact names each entry it lists (name, kind, path,
+    format; never the text, which only ``GET /agent/logs`` serves). With no
+    session running, a ``doctor`` run's case, the fact is the files ``backend``
+    keeps for the project's most recent session, found from what that session
+    recorded (``session.logfiles.recorded``).
     """
     facts = {
         "python": {
@@ -145,6 +154,7 @@ def collect(
         ],
         "lock": _lock_info(project_dir),
         "settings_files": _settings_files(project_dir),
+        "backend_logs": _backend_logs(project_dir, backend, backend_logs),
     }
     if backend == "codex":
         facts["codex_cli"] = _codex_cli_info(run=run, which=which)
@@ -153,6 +163,21 @@ def collect(
             omp_base_url, omp_api_key, which=which, run=run, urlopen=urlopen
         )
     return facts
+
+
+def _backend_logs(project_dir, backend, listing):
+    """``[{"name", "kind", "path", "format"}]`` for ``collect``'s
+    ``backend_logs`` fact; empty rather than an error when nothing can say."""
+    try:
+        if listing is not None:
+            entries = listing()
+        elif project_dir is not None and backend is not None:
+            entries = logfiles.recorded(files.resolve_serve_dir(project_dir), backend)
+        else:
+            entries = []
+        return [entry.to_wire() for entry in entries]
+    except Exception:
+        return []
 
 
 def _safe_which(which, name):

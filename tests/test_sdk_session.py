@@ -1182,3 +1182,40 @@ def test_the_product_s_session_context_reaches_omp(tmp_path, swap_product):
     asyncio.run(omp.start())
     assert captured["append_system_prompt"] == "You are reviewing design demo."
     assert seen == [tmp_path]
+
+
+# ---------------------------------------------------------------------------
+# The backend's own logs (backend_logs)
+# ---------------------------------------------------------------------------
+
+
+def test_backend_logs_are_this_sessions_transcript_and_the_clis_stderr(tmp_path, monkeypatch):
+    """The CLI keeps a transcript per session under its config directory, in a
+    folder named after the working directory with every character that is not
+    an ASCII letter or digit replaced by "-" (the CLI's own rule). Only this
+    session's is listed, and the stderr kept in memory is there before any
+    transcript exists, which is the case when the CLI never started."""
+    import os
+    import re
+
+    config = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    project = tmp_path / "my project.v2"
+    project.mkdir()
+    folder = config / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", os.path.realpath(project))
+    folder.mkdir(parents=True)
+    mine = folder / "0f6c1d2e-mine.jsonl"
+    mine.write_text("{}\n", encoding="utf-8")
+    (folder / "9a8b7c6d-another-session.jsonl").write_text("{}\n", encoding="utf-8")
+
+    session = SdkSession(EventRecorder(), cwd=project, session_id="s")
+    session._note_stderr("Invalid API key · Please run /login")
+    assert [(e.name, e.kind) for e in session.backend_logs()] == [("Claude stderr", "text")]
+
+    session._remember_sdk_session("0f6c1d2e-mine")
+    logs = session.backend_logs()
+    assert [(e.name, e.path) for e in logs] == [
+        ("Claude transcript", os.path.realpath(mine)),
+        ("Claude stderr", None),
+    ]
+    assert logs[1].text == "Invalid API key · Please run /login"

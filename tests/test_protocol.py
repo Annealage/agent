@@ -132,6 +132,8 @@ def test_build_hello_round_trips():
             "sdk_session_id": "sdk-1",
             "cwd": "/tmp/proj",
             "agent": "ready",
+            # Present and null unless the agent is down with a reason.
+            "agent_error": None,
             # Defaulted, and present rather than omitted: a page that found no
             # `paused` key would have to guess, and the safe guess (not paused)
             # is the one that shows the human a control claiming the agent may
@@ -204,6 +206,12 @@ def test_build_refused_round_trips():
     assert _roundtrip(frame) == frame
 
 
+def test_a_refused_turn_names_its_client_id():
+    frame = build_refused("the agent is connecting", "c-1")
+    assert frame["client_id"] == "c-1"
+    assert _roundtrip(frame) == frame
+
+
 # ---------------------------------------------------------------------------
 # Inbound validation: well-shaped frames of every recognised type
 # ---------------------------------------------------------------------------
@@ -235,6 +243,12 @@ VALID_FRAMES = [
             {"type": "text", "text": "look at"},
             {"type": "image_path", "path": "images/b.png"},
         ],
+    },
+    {
+        "v": PROTOCOL_VERSION,
+        "type": "turn",
+        "blocks": [{"type": "text", "text": "x"}],
+        "client_id": "3f2b8c1e-7a44-4c1d-9b0e-2d6f5a9c8e71",
     },
     {"v": PROTOCOL_VERSION, "type": "permission", "request_id": "pr_1", "decision": "allow"},
     {"v": PROTOCOL_VERSION, "type": "permission", "request_id": "pr_1", "decision": "allow_always"},
@@ -290,8 +304,9 @@ def test_validate_inbound_rejects_frame_missing_v():
 
 def test_validate_inbound_raises_on_version_mismatch_instead_of_returning():
     with pytest.raises(ProtocolVersionMismatch) as excinfo:
-        validate_inbound({"v": 2, "type": "interrupt"})
-    assert excinfo.value.received == 2
+        # A page from before version 2, left open across an upgrade.
+        validate_inbound({"v": 1, "type": "interrupt"})
+    assert excinfo.value.received == 1
 
 
 def test_validate_inbound_rejects_unknown_type_with_reason_naming_it():
@@ -386,6 +401,20 @@ def test_validate_inbound_rejects_turn_block_with_unknown_key():
             "v": PROTOCOL_VERSION,
             "type": "turn",
             "blocks": [{"type": "text", "text": "x", "size": 12}],
+        }
+    )
+    assert ok is False
+
+
+@pytest.mark.parametrize("client_id", ["", "x" * 65, "has space", "</script>", 7, None])
+def test_validate_inbound_rejects_a_turn_client_id_that_is_not_a_short_plain_name(client_id):
+    """It is echoed into the event log and every tab's replay."""
+    ok, _reason = validate_inbound(
+        {
+            "v": PROTOCOL_VERSION,
+            "type": "turn",
+            "blocks": [{"type": "text", "text": "x"}],
+            "client_id": client_id,
         }
     )
     assert ok is False

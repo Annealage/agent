@@ -831,3 +831,57 @@ async def test_the_session_context_is_the_thread_s_developer_instructions():
         assert fake.thread_start_params.developer_instructions is None
     finally:
         await plain.close()
+
+
+# ---------------------------------------------------------------------------
+# The backend's own logs (backend_logs)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backend_logs_keep_the_app_servers_stderr_after_a_failed_start(tmp_path, monkeypatch):
+    """The client that failed to start is closed and dropped, and its stderr
+    is the only account of why; the session still has it to show."""
+    import collections
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    fake = FakeCodexClient(config=None, approval_handler=None)
+    fake._stderr_lines = collections.deque(["Error: not logged in to Codex"], maxlen=400)
+
+    def exits():
+        raise TransportClosedError("Codex process closed stdout")
+
+    fake.start = exits
+    session = CodexSession(
+        EventRecorder(), cwd="/proj/root", session_id="s", client_factory=lambda **kw: fake
+    )
+    await session.start()
+    try:
+        assert session.agent_status() == AGENT_UNAVAILABLE
+        assert [(e.name, e.text) for e in session.backend_logs()] == [
+            ("Codex stderr", "Error: not logged in to Codex")
+        ]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_backend_logs_list_this_threads_rollout_only(tmp_path, monkeypatch):
+    """Codex keeps a rollout per thread under ``$CODEX_HOME/sessions/Y/M/D``;
+    another thread's, in the same day, is not this session's to show."""
+    import os
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    day = tmp_path / "codex" / "sessions" / "2026" / "09" / "27"
+    day.mkdir(parents=True)
+    mine = day / "rollout-2026-09-27T10-00-00-thread-1.jsonl"
+    mine.write_text("{}\n", encoding="utf-8")
+    (day / "rollout-2026-09-27T11-00-00-thread-2.jsonl").write_text("{}\n", encoding="utf-8")
+
+    session, fake, recorder, broker = await _started_session()
+    try:
+        assert [(e.name, e.path) for e in session.backend_logs()] == [
+            ("Codex rollout", os.path.realpath(mine))
+        ]
+    finally:
+        await session.close()

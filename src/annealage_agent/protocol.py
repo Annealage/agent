@@ -24,24 +24,34 @@ requires that reason reach the client regardless, and reusing the
 existing browser-to-server ``error`` shape (which always carries a call
 ``id``) would make an uncorrelated protocol refusal look like a failed
 reply to some particular ``call``. ``build_refused`` is a new, minimal
-type for exactly that one purpose.
+type for exactly that one purpose. It carries one correlation field, a
+refused ``turn`` frame's ``client_id``, the page's own name for the message
+(the ``turn`` frame's one optional field beyond the plan's ``blocks``), so
+the page can tell which of its sent messages will never appear.
 
 The inbound ``pause`` frame: the human's pause switch is enforced in the
 server, because the tools it gates run there, so the browser's control has
-to be able to say what the human chose. Neither addition changes
-``PROTOCOL_VERSION``, and neither needs to: an older page never sends a
-``pause`` frame and simply ignores an event kind or frame type it does not
-recognise, which is the same tolerance every other addition to this
-protocol relies on.
+to be able to say what the human chose. Neither addition changed
+``PROTOCOL_VERSION``: an older page never sends a ``pause`` frame and
+simply ignores an event kind or frame type it does not recognise, which is
+the same tolerance most additions to this protocol rely on.
+
+Version 2 is the one change an older page cannot tolerate: a connection
+now opens with the session's whole history (``http/ws.py``'s ``_greet``),
+and a hello's ``last_seq`` counts only in the session its ``session_id``
+names. A version-1 page left open across the upgrade would take that
+history as new and show every message twice, so it is closed with
+``CLOSE_VERSION_MISMATCH`` and told to reload instead.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import re
 import struct
 from typing import Any, Callable, Optional, Set, Tuple, Union
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 # Close code for a mismatched protocol version (plan section 3.3): how a
 # stale cached page is told apart from a newer server. Sent with
@@ -133,6 +143,7 @@ def build_hello(
     paused: bool = False,
     model: Optional[str] = None,
     steers: bool = False,
+    agent_error: Optional[dict] = None,
 ) -> dict:
     """The greeting sent once, immediately after a successful upgrade.
 
@@ -143,10 +154,11 @@ def build_hello(
 
     ``paused`` carries the current state of the human's pause switch, so a
     tab opened long after it was set shows it. A ``pause_changed`` event
-    announces every later change, but such an event only reaches a client
-    that was connected when it happened: replay reaches back 500 events and
-    a fresh tab replays nothing at all, so the value belongs in the greeting
-    rather than being inferred from the event stream.
+    announces every later change, but the greeting is where a tab can count
+    on finding it: a viewer-only run's replay reaches back only 500 events,
+    and a page reading the flag out of a whole replayed history would show
+    the wrong value until the replay reached the last change, so the value
+    belongs in the greeting rather than being inferred from the event stream.
 
     ``model`` is the effective starting model this run's agent session was
     constructed with (``settings.py``'s ``model`` key, Phase 2's per-project
@@ -158,6 +170,12 @@ def build_hello(
     ``steers`` says a message sent while a turn is running redirects that
     turn rather than waiting behind it (the omp backend), so the page can
     label its Send button for what it will do.
+
+    ``agent_error``, while the agent is not ready, is the latest
+    ``AgentError`` as ``{"remediation", "stderr"}`` (None otherwise): why the
+    agent is down, for a page opened after it went down. The page takes no
+    banner from a replayed ``agent_error`` event, which may be an earlier
+    process's, so the current one has to come from here.
     """
     return {
         "v": PROTOCOL_VERSION,
@@ -168,6 +186,7 @@ def build_hello(
             "sdk_session_id": sdk_session_id,
             "cwd": cwd,
             "agent": agent_status,
+            "agent_error": agent_error,
             "model": model,
             "paused": bool(paused),
             "steers": bool(steers),
@@ -198,7 +217,7 @@ def build_ping(t) -> dict:
     return {"v": PROTOCOL_VERSION, "type": "ping", "t": t}
 
 
-def build_refused(reason: str) -> dict:
+def build_refused(reason: str, client_id: Optional[str] = None) -> dict:
     """Tells the client one inbound frame was refused, and why.
 
     Not part of plan section 3.3's catalogue; see this module's docstring
@@ -206,8 +225,17 @@ def build_refused(reason: str) -> dict:
     shape reused in the other direction. The connection stays open: this
     is the response to one bad frame, not the version mismatch that ends
     the connection (see ``ProtocolVersionMismatch``).
+
+    ``client_id`` is the refused ``turn`` frame's own, when it carried one:
+    the page holds a sent message as pending until the server either logs
+    it (a ``user_turn`` event with the same ``client_id``) or refuses it,
+    and a refusal it cannot match would leave that message pending, to be
+    shown against whatever turn came next.
     """
-    return {"v": PROTOCOL_VERSION, "type": "refused", "reason": reason}
+    frame = {"v": PROTOCOL_VERSION, "type": "refused", "reason": reason}
+    if client_id is not None:
+        frame["client_id"] = client_id
+    return frame
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +261,12 @@ def _check_hello(frame: dict) -> Optional[str]:
     last_seq = frame.get("last_seq")
     if last_seq is not None and not isinstance(last_seq, int):
         return "hello.last_seq must be an integer or absent"
+    # The session the client's last_seq is a position in: a seq means nothing
+    # in another session's log (http/ws.py's _greet). Absent from a client
+    # that has seen no session yet, and from a page older than the field.
+    session_id = frame.get("session_id")
+    if session_id is not None and not (isinstance(session_id, str) and len(session_id) <= 128):
+        return "hello.session_id must be a string of at most 128 characters, or absent"
     viewer = frame.get("viewer")
     if viewer is not None:
         return object_error(viewer, {"tab_id", "w", "h"}, {"tab_id"}, "hello.viewer")
@@ -243,6 +277,14 @@ _BLOCK_SPECS = {
     "text": ({"type", "text"}, {"type", "text"}),
     "image_path": ({"type", "path"}, {"type", "path"}),
 }
+
+
+# A turn frame's ``client_id``: the page's own name for one message it sent,
+# echoed back in the ``user_turn`` event that logs it or in the ``refused``
+# frame that turns it away. Short and plain, because it is written into the
+# event log and every tab's replay: a UUID fits, and so does anything a page
+# without ``crypto.randomUUID`` makes instead.
+_CLIENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 def _check_turn(frame: dict) -> Optional[str]:
@@ -259,6 +301,10 @@ def _check_turn(frame: dict) -> Optional[str]:
         error = object_error(block, spec[0], spec[1], "turn.blocks[%d]" % i)
         if error:
             return error
+    if "client_id" in frame and not (
+        isinstance(frame["client_id"], str) and _CLIENT_ID_RE.fullmatch(frame["client_id"])
+    ):
+        return "turn.client_id must be 1 to 64 letters, digits, '-' or '_'"
     return None
 
 
@@ -324,8 +370,8 @@ class FrameSpec:
 # flat key shape already passed, for the shapes that need to look inside a
 # nested object or enumerate a value's allowed contents.
 _INBOUND_SPECS = {
-    "hello": FrameSpec({"token", "last_seq", "viewer"}, {"token"}, _check_hello),
-    "turn": FrameSpec({"blocks"}, {"blocks"}, _check_turn),
+    "hello": FrameSpec({"token", "last_seq", "viewer", "session_id"}, {"token"}, _check_hello),
+    "turn": FrameSpec({"blocks", "client_id"}, {"blocks"}, _check_turn),
     "permission": FrameSpec(
         {"request_id", "decision", "message"}, {"request_id", "decision"}, _check_permission
     ),

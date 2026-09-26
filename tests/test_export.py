@@ -26,6 +26,7 @@ from annealage_agent.session.base import (
     ToolResult,
     ToolUse,
     TurnEnd,
+    UserTurn,
 )
 
 
@@ -131,6 +132,26 @@ def test_render_transcript_markdown_joins_text_deltas_and_names_a_tool_call():
     assert "a.json" not in text
     assert "contents" not in text
     assert "cost" not in text
+
+
+def test_a_text_transcript_reads_as_the_conversation_the_human_s_side_included():
+    records = [
+        _rec(
+            1,
+            UserTurn(
+                turn=1,
+                blocks=[
+                    {"type": "image_path", "path": "images/wall.png"},
+                    {"type": "text", "text": "Why is\nthis wall thin?"},
+                ],
+                client_id="c1",
+            ),
+        ),
+        _rec(2, TextDelta(turn=1, text="It is 0.8 mm.")),
+    ]
+    text = events.render_transcript(records, fmt="markdown", include="text")
+    assert text.index("Why is") < text.index("this wall thin?") < text.index("It is 0.8 mm.")
+    assert "images/wall.png" in text
 
 
 def test_render_transcript_markdown_full_includes_tool_input_and_result_and_cost():

@@ -66,7 +66,9 @@ def register_settings_routes(
     flag that still outranks it.
 
     ``session_id``, ``bind`` and ``port`` are passed straight through to the
-    diagnostics collector, which is the only consumer of them here.
+    diagnostics collector, which is the only consumer of them here, and so is
+    the running session's ``backend_logs``, read off ``app.agent_session`` per
+    request because the session is built after these routes are registered.
     """
     if settings is None:
         settings = settings_module.resolve(serve_dir)
@@ -80,6 +82,7 @@ def register_settings_routes(
         settings reads two small TOML files and goes with it.
         """
         loop = asyncio.get_running_loop()
+        session = getattr(app, "agent_session", None)
         collect = functools.partial(
             diagnostics.collect,
             serve_dir,
@@ -89,6 +92,7 @@ def register_settings_routes(
             backend=settings["backend"],
             omp_base_url=settings["omp_base_url"],
             omp_api_key=settings["omp_api_key"],
+            backend_logs=getattr(session, "backend_logs", None),
         )
         facts = await loop.run_in_executor(None, collect)
         wire = settings.to_wire()

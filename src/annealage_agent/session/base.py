@@ -35,6 +35,25 @@ AGENT_READY = "ready"
 AGENT_UNAVAILABLE = "unavailable"
 
 
+def turn_not_sent(status: str) -> str:
+    """The remediation a backend reports for a turn it will not take because
+    its status is ``status``, not ready.
+
+    Every backend refuses a turn unless it is ready, whatever else it could
+    do with one: it numbers the turns it is given, and ``http/ws.py`` counts
+    one on the ``ViewerBus`` only for a ready session, so taking one in any
+    other state would put its reply under a number the page pairs with the
+    wrong message."""
+    if status == AGENT_CONNECTING:
+        return (
+            "the agent is still starting, so this turn was not sent; send it again once it is ready"
+        )
+    return (
+        "the agent is not running, so this turn was not sent; "
+        "check the startup output for why and use Retry"
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class SandboxStatus:
     """Whether bash is actually contained, as opposed to requested.
@@ -346,6 +365,33 @@ class Attention(AgentEvent):
     viewer: Optional[str] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class UserTurn(AgentEvent):
+    """What the human sent as turn ``turn``: the turn frame's own ``blocks``,
+    exactly as the page sent them, and the ``client_id`` the sending tab gave
+    the frame.
+
+    ``http/ws.py`` logs it when, and only when, the turn goes to a ready
+    session (the moment ``ViewerBus.begin_turn`` counts it), and before the
+    session sees the turn, so it precedes every event the turn produces. It
+    is what makes the human's side of the conversation part of the history:
+    every tab, a reload and a restart pair a turn with what the human said by
+    this event, and ``client_id`` is how the tab that sent it retires its own
+    optimistic copy. ``turn`` is ``bus.turn`` after ``begin_turn``, which is
+    the number every backend gives the reply (a steer's included).
+
+    ``blocks`` are the human's, never the product's notes ``begin_turn`` puts
+    in front of them, and an image is its ``image_path`` block, a path under
+    the served directory: the pixels stay in the file, out of the log.
+    """
+
+    kind: ClassVar[str] = "user_turn"
+    turn: int
+    blocks: list
+    client_id: Optional[str] = None
+    viewer: Optional[str] = None
+
+
 #: Every event kind the agent layer emits itself. A product's own event
 #: classes (``Product.events``) are registered beside these by
 #: ``product.install`` and may not reuse one of their kinds: the chat pane and
@@ -366,6 +412,7 @@ GENERIC_EVENTS = (
     AgentError,
     ReviewChanged,
     Attention,
+    UserTurn,
 )
 
 #: The installed product's event classes; see ``register_product_events``.
@@ -391,6 +438,40 @@ def register_product_events(events) -> None:
     ``product.reset`` only."""
     global PRODUCT_EVENTS
     PRODUCT_EVENTS = tuple(events)
+
+
+@dataclasses.dataclass(frozen=True)
+class BackendLog:
+    """One of the agent backend's own logs, as ``AgentSession.backend_logs``
+    lists it: what the backend itself wrote about this session, which is where
+    the real reason for a failure is when the remediation text is only a guess
+    at it.
+
+    ``kind`` is ``"file"``, with ``path`` naming a file this process found for
+    this session (the Claude CLI's transcript, a Codex rollout, omp's process
+    log and conversation file), or ``"text"``, with ``text`` holding what this
+    process kept in memory (the backend's stderr), which exists even when the
+    backend never got as far as writing a file. ``format`` is ``"jsonl"`` for a
+    file of JSON objects one per line, which the page can filter by their
+    ``level``, and ``"text"`` otherwise.
+
+    A session only ever lists a path it decided itself, from where its backend
+    is known to keep its files, and only when that is a regular file inside
+    that place (``session/logfiles.py``): ``GET /agent/logs`` serves these to
+    the browser, so a path the backend or the agent could have planted must
+    never reach this list.
+    """
+
+    name: str
+    kind: str
+    path: Optional[str] = None
+    text: Optional[str] = None
+    format: str = "text"
+
+    def to_wire(self) -> dict:
+        """The listing's JSON shape: everything but the text, which is served
+        one entry at a time, capped (``http/routes_logs.py``)."""
+        return {"name": self.name, "kind": self.kind, "path": self.path, "format": self.format}
 
 
 @runtime_checkable
@@ -420,6 +501,11 @@ class AgentSession(Protocol):
     constructor for every event it produces. Whatever builds a session
     (``http/ws.py`` or ``app.py``) is responsible for making that callback
     append to an ``EventLog`` and broadcast through a ``ViewerRegistry``.
+
+    ``backend_logs()`` lists the backend's own logs for this session
+    (``BackendLog``) for the page's Agent log section, ``GET /agent/logs`` and
+    the diagnostics block. Every session implements it; one whose backend
+    writes nothing of its own returns an empty list.
 
     Three optional members, outside the Protocol so a session without them
     (a test's fake, an older product's) still is one, and read with
@@ -504,3 +590,15 @@ class AgentSession(Protocol):
         session with no shell to contain reports ``requested`` false.
         """
         ...
+
+    def backend_logs(self) -> list:
+        """The backend's own logs for this session, as ``BackendLog`` entries,
+        in the order the page lists them.
+
+        Called off the event loop (it looks at files), and again on every
+        request for a log, so the list is always the session's current view:
+        a file the backend has only now created appears, one that has gone is
+        no longer listed. Must not raise; a log that cannot be found is left
+        out rather than reported as an error.
+        """
+        return []

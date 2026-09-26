@@ -43,7 +43,7 @@ export function initPause({ send, button = document.getElementById("pauseBtn") }
     // does not change until the server broadcasts that the flag moved. That
     // is deliberate: the flag lives in the server because the tools it gates
     // run there, so a local latch would be a claim this page cannot make.
-    send({ v: 1, type: "pause", paused: !store.getState().paused });
+    send({ type: "pause", paused: !store.getState().paused });
   });
 
   return { setPausedFromServer: (paused) => store.setPaused(paused) };

@@ -197,6 +197,42 @@ def test_collect_payload_round_trips_through_json(monkeypatch, tmp_path):
     assert round_tripped == result
 
 
+def test_collect_names_the_last_sessions_backend_files_for_a_doctor_run(monkeypatch, tmp_path):
+    """A ``doctor`` run has no session to ask, so the files the project's most
+    recent session left are found from the id it recorded: here the Claude
+    CLI's transcript, under the folder the CLI names after the project."""
+    import re
+
+    from annealage_agent import sessions
+
+    monkeypatch.setattr(diagnostics, "_bundled_claude_path", lambda: None)
+    config = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    project = tmp_path / "project"
+    project.mkdir()
+    sid = sessions.create_session(project)
+    sessions.set_sdk_session_id(project, sid, "0f6c1d2e-last")
+    folder = config / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", os.path.realpath(project))
+    folder.mkdir(parents=True)
+    (folder / "0f6c1d2e-last.jsonl").write_text("{}\n", encoding="utf-8")
+
+    result = diagnostics.collect(
+        project,
+        backend="claude",
+        run=_run_raises(FileNotFoundError("no ip binary")),
+        which=_no_binaries,
+    )
+
+    assert result["backend_logs"] == [
+        {
+            "name": "Claude transcript",
+            "kind": "file",
+            "path": os.path.realpath(folder / "0f6c1d2e-last.jsonl"),
+            "format": "jsonl",
+        }
+    ]
+
+
 # --- collect() backend gating: codex_cli/omp_cli present only for their own backend ---
 
 

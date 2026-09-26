@@ -3,9 +3,10 @@ append-only ``events.jsonl``.
 
 Every server-to-browser event carries a seq number that never repeats and
 never goes backwards for a given log (plan section 3.4). A reconnecting
-browser sends the last seq it saw; this module decides how much of what
-happened since then can be replayed straight back over the socket versus
-having to be paged from disk, and never silently drops the difference.
+browser sends the last seq it saw; this module replays what happened since
+then from the in-memory ring, or from the file where the ring no longer
+reaches (a long gap, or a restart), and never silently drops a difference
+it cannot fill.
 
 ``EventLog`` takes an optional ``path``: with one it persists to
 ``events.jsonl`` beneath a session's own ``<state dir>/sessions/<sid>/``
@@ -34,18 +35,19 @@ directory is created by this process on first use, but the served project
 directory around it is not otherwise trusted, so a ``review/`` replaced by
 a symlink is refused rather than followed.
 
-A rendered transcript never shows what a human typed. Nothing in
-``session/base.py``'s ``AgentEvent`` set records the content of an inbound
-turn: ``http/ws.py`` hands a turn frame's ``blocks`` straight to
-``AgentSession.submit_turn`` without logging them anywhere first, so the
-events this module reads back are exactly the ones a session produced on
-its own. A transcript exported from here is a record of what the agent
-said and did, not a transcript of the conversation the way a human would
-read one back.
+A rendered transcript reads as the conversation, the human's side included.
+``http/ws.py`` logs each turn the human sends as a ``user_turn`` event
+(``session/base.py``'s ``UserTurn``) before the session sees it, carrying
+the blocks exactly as the page sent them: what the human typed, and an
+attached image as its path. The product's own notes, which
+``ViewerBus.begin_turn`` puts in front of a turn on its way to the model, are
+not part of it, so a transcript shows what the human said rather than
+everything the model was sent.
 """
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import dataclasses
 import json
@@ -59,8 +61,9 @@ from .. import files, product, sessions
 # Bounded history kept in memory for a reconnect to replay without a disk
 # read. 500 events comfortably outlasts a normal reconnect gap (dropped
 # WiFi, laptop lid, a phone locking) without growing without bound across
-# a long session; a gap wider than that is reported rather than guessed
-# at, via Replay.truncated below.
+# a long session; a gap wider than that is read back from the file, or,
+# for a log with no file, reported rather than guessed at, via
+# Replay.truncated below.
 RING_SIZE = 500
 
 
@@ -68,33 +71,35 @@ RING_SIZE = 500
 class Replay:
     """The result of asking an ``EventLog`` to replay from a client's ``last_seq``.
 
-    ``events`` is every ring-held ``(seq, wire_dict)`` pair newer than
-    ``last_seq``, in seq order, ready to send straight back over the
-    socket. ``truncated`` is True when ``last_seq`` predates what the ring
-    still holds: some events between ``last_seq`` and the oldest one
-    returned exist only in the append-only file (or, if no path was
-    given, nowhere at all), and the caller must say so rather than
-    replaying a partial history that looks complete. ``events`` is still
-    populated in that case with whatever the ring does have, since
-    telling the browser about a gap in its oldest history is no reason to
-    also withhold the newer events that are available. ``truncated`` is
-    also True when ``last_seq`` is below the log's own current position
-    but the ring is empty (a restart recovers the seq counter but not the
-    ring's contents), and when ``last_seq`` is higher than any seq this
-    log has ever issued, which can only mean it belongs to a different
-    run of the log than the one now being asked. In both cases real
-    events exist between ``last_seq`` and the log's current position that
-    this reply cannot hand back, which is a gap regardless of the ring's
-    own state.
+    ``events`` is every ``(seq, wire_dict)`` pair newer than ``last_seq`` that
+    this log can still produce, in seq order, ready to send straight back
+    over the socket: the ring's own, preceded, when the client is further
+    back than the ring reaches, by the file's records for the gap (see
+    ``EventLog.replay``). ``truncated`` is True only when some of that
+    history is unavailable: the log has no file (viewer-only mode's, or a
+    test's) and the ring has already dropped events the client is missing,
+    or the file could not be read back as far as the ring reaches. The
+    caller must then say so rather than replay a partial history that looks
+    complete. ``events`` is still populated in that case with whatever is
+    available, since a gap in the oldest history is no reason to also
+    withhold the newer events.
+
+    ``through`` is the log's ``current_seq`` when the replay was taken:
+    everything up to it is in ``events`` or reported missing, so it is where
+    a following replay (``http/ws.py``'s catch-up) starts, whatever was
+    appended while this one was being read or sent.
     """
 
     events: List[Tuple[int, dict]]
     truncated: bool
+    through: int = 0
 
 
 #: The event kinds whose ``turn`` numbers a conversation turn (``EventLog``
-#: reads a resumed session's turns from these alone).
-_TURN_KINDS = frozenset(("text_delta", "tool_use", "turn_end"))
+#: reads a resumed session's turns from these alone). ``user_turn`` is one,
+#: so a turn the human sent that got no reply at all (the process was
+#: killed first) still counts and is closed as interrupted on the next start.
+_TURN_KINDS = frozenset(("user_turn", "text_delta", "tool_use", "turn_end"))
 
 
 class EventLog:
@@ -123,6 +128,11 @@ class EventLog:
         #: already shows from history, nor does history look like it runs.
         self.last_turn = 0
         self.unfinished_turns: tuple = ()
+        #: Every ``permission_request`` in the file with no
+        #: ``permission_resolved`` after it: asked by a process that died
+        #: before anyone answered, which ``app.create_app`` closes, so a page
+        #: replaying the history is not shown a card nobody can answer.
+        self.unresolved_requests: tuple = ()
         if self._path is not None:
             self._seq = self._recover_seq()
             self._fd = os.open(str(self._path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -145,6 +155,7 @@ class EventLog:
             return 0
         highest = 0
         started, ended = set(), set()
+        requests: dict = {}  # request_id -> None, in the order they were asked
         with open(self._path, "r", encoding="utf-8") as f:
             for line in f:
                 try:
@@ -157,15 +168,24 @@ class EventLog:
                 if isinstance(seq, int) and seq > highest:
                     highest = seq
                 event = record.get("event")
-                if not isinstance(event, dict) or event.get("kind") not in _TURN_KINDS:
+                if not isinstance(event, dict):
+                    continue
+                kind = event.get("kind")
+                request_id = event.get("request_id")
+                if kind == "permission_request" and isinstance(request_id, str):
+                    requests[request_id] = None
+                elif kind == "permission_resolved":
+                    requests.pop(request_id, None)
+                if kind not in _TURN_KINDS:
                     continue
                 turn = event.get("turn")
                 if isinstance(turn, int) and not isinstance(turn, bool):
                     started.add(turn)
-                    if event["kind"] == "turn_end":
+                    if kind == "turn_end":
                         ended.add(turn)
         self.last_turn = max(started, default=0)
         self.unfinished_turns = tuple(sorted(started - ended))
+        self.unresolved_requests = tuple(requests)
         return highest
 
     @property
@@ -196,38 +216,82 @@ class EventLog:
         return seq
 
     def replay(self, last_seq: Optional[int]) -> Replay:
-        """Everything the ring holds newer than ``last_seq``, plus whether
-        that leaves a gap. ``last_seq=None`` means the client has no prior
-        history at all (a first-ever connection), treated the same as 0.
+        """Everything newer than ``last_seq``, in seq order, plus whether
+        any of it is unavailable. ``last_seq=None`` means the client has no
+        prior history at all (a first-ever connection, a reloaded page),
+        treated the same as 0.
+
+        The ring answers for what it holds. What it no longer holds, or
+        never held (a restarted log starts with an empty ring: see
+        ``_recover_seq``), comes from the file: the records after
+        ``last_seq`` and older than the ring's oldest, with each run of one
+        turn's ``text_delta`` events joined into one (``_coalesce``), so a
+        long session's history is a few frames per turn rather than one per
+        streamed chunk. The ring is copied and the file's bound fixed in one
+        step (``_plan``), so the file's part ends exactly where the ring's
+        begins whenever the file is read: an event appended meanwhile is in
+        neither, and ``Replay.through`` says where the next replay starts.
         """
-        if last_seq is None:
+        plan = self._plan(last_seq)
+        gap = self._read_between(plan.after, plan.before) if plan.before is not None else []
+        return plan.replay(gap)
+
+    async def replay_async(self, last_seq: Optional[int]) -> Replay:
+        """``replay``, with the file read in a worker thread, so a long
+        history does not stall every stream on the event loop while one tab
+        connects. The file's part is bounded by the ring's oldest seq at the
+        moment of the call, and every record below that is already whole in
+        the file (``append`` writes the line before it returns), so appends
+        while the thread reads change nothing it returns."""
+        plan = self._plan(last_seq)
+        gap = []
+        if plan.before is not None:
+            gap = await asyncio.to_thread(self._read_between, plan.after, plan.before)
+        return plan.replay(gap)
+
+    def _plan(self, last_seq: Optional[int]) -> "_ReplayPlan":
+        """What a replay from ``last_seq`` is made of, fixed at one moment:
+        nothing here waits, so the ring copy, the file's bound and
+        ``through`` all describe the same point in the stream."""
+        if last_seq is None or last_seq < 0 or last_seq > self._seq:
+            # A last_seq higher than any seq this log has issued came from a
+            # different run of the log (most likely a new session after a
+            # restart, counting up from a lower seq): the client has none of
+            # this log's events, so it is answered as a fresh one, rather
+            # than with an empty reply that would read as "already caught
+            # up". A negative one is no position at all.
             last_seq = 0
-        if last_seq > self._seq:
-            # last_seq is higher than any seq this log has ever issued.
-            # This log cannot be the one that produced it, most likely
-            # because the process restarted and this is a fresh log
-            # counting up from a lower recovered seq: nothing here can
-            # answer for what came after a point it never reached, so the
-            # whole ring is handed back rather than an empty reply that
-            # would read as "already caught up".
-            return Replay(events=list(self._ring), truncated=True)
-        if not self._ring:
-            # An empty ring says nothing about whether last_seq is caught
-            # up: a restarted, path-backed log recovers self._seq from
-            # the file but never repopulates the ring (see
-            # _recover_seq), so last_seq below self._seq here means real
-            # events exist only in the file, not that nothing has
-            # happened since last_seq.
-            return Replay(events=[], truncated=last_seq < self._seq)
-        oldest = self._ring[0][0]
-        # A gap exists whenever the ring's oldest kept event is not the
-        # very next one the client is expecting: everything between
-        # last_seq and oldest fell off the ring before this replay and is
-        # not silently skippable, so the caller is told rather than
-        # handed a history with a hole already cut out of it.
-        truncated = last_seq < oldest - 1
-        events = [(seq, wire) for seq, wire in self._ring if seq > last_seq]
-        return Replay(events=events, truncated=truncated)
+        ring = [(seq, wire) for seq, wire in self._ring if seq > last_seq]
+        # The first seq the ring can answer for; with an empty ring, the next
+        # one to be issued.
+        oldest = self._ring[0][0] if self._ring else self._seq + 1
+        # Past the ring's reach, everything between last_seq and oldest fell
+        # off it (or was written by an earlier process). It is not silently
+        # skippable: it comes from the file, and whatever the file cannot
+        # supply is reported rather than handed over as a history with a
+        # hole in it.
+        before = oldest if last_seq < oldest - 1 else None
+        return _ReplayPlan(after=last_seq, before=before, ring=ring, through=self._seq)
+
+    def _read_between(self, after: int, before: int) -> List[Tuple[int, dict]]:
+        """The file's records with ``after < seq < before``, coalesced; none
+        for a log with no file.
+
+        The file is in seq order (this class is its one writer), so reading
+        stops at the first record the ring already holds. Every record below
+        the ring's oldest is already in the file: ``append`` writes the line
+        in the same call that puts the event in the ring.
+        """
+        if self._path is None:
+            return []
+        records = []
+        for record in read_records(self._path):
+            seq = record["seq"]
+            if seq >= before:
+                break
+            if seq > after:
+                records.append((seq, record["event"]))
+        return _coalesce(records)
 
     def close(self) -> None:
         """Close the append-only file descriptor, if one is open.
@@ -242,6 +306,60 @@ class EventLog:
             self._fd = None
 
 
+@dataclasses.dataclass(frozen=True)
+class _ReplayPlan:
+    """One replay's parts, fixed by ``EventLog._plan``: the ring's events
+    after ``after``, and, when ``before`` is set, the file's records with
+    ``after < seq < before`` still to read."""
+
+    after: int
+    before: Optional[int]
+    ring: List[Tuple[int, dict]]
+    through: int
+
+    def replay(self, gap: List[Tuple[int, dict]]) -> Replay:
+        if self.before is None:
+            return Replay(events=self.ring, truncated=False, through=self.through)
+        reached = gap[-1][0] if gap else self.after
+        return Replay(
+            events=gap + self.ring, truncated=reached < self.before - 1, through=self.through
+        )
+
+
+def _coalesce(records: List[Tuple[int, dict]]) -> List[Tuple[int, dict]]:
+    """``records`` with each run of consecutive same-turn ``text_delta``
+    events joined into one, which carries the run's joined text and its last
+    seq; everything else passes through untouched.
+
+    The same merge ``viewers.ViewerRegistry``'s writer makes on a live
+    connection, for the same reasons: the page appends a delta's text to its
+    turn whatever size it is, so one joined delta renders exactly as the run
+    did, and the last seq is the one a client may resume from, since the
+    joined text already includes everything up to it.
+    """
+    out: List[Tuple[int, dict]] = []
+    run: List[str] = []  # the texts of the delta run out[-1] stands for
+
+    def close_run():
+        if len(run) > 1:
+            seq, event = out[-1]
+            out[-1] = (seq, dict(event, text="".join(run)))
+        run.clear()
+
+    for seq, event in records:
+        is_delta = event.get("kind") == "text_delta"
+        if run and is_delta and event.get("turn") == out[-1][1].get("turn"):
+            run.append(event.get("text", ""))
+            out[-1] = (seq, out[-1][1])
+            continue
+        close_run()
+        out.append((seq, event))
+        if is_delta:
+            run.append(event.get("text", ""))
+    close_run()
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Transcript rendering and export: turning an events.jsonl back into a
 # document, and writing that document under review/.
@@ -254,10 +372,10 @@ class EventLog:
 TRANSCRIPT_FORMATS = ("markdown", "jsonl")
 
 # How much of a session's history a transcript shows. "text" is the
-# conversation as a person would read it: what the agent said, and which
-# tools it named. "full" adds everything else events.jsonl carries: each
-# tool's input and result, each permission request's outcome, and the cost
-# of each turn.
+# conversation as a person would read it: what the human sent, what the
+# agent said, and which tools it named. "full" adds everything else
+# events.jsonl carries: each tool's input and result, each permission
+# request's outcome, and the cost of each turn.
 TRANSCRIPT_INCLUDE = ("text", "full")
 
 # The least inclusive TRANSCRIPT_INCLUDE level at which each AgentEvent kind
@@ -268,6 +386,7 @@ TRANSCRIPT_INCLUDE = ("text", "full")
 # session_reset and agent_error describe the session's own lifecycle rather
 # than anything said or done within it.
 _KIND_MIN_INCLUDE = {
+    "user_turn": "text",
     "text_delta": "text",
     "tool_use": "text",
     "tool_result": "full",
@@ -319,6 +438,20 @@ def _render_jsonl(kept: list) -> str:
     return "".join(json.dumps(record) + "\n" for record in kept)
 
 
+def _human_lines(blocks) -> List[str]:
+    """A ``user_turn``'s blocks as a blockquote headed with who said it: the
+    text as typed, line for line, and an attached image as its path."""
+    body: List[str] = []
+    for block in blocks if isinstance(blocks, list) else ():
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            body.extend(str(block.get("text", "")).splitlines() or [""])
+        elif block.get("type") == "image_path":
+            body.append("[image: %s]" % block.get("path", ""))
+    return ["> **Human:**"] + [("> " + line) if line else ">" for line in body]
+
+
 def _render_markdown(kept: list, include: str, session_id, project_dir, exported_at) -> str:
     lines = ["# %s transcript" % product.current().title]
     meta = []
@@ -357,7 +490,10 @@ def _render_markdown(kept: list, include: str, session_id, project_dir, exported
             continue
         flush_text()
 
-        if kind == "tool_use":
+        if kind == "user_turn":
+            lines.append("")
+            lines.extend(_human_lines(event.get("blocks")))
+        elif kind == "tool_use":
             lines.append("")
             lines.append("Tool call: %s" % event.get("name", ""))
             if full:
@@ -400,12 +536,13 @@ def render_transcript(
 ) -> str:
     """Render ``records`` (as ``read_records`` yields them) as one document.
 
-    ``fmt="markdown"`` produces prose meant to be read: the model's text,
-    joined across the ``text_delta`` chunks that streamed it, and one line
-    naming each tool call. At ``include="full"`` this adds each tool's input
-    and result, each permission request's outcome, and each turn's cost;
-    ``include="text"`` leaves all of that out, showing only the model's own
-    words and which tools it reached for.
+    ``fmt="markdown"`` produces prose meant to be read: what the human sent
+    (``user_turn``, quoted), the model's text, joined across the
+    ``text_delta`` chunks that streamed it, and one line naming each tool
+    call. At ``include="full"`` this adds each tool's input and result, each
+    permission request's outcome, and each turn's cost; ``include="text"``
+    leaves all of that out, showing only the conversation's words and which
+    tools the model reached for.
 
     ``fmt="jsonl"`` instead emits the surviving records themselves, one JSON
     object per line, unmodified: the same ``TRANSCRIPT_INCLUDE`` rule decides

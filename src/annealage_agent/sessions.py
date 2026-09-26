@@ -32,10 +32,10 @@ second time in ``meta.json``: ``EventLog`` is already the one writer of
 that file, and a count kept separately in ``meta.json`` would need someone
 to update it in step with every turn, which is exactly the two-writer
 hazard the front-end store contract elsewhere in this project exists to
-avoid. ``first_user_text`` has no home in ``events.jsonl`` (nothing in
-``session/base.py``'s ``AgentEvent`` set records what the human typed) and
-is the one field this module keeps in ``meta.json``, written at most once
-per session by ``record_first_user_text``.
+avoid. ``first_user_text`` is the one field this module keeps in
+``meta.json``, written at most once per session by ``record_first_user_text``.
+``events.jsonl`` also holds what the human sent, as the ``user_turn`` events
+``http/ws.py`` logs, but no lookup here reads it from there.
 """
 
 from __future__ import annotations

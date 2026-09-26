@@ -98,7 +98,7 @@ from openai_codex.generated.v2_all import (
 from openai_codex.models import Notification
 
 from .. import product
-from . import turn_images
+from . import logfiles, turn_images
 from .base import (
     AGENT_CONNECTING,
     AGENT_READY,
@@ -113,6 +113,7 @@ from .base import (
     ToolUse,
     TurnEnd,
     UnknownRequest,
+    turn_not_sent,
 )
 from .codex_mcp_stdio_bridge import AGENT_TOKEN_ENV
 from .permissions import Decision, _toml_string
@@ -218,6 +219,9 @@ class CodexSession:
         # complete interrupts the turn, which then ends as ended_by_tool.
         self._end_turn_pending = False
         self._stop_reason: Optional[str] = None
+        # The client's own bounded stderr tail (see backend_logs), kept here
+        # so it outlives a client that failed to start and was dropped.
+        self._stderr_lines = None
 
         # See this module's docstring: one pool for one-shot control calls,
         # a second, separate one for the long-lived per-turn drain, so an
@@ -256,6 +260,18 @@ class CodexSession:
         """
         return SandboxStatus(requested=True, active=True, missing=())
 
+    def backend_logs(self) -> list:
+        """The thread's rollout (the one being resumed until the app-server
+        reports its own id) and the app-server's stderr. ``CodexClient`` keeps
+        its last 400 stderr lines only on its private ``_stderr_lines`` deque,
+        which ``start`` holds on to, read defensively since a test's fake client
+        has none."""
+        lines = self._stderr_lines
+        return logfiles.codex_logs(
+            self.sdk_session_id or self._resume,
+            "\n".join(list(lines)) if lines is not None else None,
+        )
+
     def on_viewer_presence(self, count: int) -> None:
         """Keep the broker's view of viewer count in step with the registry's.
         Identical in intent to ``SdkSession.on_viewer_presence``; see its
@@ -283,14 +299,9 @@ class CodexSession:
         is what keeps events flowing regardless of whether a browser is
         attached (the same invariant ``SdkSession``'s pump keeps).
         """
-        if self._client is None or self._status == AGENT_UNAVAILABLE or self._thread_id is None:
+        if self._client is None or self._status != AGENT_READY or self._thread_id is None:
             self._emit(
-                AgentError(
-                    stderr="",
-                    remediation="the agent is not running, so this turn was not sent; "
-                    "check the startup output for why and use Retry",
-                    viewer=viewer,
-                )
+                AgentError(stderr="", remediation=turn_not_sent(self._status), viewer=viewer)
             )
             return
         self._turn += 1
@@ -413,6 +424,7 @@ class CodexSession:
                 ),
                 approval_handler=self._approval_handler if self._broker is not None else None,
             )
+            self._stderr_lines = getattr(self._client, "_stderr_lines", None)
             await self._run_blocking(self._client.start)
             await self._run_blocking(self._client.initialize)
             account = await self._run_blocking(self._client.account_read)
@@ -1068,7 +1080,7 @@ def _remediation_for(exc: BaseException) -> str:
             "the codex app-server rejected a request this build sent, which "
             "usually means a version mismatch; check the pinned SDK range"
         )
-    return "the agent is unavailable; the captured output above is what it reported"
+    return "the agent is unavailable; its captured output says why"
 
 
 def _bundled_codex_binary_hint() -> str:

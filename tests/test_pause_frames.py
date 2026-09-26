@@ -102,7 +102,12 @@ async def test_a_pause_frame_moves_the_flag_and_announces_it():
     assert sent == []
     assert isinstance(event_log.appended[0], PauseChanged)
     assert registry.broadcasts == [
-        {"v": 1, "type": "event", "seq": 1, "event": {"kind": "pause_changed", "paused": True}}
+        {
+            "v": protocol.PROTOCOL_VERSION,
+            "type": "event",
+            "seq": 1,
+            "event": {"kind": "pause_changed", "paused": True},
+        }
     ]
 
 
@@ -157,8 +162,8 @@ async def test_viewer_only_mode_says_there_is_nothing_to_pause():
 
 
 async def test_the_greeting_carries_the_current_value():
-    """A tab that connects after the switch was set has no event to learn it
-    from: replay reaches back 500 events and a fresh tab replays nothing. The
+    """A tab that connects after the switch was set may have no event to learn
+    it from (a viewer-only run replays only its last 500 events). The
     frame shape itself is covered in ``tests/test_protocol.py``; this is about
     the value coming from the live bus rather than from a default."""
     bus = _bus()

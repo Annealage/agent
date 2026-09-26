@@ -9,7 +9,10 @@ which concrete event type is used.
 
 import json
 
-from annealage_agent.session.base import TextDelta
+import pytest
+
+from annealage_agent.session import events as events_module
+from annealage_agent.session.base import TextDelta, ToolUse, TurnEnd, UserTurn
 from annealage_agent.session.events import RING_SIZE, EventLog
 
 
@@ -126,13 +129,12 @@ def test_replay_at_the_ring_boundary_is_not_reported_truncated():
 
 
 def test_replay_from_a_last_seq_older_than_the_ring_reports_truncation():
-    """Events between ``last_seq`` and what the ring still holds fell off
-    the ring before this replay; the caller (``http/ws.py``) must be told
-    the browser needs to page the rest over HTTP rather than being handed
-    a history with a silent hole cut out of the front of it. Whatever the
-    ring does still hold is returned alongside the truncation flag, since
-    a gap in the oldest history is no reason to also withhold newer
-    events that are available."""
+    """With no file behind it, events between ``last_seq`` and what the ring
+    still holds are gone; the caller (``http/ws.py``) must be told rather
+    than handed a history with a silent hole cut out of the front of it.
+    Whatever the ring does still hold is returned alongside the truncation
+    flag, since a gap in the oldest history is no reason to also withhold
+    newer events that are available."""
     log = EventLog()
     for i in range(RING_SIZE + 50):
         log.append(_evt(str(i)))
@@ -143,16 +145,11 @@ def test_replay_from_a_last_seq_older_than_the_ring_reports_truncation():
     assert replay.events != []
 
 
-def test_replay_immediately_after_a_restart_must_report_truncation_not_a_false_all_clear(
-    tmp_path,
-):
+def test_a_restarted_log_replays_its_history_from_the_file(tmp_path):
     """A restarted ``EventLog`` recovers ``current_seq`` from the file but
-    starts its in-memory ring empty (``__init__`` never repopulates the
-    ring from disk). A client reconnecting right after that restart, with
-    a ``last_seq`` below the recovered seq, must be told ``truncated``:
-    every event between its ``last_seq`` and the recovered seq exists
-    only in the append-only file, not in the empty ring, so an empty ring
-    on its own must never be read as "nothing to report"."""
+    starts its in-memory ring empty. A client reconnecting right after that
+    restart, with a ``last_seq`` below the recovered seq, is sent what it is
+    missing out of the file, not an empty reply that reads as "caught up"."""
     path = tmp_path / "events.jsonl"
     log = EventLog(str(path))
     for i in range(3):
@@ -163,7 +160,123 @@ def test_replay_immediately_after_a_restart_must_report_truncation_not_a_false_a
     assert restarted.current_seq == 3
 
     replay = restarted.replay(1)
-    assert replay.truncated is True
+    assert replay.truncated is False
+    assert replay.events == [(3, {"kind": "text_delta", "turn": 1, "text": "12"})]
+
+
+def test_a_gap_the_file_cannot_fill_is_reported(tmp_path):
+    """The history behind the ring is gone (the file was removed under a
+    running log): the gap is reported, never handed over as a complete
+    history with a hole in it."""
+    path = tmp_path / "events.jsonl"
+    log = EventLog(str(path))
+    for i in range(3):
+        log.append(_evt(str(i)))
+    log.close()
+    restarted = EventLog(str(path))
+    path.unlink()
+
+    assert restarted.replay(0).truncated is True
+
+
+def test_the_file_and_the_ring_join_with_no_seq_skipped_or_repeated(tmp_path, monkeypatch):
+    """Past the ring, the file supplies exactly the seqs the ring no longer
+    holds; each run of one turn's deltas from the file comes back as one
+    event with the run's last seq, and together they render the same text."""
+    monkeypatch.setattr(events_module, "RING_SIZE", 3)
+    path = tmp_path / "events.jsonl"
+    log = EventLog(str(path))
+    streamed = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
+    for text in streamed:
+        log.append(_evt(text))
+
+    replay = log.replay(0)
+    assert replay.truncated is False
+    assert [seq for seq, _ in replay.events] == [7, 8, 9, 10]
+    assert "".join(wire["text"] for _, wire in replay.events) == "".join(streamed)
+    # A client that saw the joined event resumes after its seq, not before.
+    assert [seq for seq, _ in log.replay(7).events] == [8, 9, 10]
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_appends_while_the_file_is_read_are_neither_skipped_nor_repeated(
+    tmp_path, monkeypatch
+):
+    """The file's part of a replay is read in a worker thread while the
+    stream goes on: events appended meanwhile (enough to push more off the
+    ring) come in the next replay, from ``through``, each exactly once."""
+    monkeypatch.setattr(events_module, "RING_SIZE", 3)
+    log = EventLog(str(tmp_path / "events.jsonl"))
+    for turn in range(1, 11):
+        log.append(_evt(str(turn), turn=turn))
+    read_between = log._read_between
+
+    def appending_meanwhile(after, before):
+        for turn in range(11, 16):
+            log.append(_evt(str(turn), turn=turn))
+        return read_between(after, before)
+
+    monkeypatch.setattr(log, "_read_between", appending_meanwhile)
+    first = await log.replay_async(0)
+    monkeypatch.setattr(log, "_read_between", read_between)
+    second = await log.replay_async(first.through)
+
+    assert first.through == 10
+    seqs = [seq for seq, _ in first.events + second.events]
+    assert seqs == list(range(1, 16))
+    assert not first.truncated and not second.truncated
+    log.close()
+
+
+def test_coalescing_keeps_every_other_event_and_every_turn_s_own_text(tmp_path):
+    path = tmp_path / "events.jsonl"
+    log = EventLog(str(path))
+    for event in (
+        UserTurn(turn=1, blocks=[{"type": "text", "text": "hi"}], client_id="c1"),
+        _evt("Let me ", turn=1),
+        _evt("look.", turn=1),
+        ToolUse(turn=1, tool_use_id="t1", name="read_file", input={}),
+        _evt("Done.", turn=1),
+        TurnEnd(turn=1, stop_reason="end", cost_usd=0.0),
+        _evt("Next ", turn=2),
+        _evt("one.", turn=2),
+    ):
+        log.append(event)
+    log.close()
+
+    replayed = EventLog(str(path)).replay(0).events
+    assert [(seq, wire["kind"]) for seq, wire in replayed] == [
+        (1, "user_turn"),
+        (3, "text_delta"),
+        (4, "tool_use"),
+        (5, "text_delta"),
+        (6, "turn_end"),
+        (8, "text_delta"),
+    ]
+    assert [wire["text"] for _, wire in replayed if wire["kind"] == "text_delta"] == [
+        "Let me look.",
+        "Done.",
+        "Next one.",
+    ]
+    assert replayed[0][1]["blocks"] == [{"type": "text", "text": "hi"}]
+
+
+def test_a_human_turn_with_no_reply_counts_and_is_unfinished(tmp_path):
+    """The process died before the agent said anything: the turn still
+    counts, so the next one is numbered after it, and it is unfinished, so
+    the next start closes it (``app.create_app``)."""
+    path = tmp_path / "events.jsonl"
+    log = EventLog(str(path))
+    log.append(UserTurn(turn=1, blocks=[{"type": "text", "text": "a"}]))
+    log.append(TurnEnd(turn=1, stop_reason="end", cost_usd=0.0))
+    log.append(UserTurn(turn=2, blocks=[{"type": "text", "text": "b"}]))
+    log.close()
+
+    restarted = EventLog(str(path))
+    assert restarted.last_turn == 2
+    assert restarted.unfinished_turns == (2,)
+    restarted.close()
 
 
 # ---------------------------------------------------------------------------

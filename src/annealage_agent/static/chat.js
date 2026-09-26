@@ -213,13 +213,26 @@ function assetUrlForImagePath(path) {
   return "/asset/" + name;
 }
 
-// Builds a sent turn's own thumbnail row from its composer blocks, once:
-// `container` starts empty and this only ever appends, since `record.user`
-// is set once (ensureTurn) and never changes afterwards. This is why a sent
-// turn's images come from the local record rather than from the agent's
-// echo of the turn: the SDK's message parser drops an image block out of
-// that echo with no error, so the echo cannot be relied on to show what was
-// actually sent, while the composer's own blocks already are that answer.
+// The name this page gives one message it sends: the turn frame's
+// `client_id`, echoed back in the `user_turn` event that logs the message or
+// the `refused` frame that turns it away. It only has to be unique among the
+// tabs of one conversation, and protocol.py takes up to 64 letters, digits,
+// '-' and '_'. randomUUID is missing on a plain-http tailnet address, which
+// is not a secure context, hence the fallback.
+function makeClientId() {
+  if (window.crypto && typeof window.crypto.randomUUID === "function") {
+    return window.crypto.randomUUID();
+  }
+  return "m" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+// Builds a sent turn's own thumbnail row from its blocks, once: `container`
+// starts empty and this only ever appends, since `record.user` is set once,
+// from the turn's `user_turn` event, and never changes afterwards. This is
+// why a sent turn's images come from that event, the blocks exactly as the
+// page sent them, rather than from the agent's echo of the turn: the SDK's
+// message parser drops an image block out of that echo with no error, so the
+// echo cannot be relied on to show what was actually sent.
 // Every element is built with createElement and given its `src` directly;
 // this pane never assigns HTML from a value that did not originate here.
 function renderUserAttachments(container, blocks) {
@@ -273,6 +286,22 @@ function findById(root, id) {
   return root.querySelector("#" + CSS.escape(id));
 }
 
+// The block under the banner's message that holds the backend's own text (an
+// agent_error's stderr): collapsible, and capped in height by agent.css. Built
+// here rather than asked of the page's markup, so every product's banner has
+// it; reused if this banner already has one.
+function bannerDetail(bannerEl) {
+  const existing = bannerEl.querySelector(":scope > details.chatbannerdetail");
+  if (existing) return existing;
+  const details = document.createElement("details");
+  details.className = "chatbannerdetail";
+  details.hidden = true;
+  const summary = document.createElement("summary");
+  summary.textContent = "What the agent backend said";
+  details.append(summary, document.createElement("pre"));
+  return bannerEl.appendChild(details);
+}
+
 /**
  * Mounts the pane. `send` is ws.js's frame sender; `root` is where the pane's
  * elements are looked up (default: the document); `ids` overrides any of
@@ -296,6 +325,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
   const bannerEl = els.banner;
   const bannerTextEl = els.bannerText;
   const bannerCloseBtn = els.bannerClose;
+  const bannerDetailEl = bannerDetail(bannerEl);
   const chatInputEl = els.input;
   const chatSendBtn = els.send;
   const chatModelInputEl = els.modelInput;
@@ -603,7 +633,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     // actually applied.
     function decide(decision) {
       const message = decision === "deny" ? reasonEl.value : "";
-      send({ v: 1, type: "permission", request_id: req.request_id, decision, message });
+      send({ type: "permission", request_id: req.request_id, decision, message });
       store.markChatPermissionSubmitted(req.request_id, decision);
     }
     allowBtn.addEventListener("click", () => decide("allow"));
@@ -687,11 +717,12 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
   // Set to the requested model right before sending `set_model`, and
   // cleared by whichever of two frames answers it first: a matching
   // `agent_model_changed` (the switch took effect) or the next `refused`
-  // frame seen afterwards (protocol.py's build_refused carries no
-  // correlation id, so "the next one" is the only signal this pane has
-  // that its own request -- not some unrelated permission/turn refusal --
-  // was the one rejected). `handleRefused` below reads this to decide
-  // whether a given refusal is its business at all.
+  // frame seen afterwards that names no turn (protocol.py's build_refused
+  // correlates a refused turn by its client_id and nothing else, so "the
+  // next uncorrelated one" is the only signal this pane has that its own
+  // request -- not some unrelated permission refusal -- was the one
+  // rejected). `handleRefused` below reads this to decide whether a given
+  // refusal is its business at all.
   let pendingSetModel = null;
 
   // A refusal that needs to revert the field, but arrived while the field
@@ -728,7 +759,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
       return;
     }
     pendingSetModel = value;
-    if (!send({ v: 1, type: "set_model", model: value })) {
+    if (!send({ type: "set_model", model: value })) {
       // send() no-ops silently when the socket is not OPEN; no refusal
       // (or confirming agent_model_changed) will ever arrive for a
       // request that was never transmitted, so pendingSetModel cannot be
@@ -776,20 +807,24 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
   // independent reasons to refuse a send and a function per reason would leave
   // whichever ran last deciding for both.
   //
+  // Only a ready agent takes a message: the server refuses one sent while the
+  // agent is starting or gone, so the button says so rather than offering a
+  // send that comes straight back.
+  //
   // An upload still in flight is a refusal rather than a partial send: posting
   // the turn without it would silently omit the image the human is waiting on
   // and then carry it on whatever they typed next, which reads as the picture
   // having been ignored.
   function renderSendButton(chat) {
-    const unavailable = chat.agentStatus === "unavailable";
+    const ready = chat.agentStatus === "ready";
     const uploading = chat.attachments.some((a) => a.state === "uploading");
     const busy = chat.pendingUser.length > 0 || chat.turns.some((t) => !t.complete);
-    const steering = steers && busy && !unavailable;
-    chatSendBtn.disabled = unavailable || uploading;
+    const steering = steers && busy && ready;
+    chatSendBtn.disabled = !ready || uploading;
     chatSendBtn.textContent = steering ? "Steer" : "Send";
     chatSendBtn.title = uploading
       ? "Waiting for an attachment to finish uploading"
-      : (unavailable ? titles.unavailable
+      : (!ready ? titles[chat.agentStatus] || ""
         : (steering ? "The agent is working: this message redirects it now" : ""));
   }
 
@@ -798,6 +833,15 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
       bannerEl.hidden = false;
       bannerEl.dataset.kind = chat.banner.kind;
       bannerTextEl.textContent = chat.banner.text;
+      // Opened whenever it shows something new, so the backend's words are
+      // seen, and left as the human set it while the same text stays.
+      const detail = chat.banner.detail || "";
+      const pre = bannerDetailEl.querySelector("pre");
+      if (pre.textContent !== detail) {
+        pre.textContent = detail;
+        bannerDetailEl.open = true;
+      }
+      bannerDetailEl.hidden = !detail;
     } else {
       bannerEl.hidden = true;
     }
@@ -825,9 +869,12 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
 
   function doSend() {
     const text = chatInputEl.value.trim();
-    const attachments = store.getState().chat.attachments;
-    // Anything still uploading holds the send: the button is already disabled
-    // for it, and this covers the Enter key, which is not the button.
+    const chat = store.getState().chat;
+    const attachments = chat.attachments;
+    // Held while the agent is not ready or anything is still uploading: the
+    // button is already disabled for both, and this covers the Enter key,
+    // which is not the button. The message stays in the composer.
+    if (chat.agentStatus !== "ready") return;
     if (attachments.some((a) => a.state === "uploading")) return;
     const ready = attachments.filter((a) => a.state === "done");
     if (!text && !ready.length) return; // an attachment with no text is allowed; neither is not
@@ -836,8 +883,16 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     // the API outright, failing the whole turn including the image, and an
     // attachment with no typed message is a case this composer allows.
     if (text) blocks.push({ type: "text", text });
-    store.queueChatUserTurn(blocks);
-    send({ v: 1, type: "turn", blocks });
+    const clientId = makeClientId();
+    if (!send({ type: "turn", blocks, client_id: clientId })) {
+      // Nothing went out, so nothing will answer it: the message stays in
+      // the composer to be sent again once the socket is back.
+      toast("Not connected, so the message was not sent", false);
+      return;
+    }
+    // Held as pending, not drawn: the server's `user_turn` for it, which
+    // every tab receives, is what shows the message.
+    store.queueChatUserTurn(clientId, blocks);
     chatInputEl.value = "";
     store.clearChatAttachments();
   }
@@ -851,7 +906,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
   });
 
   chatInterruptBtn.addEventListener("click", () => {
-    send({ v: 1, type: "interrupt" });
+    send({ type: "interrupt" });
   });
 
   bannerCloseBtn.addEventListener("click", () => store.clearChatBanner());
@@ -905,6 +960,32 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     renderExportButton();
   }
 
+  // Messages this pane sent over an earlier connection that neither a
+  // user_turn nor a refusal had answered when a new connection opened. The
+  // new connection's replay says what became of each: one the server logged
+  // arrives as its user_turn, which retires it; one that never reached the
+  // server (the socket dropped with the frame in flight) does not, and goes
+  // back into the composer once the replay is over, rather than vanishing.
+  // The replay is over at the first live event, or, when none comes, once
+  // the replay has been quiet for SETTLE_MS.
+  const SETTLE_MS = 1500;
+  let unconfirmed = new Set();
+  let settleTimer = null;
+
+  function settleUnconfirmed() {
+    clearTimeout(settleTimer);
+    settleTimer = null;
+    const lost = [];
+    for (const clientId of unconfirmed) {
+      const blocks = store.dropChatUserTurn(clientId);
+      if (blocks) lost.push(...blocks);
+    }
+    unconfirmed = new Set();
+    if (!lost.length) return;
+    const complete = restoreToComposer(lost);
+    toast(restoredText("A message sent as the connection dropped never arrived", complete), false);
+  }
+
   function handleHello(session) {
     if (session) {
       // A fresh connection's hello is authoritative, the same way it
@@ -921,19 +1002,48 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
       queuedModelRevert = false;
       store.setChatAgentStatus(session.agent);
       store.setChatModel(session.model);
+      // Why the agent is down, for a page opened after it went down: the
+      // agent_error event that said so is history in this connection's
+      // replay, which raises no banner.
+      if (session.agent_error) {
+        store.setChatBanner(
+          "error",
+          session.agent_error.remediation || "The agent reported an error.",
+          session.agent_error.stderr,
+        );
+      }
     }
+    // What this pane sent over an earlier connection is settled by the replay
+    // that follows (see `unconfirmed`).
+    unconfirmed = new Set(store.getState().chat.pendingUser.map((p) => p.clientId));
+    clearTimeout(settleTimer);
+    settleTimer = unconfirmed.size ? setTimeout(settleUnconfirmed, SETTLE_MS) : null;
+    // A different session from the one this pane was showing (the server
+    // restarted into a new conversation): the turns on screen belong to
+    // another conversation, and this one's history arrives in the replay.
+    const nextSessionId = session && session.id ? session.id : null;
+    if (sessionId !== null && nextSessionId !== sessionId) store.resetChatTurns();
     // Held for the Export button, which needs the id of the session it is
     // writing out. Viewer-only runs report "viewer-only" here and have no
     // conversation to export, which the button reflects by staying disabled.
-    sessionId = session && session.id ? session.id : null;
+    sessionId = nextSessionId;
     steers = !!(session && session.steers);
     renderSendButton(store.getState().chat);
     renderExportButton();
   }
 
+  // `meta.replayed` marks the history a connection opens with. It builds the
+  // conversation like any live event, but state the hello already reported
+  // afresh (agent status, model) is not taken from it, and nothing in it
+  // calls for the human now: a banner, a toast or a notification raised
+  // from history would report an earlier process's trouble as current.
   function handleEvent(event, meta = {}) {
     if (!event) return;
+    const replayed = !!meta.replayed;
     switch (event.kind) {
+      case "user_turn":
+        store.setChatUserTurn(event.turn, event.blocks, event.client_id || null);
+        break;
       case "text_delta":
         store.appendChatTextDelta(event.turn, event.text);
         break;
@@ -947,8 +1057,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
         store.endChatTurn(event.turn, event.stop_reason, event.cost_usd, event.tokens || null);
         break;
       case "attention":
-        // History on a reconnect is not a call for the human now.
-        if (!meta.replayed) {
+        if (!replayed) {
           notifyAttention(event.title, event.body);
           store.setChatBanner("info", event.title + ": " + event.body);
         }
@@ -963,13 +1072,13 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
         );
         break;
       case "permission_resolved":
-        reportResolution(event);
+        if (!replayed) reportResolution(event);
         store.removeChatPermissionRequest(event.request_id);
         break;
       case "agent_status":
-        // The hello frame's `session.agent` is only the status at the moment
-        // this connection was accepted; this is what keeps it current.
-        store.setChatAgentStatus(event.status);
+        // The hello frame's `session.agent` is the status at the moment this
+        // connection was accepted; a live event is what keeps it current.
+        if (!replayed) store.setChatAgentStatus(event.status);
         break;
       case "agent_model_changed":
         // The LLM backend's active model, confirmed to have taken effect
@@ -978,7 +1087,8 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
         // asked for -- a different tab's switch, or a value nobody here
         // requested, is still worth displaying but must not be mistaken for
         // an answer to a request that, as far as this pane knows, is still
-        // outstanding.
+        // outstanding. A replayed one is older than the hello's model.
+        if (replayed) break;
         if (pendingSetModel !== null && event.model === pendingSetModel) {
           pendingSetModel = null;
         }
@@ -986,14 +1096,27 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
         break;
       case "session_reset":
         store.resetChatTurns();
-        store.setChatBanner("reset", event.reason);
+        if (!replayed) store.setChatBanner("reset", event.reason);
         break;
       case "agent_error":
-        store.setChatBanner("error", event.remediation || event.stderr);
+        // What to do, and under it the backend's own words, which are often
+        // the only real reason given.
+        if (!replayed) {
+          store.setChatBanner(
+            "error", event.remediation || "The agent reported an error.", event.stderr);
+        }
         break;
       default:
         // "viewer_primary" and any future kind: no rendering in this pane yet.
         break;
+    }
+    if (unconfirmed.size) {
+      if (replayed) {
+        clearTimeout(settleTimer);
+        settleTimer = setTimeout(settleUnconfirmed, SETTLE_MS);
+      } else {
+        settleUnconfirmed();
+      }
     }
   }
 
@@ -1016,16 +1139,62 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     renderModel(store.getState().chat);
   }
 
-  // A refusal carries no correlation id (protocol.py's build_refused is
-  // just {v, type, reason}), so this cannot tell which outstanding request
-  // it answers. What it can do is track its own pending `set_model` call
-  // locally (`pendingSetModel`, set by applyModelInput above and cleared by
-  // a matching `agent_model_changed`) and treat only the next refusal seen
-  // while that is still set as "probably mine". An unrelated refusal (a
-  // permission or turn frame, with no set_model outstanding) is left alone
-  // entirely, rather than reverting a model change that has not actually
-  // failed.
-  function handleRefused() {
+  // A message that will not appear (refused, or lost in a dropped
+  // connection) goes back into the composer rather than being lost: it was
+  // cleared on Send. Its text goes in front of anything typed since, a blank
+  // line between, and its images come back as finished attachments, since
+  // their files are already on the server. Returns false when some images
+  // did not fit beside those already attached (MAX_CHAT_ATTACHMENTS).
+  function restoreToComposer(blocks) {
+    const text = blocksToText(blocks);
+    const typed = chatInputEl.value.trim();
+    if (text) chatInputEl.value = typed ? text + "\n\n" + typed : text;
+    let complete = true;
+    blocks
+      .filter((b) => b.type === "image_path")
+      .forEach((b) => {
+        const id = store.reserveChatAttachment("upload");
+        if (id === null) {
+          complete = false;
+          return;
+        }
+        store.completeChatAttachment(id, {
+          path: b.path,
+          url: assetUrlForImagePath(b.path),
+          bytes: null,
+          mediaType: null,
+        });
+      });
+    return complete;
+  }
+
+  // The toast that says a message went back into the composer, true to what
+  // restoreToComposer managed.
+  function restoredText(what, complete) {
+    return complete
+      ? what + "; it is back in the box"
+      : what + "; it is back in the box, but not every image fitted beside the ones attached";
+  }
+
+  // A refused turn names itself (`clientId`, the turn frame's own): it is
+  // not coming back as a user_turn, so it stops being pending and is offered
+  // again. Any other refusal carries no correlation id, so this cannot tell
+  // which outstanding request it answers. What it can do is track its own
+  // pending `set_model` call locally (`pendingSetModel`, set by
+  // applyModelInput above and cleared by a matching `agent_model_changed`)
+  // and treat only the next such refusal seen while that is still set as
+  // "probably mine". An unrelated refusal (a permission frame, with no
+  // set_model outstanding) is left alone entirely, rather than reverting a
+  // model change that has not actually failed.
+  function handleRefused(reason, clientId = null) {
+    if (clientId) {
+      const blocks = store.dropChatUserTurn(clientId);
+      if (blocks) {
+        const complete = restoreToComposer(blocks);
+        toast(restoredText(reason || "The message was not sent", complete), false);
+      }
+      return;
+    }
     if (pendingSetModel === null) return;
     pendingSetModel = null;
     revertPendingModel();

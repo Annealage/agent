@@ -56,6 +56,8 @@ class FakeSession:
         self.started = 0
         self.closed = 0
         self.viewer_counts: List[int] = []
+        # What backend_logs() lists; a test sets it to BackendLog entries.
+        self.logs: list = []
 
     def agent_status(self) -> str:
         return self._status
@@ -113,3 +115,7 @@ class FakeSession:
         real answer rather than omitted, so the banner has one shape to render
         for every session instead of a present case and an absent one."""
         return SandboxStatus(requested=False, active=False, missing=())
+
+    def backend_logs(self) -> list:
+        """Whatever a test put in ``logs``: a fake has no backend of its own."""
+        return list(self.logs)

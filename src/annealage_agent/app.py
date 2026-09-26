@@ -1,8 +1,8 @@
 """Builds the microdot application for any product and owns its asyncio
 startup and shutdown.
 
-``create_app`` wires the agent layer's routes (``/ws``, the chat, settings and
-``/mcp`` routes, and ``/agent/static/`` for its own front end) and whatever
+``create_app`` wires the agent layer's routes (``/ws``, the chat, settings,
+agent log and ``/mcp`` routes, and ``/agent/static/`` for its own front end) and whatever
 routes the product registers onto a fresh ``Microdot`` instance, together with
 the pieces every product shares: the Host check, the event log, the viewer
 registry and bus, the product's tool server, the session, and the security
@@ -29,6 +29,7 @@ from . import net, product, protocol, sessions
 from . import settings as settings_module
 from .http.routes_chat import register_chat_routes
 from .http.routes_login import LoginNonces, register_login_routes
+from .http.routes_logs import register_log_routes
 from .http.routes_mcp import register_mcp_routes
 from .http.routes_review import register_review_routes
 from .http.routes_settings import register_settings_routes
@@ -36,8 +37,16 @@ from .http.static import register_agent_static_routes
 from .http.ws import host_is_allowed, ping_forever, refusal, register_ws
 from .review.watcher import ReviewWatcher
 from .session import secret_paths
-from .session.base import AgentModelChanged, TurnEnd
+from .session.base import (
+    AGENT_READY,
+    AgentError,
+    AgentModelChanged,
+    AgentStatus,
+    PermissionResolved,
+    TurnEnd,
+)
 from .session.events import EventLog
+from .session.permissions import OUTCOME_SHUTDOWN
 from .viewers import ViewerBus, ViewerRegistry
 
 # Upper bound on how long shutdown waits for in-flight requests to drain
@@ -305,7 +314,12 @@ def create_app(
     # N+1 on every backend (launch.build_session passes bus.turn on), so the
     # page never merges a new turn into an old one of the same number. A turn
     # an earlier process never finished (killed mid-turn) is closed here, so
-    # the page does not show a finished history as a running turn.
+    # the page does not show a finished history as a running turn, and so is
+    # a permission request it asked and nobody answered, first, as the broker
+    # would have at shutdown: its card would come back with the history, and
+    # no one is waiting on the answer any more.
+    for request_id in event_log.unresolved_requests:
+        event_log.append(PermissionResolved(request_id=request_id, outcome=OUTCOME_SHUTDOWN))
     for turn in event_log.unfinished_turns:
         event_log.append(TurnEnd(turn=turn, stop_reason="interrupted", cost_usd=0.0))
     registry = ViewerRegistry(event_log=event_log, on_presence=_presence)
@@ -467,6 +481,10 @@ def create_app(
             allowed_origins=allowed_origins,
         )
 
+    # Listed from whatever session this run ended up with; a viewer-only run
+    # still answers, with nothing to list.
+    register_log_routes(app, session=session, token=token, allowed_origins=allowed_origins)
+
     register_ws(
         app,
         token=token,
@@ -588,17 +606,72 @@ def _event_publisher(registry, event_log, session_info=None):
     only recovers the running model while the event that announced it is
     still inside the replay ring buffer; once evicted, a fresh ``hello``
     would otherwise fall back to permanently showing the CLI-configured
-    starting model instead of what the session is actually running.
+    starting model instead of what the session is actually running. The
+    latest ``AgentError`` is kept the same way, as
+    ``session_info["agent_error"]``, and dropped once an ``AgentStatus``
+    says the agent is ready: a page opened while the agent is down learns
+    why from the ``hello``, since it raises no banner from replayed history.
+
+    Every ``AgentError`` is also written to this process's stderr
+    (``_journal_agent_error``), so a service's journal says why its agent is
+    down without anyone opening the page. It is written here, the one place
+    every session's events pass through, rather than by each backend.
     """
 
+    # The last AgentError written to stderr, as (remediation, stderr).
+    journaled = [None]
+
     def publish(event):
+        if isinstance(event, AgentError):
+            _journal_agent_error(event, journaled)
         if session_info is not None and isinstance(event, AgentModelChanged):
             session_info["model"] = event.model
+        if session_info is not None and isinstance(event, AgentError):
+            session_info["agent_error"] = {
+                "remediation": event.remediation,
+                "stderr": event.stderr,
+            }
+        if session_info is not None and isinstance(event, AgentStatus):
+            if event.status == AGENT_READY:
+                session_info["agent_error"] = None
         seq = event_log.append(event)
         frame = protocol.build_event(seq, event.to_wire())
         asyncio.ensure_future(registry.broadcast(frame))
 
     return publish
+
+
+#: How much of a backend's own text one journal entry carries: its end, which
+#: is where the reason usually is. The page's banner shows all of it.
+JOURNAL_STDERR_LIMIT = 4000
+
+
+def _journal_agent_error(event, journaled):
+    """Write ``event`` to stderr as ``agent error: <remediation>: <stderr>``,
+    the backend's own text trimmed and its later lines indented under the
+    first, unless it repeats the error written last (``journaled[0]``).
+
+    A burst of identical errors is one fact: each turn sent to an agent that
+    never started, or a backend reporting the same failure again, would
+    otherwise bury the one line worth reading. A different error in between
+    lets the same one be written again, since it then says something new.
+    """
+    key = (event.remediation, event.stderr)
+    if journaled[0] == key:
+        return
+    journaled[0] = key
+    detail = (event.stderr or "").strip()
+    if len(detail) > JOURNAL_STDERR_LIMIT:
+        detail = "..." + detail[-JOURNAL_STDERR_LIMIT:]
+    line = "agent error: %s" % (event.remediation or "the agent reported an error")
+    if detail:
+        first, *rest = detail.splitlines()
+        line += ": " + "\n".join([first] + [("  " + more) if more.strip() else "" for more in rest])
+    try:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
 
 
 #: How often ``serve`` tries a remote MCP server that could not be reached

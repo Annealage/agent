@@ -503,7 +503,8 @@ async def test_overflow_closes_1013_when_no_ping_is_queued_and_the_frame_is_not_
     await registry.broadcast(_FILLER)  # not a ping, not a delta: no relief exists
 
     assert ws.closed is True
-    payload, opcode = ws.sent[0]
+    # The first frame sent may be the viewer_primary add announced.
+    payload, opcode = ws.sent[-1]
     assert opcode == ws.CLOSE
     assert struct.unpack("!H", payload[:2])[0] == CLOSE_OVERFLOW
     assert conn.id not in registry._connections
@@ -523,7 +524,8 @@ async def test_overflow_closes_1013_when_a_delta_has_no_same_turn_entry_to_colla
     )  # a third, still different, turn: nothing to merge into
 
     assert ws.closed is True
-    payload, _ = ws.sent[0]
+    payload, opcode = ws.sent[-1]
+    assert opcode == ws.CLOSE
     assert struct.unpack("!H", payload[:2])[0] == CLOSE_OVERFLOW
 
 
@@ -717,3 +719,30 @@ async def test_the_pause_switch_reports_only_a_real_change():
     assert bus.set_paused(True) is False
     assert bus.set_paused(False) is True
     assert bus.paused is False
+
+
+async def test_a_primary_change_reaches_every_viewer_behind_events_already_published():
+    """A session publishes by appending and scheduling the broadcast; a
+    ``viewer_primary`` announced before that broadcast has run must still
+    reach each page after it, since the page drops an event at or below the
+    last seq it has."""
+    from annealage_agent.session.events import EventLog
+
+    log = EventLog()
+    registry = ViewerRegistry(event_log=log)
+    first = await registry.add(_FakeWebSocket(), tab_id="a")
+    second = await registry.add(_FakeWebSocket(), tab_id="b")
+    await _stall_writer(first)
+    await _stall_writer(second)
+    first.queue._queue.clear()
+    second.queue._queue.clear()
+
+    event = TextDelta(turn=1, text="streamed")
+    seq = log.append(event)
+    asyncio.ensure_future(registry.broadcast(build_event(seq, event.to_wire())))
+    await registry.touch(first)  # the primary moves: a viewer_primary with a later seq
+
+    for conn in (first, second):
+        frames = _queue_frames(conn)
+        assert [f["event"]["kind"] for f in frames] == ["text_delta", "viewer_primary"]
+        assert [f["seq"] for f in frames] == sorted(f["seq"] for f in frames)

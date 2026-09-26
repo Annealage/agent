@@ -82,7 +82,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import PermissionRuleValue, ToolPermissionContext
 
 from .. import product
-from . import secret_paths, turn_images, workspace_trust
+from . import logfiles, secret_paths, turn_images, workspace_trust
 from .base import (
     AGENT_CONNECTING,
     AGENT_READY,
@@ -97,6 +97,7 @@ from .base import (
     ToolUse,
     TurnEnd,
     UnknownRequest,
+    turn_not_sent,
 )
 from .permissions import Decision
 
@@ -285,6 +286,14 @@ class SdkSession:
             missing=self._sandbox_missing,
         )
 
+    def backend_logs(self) -> list:
+        """The CLI's transcript of this conversation (the one being resumed
+        until the CLI reports its own id) and the stderr lines kept in memory
+        (``_note_stderr``), which are all there is when the CLI never started."""
+        return logfiles.claude_logs(
+            self.cwd, self.sdk_session_id or self._resume, "\n".join(self._stderr_lines)
+        )
+
     def on_viewer_presence(self, count: int) -> None:
         """Keep the broker's view of how many viewers exist in step with the
         registry's.
@@ -324,12 +333,11 @@ class SdkSession:
         runs in an executor rather than blocking this coroutine or the pump
         reading the same loop.
         """
-        if self._client is None or self._status == AGENT_UNAVAILABLE:
+        if self._client is None or self._status != AGENT_READY:
             self._emit(
                 AgentError(
                     stderr=self._recent_stderr(),
-                    remediation="the agent is not running, so this turn was not sent; "
-                    "check the startup output for why and use Retry",
+                    remediation=turn_not_sent(self._status),
                     viewer=viewer,
                 )
             )
@@ -1006,7 +1014,7 @@ def _remediation_for(exc: BaseException) -> str:
             "the claude CLI sent something this build could not parse, which "
             "usually means a version mismatch; check the pinned SDK range"
         )
-    return "the agent is unavailable; the captured output above is what it reported"
+    return "the agent is unavailable; its captured output says why"
 
 
 def _doctor_then(advice):

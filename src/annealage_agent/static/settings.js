@@ -32,6 +32,13 @@
  * are a closed set of choices (`choices`, `nullable`), and which product it is
  * describing (`product`), so a product's key appears and is editable here
  * because the product declared it, not because this file knows its name.
+ *
+ * Under Diagnostics, the Agent log section lists the agent backend's own logs
+ * for this session (`GET /agent/logs`: omp's process log, the Claude CLI's
+ * transcript, a Codex rollout, each backend's stderr) with where each one is,
+ * and shows the end of one on request (`GET /agent/logs/<name>`), since that is
+ * where the reason for a failure usually is. It is filled in once the window
+ * is open, so a slow disk never holds up the settings.
  */
 
 import { store } from "./store.js";
@@ -221,6 +228,145 @@ function diagnosticsBlock(facts, product) {
 }
 
 /**
+ * `GET path` (one of the `/agent/logs` routes), parsed, or null if it could
+ * not be read. A refusal answers with a bare body rather than JSON, which
+ * lands here too.
+ */
+async function fetchAgentLogs(path) {
+  const token = authToken();
+  if (!token) return null;
+  try {
+    const res = await fetch(path + "?t=" + encodeURIComponent(token));
+    return await res.json();
+  } catch (err) {
+    return null;
+  }
+}
+
+// Whether a line of a JSON-lines log is at debug level. Most of omp's log is,
+// and the warnings worth reading are among it, so those lines start hidden.
+function isDebugLine(line) {
+  if (!line.startsWith("{")) return false;
+  try {
+    const level = JSON.parse(line).level;
+    return level === "debug" || level === "trace";
+  } catch (err) {
+    return false;
+  }
+}
+
+function kib(bytes) {
+  return Math.max(1, Math.round(bytes / 1024)) + " KiB";
+}
+
+// One log's end, as `GET /agent/logs/<name>` sent it, scrolled to its last line.
+function logBody(payload) {
+  const wrap = document.createElement("div");
+  if (!payload || payload.ok !== true) {
+    wrap.className = "lognote";
+    wrap.textContent = (payload && payload.error) || "The log could not be read.";
+    return wrap;
+  }
+  const lines = payload.text.split("\n");
+  const opts = document.createElement("div");
+  opts.className = "logopts";
+  const note = document.createElement("span");
+  note.textContent = payload.truncated
+    ? "the last " + kib(new TextEncoder().encode(payload.text).length) + " of " + kib(payload.size)
+    : kib(payload.size);
+  opts.appendChild(note);
+  const pre = document.createElement("pre");
+  pre.className = "logtail";
+
+  let showDebug = false;
+  const debugCount = payload.format === "jsonl" ? lines.filter(isDebugLine).length : 0;
+  function render() {
+    const shown = showDebug ? lines : lines.filter((line) => !isDebugLine(line));
+    pre.textContent = shown.join("\n").trim() || "(nothing to show)";
+    requestAnimationFrame(() => { pre.scrollTop = pre.scrollHeight; });
+  }
+  if (debugCount) {
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.addEventListener("change", () => {
+      showDebug = box.checked;
+      render();
+    });
+    label.append(box, " show " + debugCount + " debug lines");
+    opts.appendChild(label);
+  } else {
+    showDebug = true;
+  }
+  wrap.append(opts, pre);
+  render();
+  return wrap;
+}
+
+function logRow(entry) {
+  const row = document.createElement("div");
+  row.className = "logrow";
+  const head = document.createElement("div");
+  head.className = "loghead";
+  const name = document.createElement("span");
+  name.className = "logname";
+  name.textContent = entry.name;
+  const where = document.createElement("span");
+  where.className = "logpath";
+  where.textContent = entry.path || "kept in memory by this server";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "logbtn";
+  button.textContent = "Show";
+  head.append(name, where, button);
+  row.appendChild(head);
+
+  let body = null;
+  button.addEventListener("click", async () => {
+    if (body) {
+      body.remove();
+      body = null;
+      button.textContent = "Show";
+      return;
+    }
+    button.disabled = true;
+    // By name, not position: the list grows while the window is open (omp's
+    // conversation file appears with the first message), so a position could
+    // by now be a different log.
+    const payload = await fetchAgentLogs("/agent/logs/" + encodeURIComponent(entry.name));
+    button.disabled = false;
+    body = logBody(payload);
+    row.appendChild(body);
+    button.textContent = "Hide";
+  });
+  return row;
+}
+
+function agentLogSection() {
+  const section = document.createElement("section");
+  const heading = document.createElement("h3");
+  heading.textContent = "Agent log";
+  section.appendChild(heading);
+  const list = document.createElement("div");
+  list.className = "lognote";
+  list.textContent = "Looking for the agent's logs…";
+  section.appendChild(list);
+  fetchAgentLogs("/agent/logs").then((payload) => {
+    const logs = payload && payload.ok === true ? payload.logs : null;
+    if (!logs) {
+      list.textContent = "The agent's logs could not be listed.";
+    } else if (!logs.length) {
+      list.textContent = "This run's agent has no logs of its own.";
+    } else {
+      list.textContent = "";
+      list.className = "loglist";
+      logs.forEach((entry) => list.appendChild(logRow(entry)));
+    }
+  });
+  return section;
+}
+
+/**
  * Reads every input back and returns only the values that differ from what the
  * payload reported, so a save writes what was actually changed rather than
  * rewriting every key with what it already held.
@@ -372,6 +518,7 @@ export function initSettings({
     diagSection.appendChild(diagHeading);
     diagSection.appendChild(diagnosticsBlock(payload.diagnostics || {}, product));
     body.appendChild(diagSection);
+    body.appendChild(agentLogSection());
     panel.appendChild(body);
 
     const footer = document.createElement("footer");

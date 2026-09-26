@@ -38,6 +38,7 @@ from omp_rpc import RpcClient
 from annealage_agent import launch, sessions
 from annealage_agent.session import omp as omp_module
 from annealage_agent.session.base import (
+    AGENT_CONNECTING,
     AGENT_READY,
     AGENT_UNAVAILABLE,
     AgentError,
@@ -1040,6 +1041,61 @@ async def test_a_refused_message_is_reported_and_leaves_the_session_ready():
 
 
 @pytest.mark.asyncio
+async def test_a_turn_sent_while_omp_is_still_connecting_is_neither_prompted_nor_counted():
+    """``-c`` resumes with the client already live and the status still
+    connecting (switch_session, get_state). A turn sent then is refused
+    before omp or either counter sees it, so the next accepted turn's
+    ``user_turn`` and its reply carry the same number."""
+    from annealage_agent.http import ws as ws_module
+    from annealage_agent.session.events import EventLog
+
+    session, fake, recorder, broker = await _started_session()
+    log = EventLog()
+    bus = ViewerBus(None, url="http://127.0.0.1:8765/")
+
+    class _Sock:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, payload):
+            self.sent.append(json.loads(payload))
+
+    class _Registry:
+        async def touch(self, conn):
+            pass
+
+        async def broadcast(self, frame):
+            pass
+
+    async def send_turn(text, client_id):
+        sock = _Sock()
+        frame = {"v": 1, "type": "turn", "blocks": _text(text), "client_id": client_id}
+        await ws_module._dispatch(
+            sock, SimpleNamespace(tab_id="t"), _Registry(), log, "tok", frame, session, bus
+        )
+        return sock.sent
+
+    try:
+        session._status = AGENT_CONNECTING
+        refused = await send_turn("too early", "c-1")
+        assert [(f["type"], f.get("client_id")) for f in refused] == [("refused", "c-1")]
+        # The backend's own guard, for a caller that goes around http/ws.py.
+        await session.submit_turn(_text("too early"))
+        assert fake.prompt_calls == []
+        assert (bus.turn, session._turn) == (0, 0)
+
+        session._status = AGENT_READY
+        assert await send_turn("now", "c-2") == []
+        fake.push_message_update({"type": "text_delta", "delta": "Hi"})
+        reply = await _next_of(recorder, TextDelta)
+        logged = [w for _s, w in log.replay(0).events if w["kind"] == "user_turn"]
+        assert [c.message for c in fake.prompt_calls] == ["now"]
+        assert [w["turn"] for w in logged] == [reply.turn] == [1]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_a_message_refused_after_omp_acknowledged_it_is_reported_the_same_way():
     """``omp://rpc.md``: a prompt's scheduling can fail after its immediate
     success response, as an error response nothing is waiting on."""
@@ -1434,6 +1490,18 @@ def _history(tmp_path, events):
     return sid
 
 
+class _Unregistered:
+    """The app's registry as ``_dispatch`` sees it for a frame from a
+    connection the test never registered: nothing to promote to primary, and
+    broadcasts reach the real registry."""
+
+    def __init__(self, registry):
+        self.broadcast = registry.broadcast
+
+    async def touch(self, conn):
+        pass
+
+
 def _resumed_omp_app(tmp_path, sid, monkeypatch):
     from conftest import create_toy_app
 
@@ -1476,8 +1544,8 @@ async def test_a_resumed_session_s_next_turn_follows_the_last_one_in_its_history
     tmp_path, monkeypatch
 ):
     """Five turns already in the log: the next human turn is 6 on the bus, on
-    the wire and in the log, never a second turn 1 the page would merge into
-    the replayed one."""
+    the wire and in the log, the human's message included, never a second
+    turn 1 the page would merge into the replayed one."""
     from annealage_agent.http import ws as ws_module
     from annealage_agent.session.events import read_records
 
@@ -1497,13 +1565,16 @@ async def test_a_resumed_session_s_next_turn_follows_the_last_one_in_its_history
             async def send(self, payload):
                 pass
 
-        class _Registry:
-            async def touch(self, conn):
-                pass
-
         frame = {"v": 1, "type": "turn", "blocks": [{"type": "text", "text": "hello again"}]}
         await ws_module._dispatch(
-            _Sock(), SimpleNamespace(tab_id="t"), _Registry(), None, "tok", frame, session, bus
+            _Sock(),
+            SimpleNamespace(tab_id="t"),
+            _Unregistered(app.agent_registry),
+            app.agent_event_log,
+            "tok",
+            frame,
+            session,
+            bus,
         )
         assert bus.turn == 6
         fake.push_message_update({"type": "text_delta", "delta": "Hi"})
@@ -1516,11 +1587,77 @@ async def test_a_resumed_session_s_next_turn_follows_the_last_one_in_its_history
             if ("turn_end", 6, "end") in kinds:
                 break
             await asyncio.sleep(0.01)
-        assert ("text_delta", 6, None) in kinds
-        assert ("turn_end", 6, "end") in kinds
-        # Nothing new was numbered below 6, and nothing was ended as steered.
-        assert not any(k[2] == "steered" for k in kinds)
-        assert [k for k in kinds[10:] if k[1] is not None and k[1] < 6] == []
+        assert [k for k in kinds[10:] if k[1] is not None] == [
+            ("user_turn", 6, None),
+            ("text_delta", 6, None),
+            ("turn_end", 6, "end"),
+        ]
+    finally:
+        await session.close()
+        app.agent_event_log.close()
+
+
+@pytest.mark.asyncio
+async def test_a_steer_is_logged_under_the_number_its_reply_arrives_under(tmp_path, monkeypatch):
+    """omp ends the running turn as steered and streams the rest under the
+    next number; the steering message's ``user_turn`` has that number, so the
+    page shows it beside the reply it produced rather than as an empty turn."""
+    from annealage_agent.http import ws as ws_module
+    from annealage_agent.session.events import read_records
+
+    sid = _history(tmp_path, [TurnEnd(turn=1, stop_reason="end", cost_usd=0.0)])
+    app, clients = _resumed_omp_app(tmp_path, sid, monkeypatch)
+    bus, session = app.agent_bus, app.agent_session
+    await session.start()
+
+    class _Sock:
+        async def send(self, payload):
+            pass
+
+    async def send_turn(text):
+        frame = {"v": 1, "type": "turn", "blocks": [{"type": "text", "text": text}]}
+        await ws_module._dispatch(
+            _Sock(),
+            SimpleNamespace(tab_id="t"),
+            _Unregistered(app.agent_registry),
+            app.agent_event_log,
+            "tok",
+            frame,
+            session,
+            bus,
+        )
+
+    async def logged_until(wanted):
+        """The turn-numbered records after the history's own, once ``wanted``
+        is among them."""
+        for _ in range(100):
+            records = list(read_records(sessions.events_path(tmp_path, sid)))[1:]
+            turns = [
+                (r["event"]["kind"], r["event"]["turn"], r["event"].get("stop_reason"))
+                for r in records
+                if "turn" in r["event"]
+            ]
+            if wanted in turns:
+                break
+            await asyncio.sleep(0.01)
+        return turns
+
+    try:
+        fake = clients[0]
+        await send_turn("draw the regulator")
+        fake.push_message_update({"type": "text_delta", "delta": "Working"})
+        await logged_until(("text_delta", 2, None))
+        await send_turn("use the LDO instead")
+        fake.push_message_update({"type": "text_delta", "delta": "Switching"})
+        fake.push_agent_end()
+        assert await logged_until(("turn_end", 3, "end")) == [
+            ("user_turn", 2, None),
+            ("text_delta", 2, None),
+            ("user_turn", 3, None),
+            ("turn_end", 2, "steered"),
+            ("text_delta", 3, None),
+            ("turn_end", 3, "end"),
+        ]
     finally:
         await session.close()
         app.agent_event_log.close()
@@ -1621,5 +1758,145 @@ async def test_a_tool_named_like_one_of_omp_s_own_is_registered_under_the_produc
         await session.submit_turn(_text("check in"))
         fake.push_tool_execution_start("call-1", "toy__checkpoint", {})
         assert (await _next_of(recorder, ToolUse)).name == "checkpoint"
+    finally:
+        await session.close()
+
+
+# ---------------------------------------------------------------------------
+# The backend's own logs (backend_logs)
+# ---------------------------------------------------------------------------
+
+
+def _omp_home(tmp_path, monkeypatch):
+    """A $HOME with an omp config directory in it, as a service passes one
+    (``omp_config_dir``), and that directory's logs directory."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    for name in ("PI_CONFIG_DIR", "PI_CODING_AGENT_DIR", "XDG_STATE_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    config = home / "svc" / "omp-config"
+    (config / "logs").mkdir(parents=True)
+    return config, config / "logs"
+
+
+@pytest.mark.asyncio
+async def test_backend_logs_after_omp_exits_before_ready_are_its_stderr_and_its_log(
+    tmp_path, monkeypatch
+):
+    """The instance that could not start: omp said "No models available" on
+    stderr, which omp_rpc keeps, and wrote its warnings to a log named after a
+    pid this session never learned. That log is guessed only once the start
+    has failed, as the one an omp no longer running last wrote between the
+    start and the failure: not a live omp's sharing the directory (the human's
+    own, say), not an older one, and not a dead one written after the failure
+    (a seed script's, another instance's)."""
+    import subprocess
+    import sys
+    import time
+
+    def dead_pid():
+        gone = subprocess.Popen([sys.executable, "-c", ""])
+        gone.wait()
+        return gone.pid
+
+    config, logs = _omp_home(tmp_path, monkeypatch)
+    failed_pid, other_pid = dead_pid(), dead_pid()
+    older = logs / ("omp.2026-09-26.%d.log" % failed_pid)
+    older.write_text("{}\n", encoding="utf-8")
+    os.utime(older, (time.time() - 3600,) * 2)
+    failed = logs / ("omp.2026-09-27.%d.log" % failed_pid)
+    live = logs / ("omp.2026-09-27.%d.log" % os.getpid())
+    later = logs / ("omp.2026-09-27.%d.log" % other_pid)
+    during_start = []
+
+    class ExitsBeforeReady(FakeRpcClient):
+        stderr = "No models available. Use /login to configure a provider.\n"
+
+        def start(self):
+            failed.write_text('{"level":"warn","message":"model discovery failed"}\n')
+            live.write_text('{"level":"debug","message":"another omp"}\n')
+            os.utime(live, (time.time() + 1,) * 2)
+            # Still starting: no guess yet, whatever the directory holds.
+            during_start.append([e.name for e in session.backend_logs()])
+            raise RpcProcessExitError("RPC process exited with code 1. Stderr: " + self.stderr)
+
+    session = OmpSession(
+        EventRecorder(),
+        cwd=tmp_path,
+        session_id="s",
+        tool_table=_tool_table(),
+        client_factory=ExitsBeforeReady,
+        config_dir=str(config),
+        session_dir=tmp_path / ".toy" / "omp",
+    )
+    await session.start()
+    later.write_text('{"level":"warn","message":"a seed script\'s omp"}\n')
+    os.utime(later, (time.time() + 60,) * 2)
+    try:
+        assert during_start == [["omp stderr"]]
+        assert session.agent_status() == AGENT_UNAVAILABLE
+        entries = session.backend_logs()
+        assert [(e.name, e.path) for e in entries] == [
+            ("omp log", os.path.realpath(failed)),
+            ("omp stderr", None),
+        ]
+        assert "No models available" in entries[1].text
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_backend_logs_of_a_running_omp_are_its_own_log_and_conversation(
+    tmp_path, monkeypatch
+):
+    """Running, omp's log is the one named after its own pid, whatever else
+    writes beside it, and its conversation file is listed only while it is a
+    file inside the session directory: a symlink planted there, or a name
+    outside it, is not followed."""
+    import time
+
+    config, logs = _omp_home(tmp_path, monkeypatch)
+    session_dir = tmp_path / ".toy" / "omp"
+    conversation = session_dir / "2026-09-27_omp-sess-1.jsonl"
+    mine = logs / "omp.2026-09-27.4242.log"
+    newer = logs / "omp.2026-09-27.4243.log"
+
+    class Running(FakeRpcClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._process = SimpleNamespace(pid=4242)
+            self.session_file = str(conversation)
+
+        def start(self):
+            conversation.write_text("{}\n", encoding="utf-8")
+            mine.write_text("{}\n", encoding="utf-8")
+            newer.write_text("{}\n", encoding="utf-8")
+            os.utime(newer, (time.time() + 5,) * 2)
+            return super().start()
+
+    session = OmpSession(
+        EventRecorder(),
+        cwd=tmp_path,
+        session_id="s",
+        tool_table=_tool_table(),
+        client_factory=Running,
+        config_dir=str(config),
+        session_dir=session_dir,
+    )
+    await session.start()
+    try:
+        assert session.agent_status() == AGENT_READY
+        assert [(e.name, e.path) for e in session.backend_logs()] == [
+            ("omp log", os.path.realpath(mine)),
+            ("omp conversation", os.path.realpath(conversation)),
+        ]
+
+        secret = tmp_path / "secret.txt"
+        secret.write_text("SECRET", encoding="utf-8")
+        planted = session_dir / "planted.jsonl"
+        planted.symlink_to(secret)
+        for reported in (planted, secret):
+            session.session_file = str(reported)
+            assert [e.name for e in session.backend_logs()] == ["omp log"]
     finally:
         await session.close()

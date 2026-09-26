@@ -20,12 +20,14 @@
  *   Mesh's `models_changed`) and `review_changed`, which review.js's
  *   `onEvent` handles for a product that uses it. A kind listed there goes to
  *   its handler and nowhere else; the server already refuses a product kind
- *   that collides with a generic one.
+ *   that collides with a generic one. Only a live event is handed on: the
+ *   replay a connection opens with (the session's whole history, for a new
+ *   page) is what already happened, which `onLive` covers.
  * - `onLive` runs on every successful handshake, the first and every
  *   reconnect, after the connection is marked live: the product stops its
  *   fallback poll there and refetches whatever an event it missed while the
- *   socket was down would have told it, since replay only covers events
- *   still in the server's ring.
+ *   socket was down would have told it, since a replayed product event is not
+ *   handed to its handler (above).
  * - `onFallback` runs when the socket stops being the live channel for a
  *   while (a downtime longer than one backoff interval, a protocol mismatch,
  *   a confirmed refusal): the product starts whatever poll keeps its view
@@ -38,7 +40,8 @@
  * `onHello` receives the hello frame's `session` object once per connection
  * (including every reconnect, since agent status can change between them),
  * and `onAgentEvent` receives every event neither this module nor a product
- * handler takes. Neither is called from here except at those two points;
+ * handler takes, replayed ones included, with `{replayed}` saying which.
+ * Neither is called from here except at those two points;
  * chat.js, not this module, decides what an event means. The returned `send`
  * is this module's only outbound capability, so a turn, permission, pause or
  * interrupt frame still goes out over the one socket this closure owns, with
@@ -47,15 +50,18 @@
  * `dispatchCall` is the product's method table, and it is what makes a `call`
  * frame do something: this module owns the correlation (answer the id, exactly
  * once, whatever happened) and knows nothing about what any method means.
- * `onPaused` receives the pause flag from both places it can arrive, the hello
- * frame and a `pause_changed` event, so its caller has one path to reconcile
- * rather than two.
+ * `onPaused` receives the pause flag from the hello frame and from each live
+ * `pause_changed` event, so its caller has one path to reconcile rather than
+ * two; a replayed one is not passed on, since the hello already said what the
+ * flag is now.
  */
 
 import { store } from "./store.js";
 import { showError, toast } from "./ui.js";
 
-const PROTOCOL_VERSION = 1;
+// protocol.py's PROTOCOL_VERSION. Stamped on every frame `send` writes, so
+// no caller carries a version of its own that could fall behind this one.
+const PROTOCOL_VERSION = 2;
 
 const BASE_BACKOFF_MS = 500; // also the "one backoff interval" the fallback poll waits out
 const MAX_BACKOFF_MS = 15000;
@@ -207,6 +213,10 @@ export function initWs({
   let ws = null;
   let opened = false; // true once this attempt's WebSocket has reached readyState OPEN
   let lastSeq = 0;
+  // The session lastSeq is a position in: the hello's `session.id` when the
+  // events counted in it arrived. A seq means nothing in another session's
+  // log, so the server answers a hello whose session differs from the start.
+  let seqSession = null;
   let liveAfter = 0;
   let attempt = 0;
   let stopped = false; // permanently done trying: protocol mismatch or a confirmed 403
@@ -245,7 +255,7 @@ export function initWs({
   // immediately instead of waiting on an answer that will never arrive.
   function send(frame) {
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(frame));
+      ws.send(JSON.stringify({ ...frame, v: PROTOCOL_VERSION }));
       return true;
     }
     return false;
@@ -305,13 +315,15 @@ export function initWs({
 
   function handleOpen() {
     opened = true;
-    send({
+    const hello = {
       v: PROTOCOL_VERSION,
       type: "hello",
       token: TOKEN,
       last_seq: lastSeq,
       viewer: { tab_id: TAB_ID, w: window.innerWidth, h: window.innerHeight },
-    });
+    };
+    if (seqSession !== null) hello.session_id = seqSession;
+    send(hello);
   }
 
   function handleMessage(event) {
@@ -343,13 +355,14 @@ export function initWs({
       // Always sent in answer to something this page sent, and always
       // carrying a reason. Dropping it would leave the human watching for an
       // effect that is never coming, with the server's explanation of why
-      // discarded one layer below the UI. There is no correlation id on
-      // this frame (build_refused carries only a reason), so onRefused
-      // cannot know which outstanding request it answers; chat.js uses it
-      // to reset optimistic UI that has no other way to learn a change
-      // was rejected.
+      // discarded one layer below the UI. A refused turn names itself with
+      // the turn frame's own `client_id`, which chat.js uses to stop holding
+      // that message; any other refusal carries no correlation id, so
+      // onRefused cannot know which outstanding request it answers, and
+      // chat.js uses it only to reset optimistic UI that has no other way to
+      // learn a change was rejected.
       toast(frame.reason || "the server refused that request", false);
-      onRefused(frame.reason || "");
+      onRefused(frame.reason || "", frame.client_id || null);
     }
     // "ping": nothing to do beyond the liveness reset above, which every
     // inbound frame already did. An unrecognised type from a same-version
@@ -401,7 +414,16 @@ export function initWs({
       handleProtocolMismatch();
       return;
     }
-    lastSeq = frame.seq;
+    // lastSeq is not moved forward here: it advances only as events arrive,
+    // so a connection that drops partway through the replay below resumes
+    // from the last event it actually received rather than skipping the
+    // rest. It goes back to the start when the server answers from the
+    // start: a different session than the one it counted (the server ignored
+    // the position), or a log that has not reached it (a different run of
+    // the log), so the replay that follows is not taken for duplicates.
+    const session = frame.session && frame.session.id ? frame.session.id : null;
+    if (session !== seqSession || frame.seq < lastSeq) lastSeq = 0;
+    seqSession = session;
     // Everything up to here is replay of what already happened; only a later
     // seq is live (chat.js raises no notification for a replayed attention).
     liveAfter = frame.seq;
@@ -411,10 +433,10 @@ export function initWs({
     fallbackTimer = null;
     store.setConnection("live");
     // The product's resync, on every (re)connect: it stops its fallback poll
-    // and refetches what it shows, because replay only covers events still in
-    // the server's 500-event ring, so a change announced during a longer gap
-    // would otherwise leave the page stale with no further event to prompt a
-    // refetch.
+    // and refetches what it shows, because a replayed product event is not
+    // handed to its handler (handleEvent), so a change announced while this
+    // page was away would otherwise leave it stale with no further event to
+    // prompt a refetch.
     onLive();
     // The pause flag comes with the greeting for the same reason: this tab may
     // have connected long after it was set, and `pause_changed` only reaches a
@@ -424,15 +446,26 @@ export function initWs({
   }
 
   function handleEvent(frame) {
+    // Each event once, in order: the server can send an event twice around
+    // the moment a connection is registered (its replay, then a broadcast
+    // scheduled before the replay finished), and never sends seqs out of
+    // order otherwise.
+    if (frame.seq <= lastSeq) return;
     lastSeq = frame.seq;
     const event = frame.event;
     const kind = event && event.kind;
+    // History rather than news: the hello already carried the current pause
+    // flag, and onLive already refetched what a product event would, so
+    // replaying either would only put back a state that has since changed
+    // (a pause set before a restart, which the new process does not hold),
+    // or refetch once per event in the history.
+    const replayed = frame.seq <= liveAfter;
     if (kind === "pause_changed") {
-      onPaused(!!event.paused);
+      if (!replayed) onPaused(!!event.paused);
     } else if (productHandlers.has(kind)) {
-      productHandlers.get(kind)(event);
+      if (!replayed) productHandlers.get(kind)(event);
     } else {
-      onAgentEvent(event, { replayed: frame.seq <= liveAfter });
+      onAgentEvent(event, { replayed });
     }
   }
 

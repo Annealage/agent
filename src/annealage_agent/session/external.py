@@ -92,3 +92,8 @@ class ExternalAgentSession:
         """No shell of this process's to contain: the external agent's own
         posture is its own client's to report."""
         return SandboxStatus(requested=False, active=False, missing=())
+
+    def backend_logs(self) -> list:
+        """None: the external agent's logs are its own client's, in another
+        process this one knows nothing about."""
+        return []

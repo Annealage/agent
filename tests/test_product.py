@@ -102,11 +102,11 @@ def test_registrations_follow_the_installed_product(swap_product):
 
     names = [key.name for key in settings.SETTING_KEYS]
     assert "sheet_zoom" in names and "units" not in names
-    assert protocol.validate_inbound({"v": 1, "type": "sheet", "sheet": {}}) == (
-        True,
-        {"v": 1, "type": "sheet", "sheet": {}},
+    sheet = {"v": protocol.PROTOCOL_VERSION, "type": "sheet", "sheet": {}}
+    assert protocol.validate_inbound(sheet) == (True, sheet)
+    ok, reason = protocol.validate_inbound(
+        {"v": protocol.PROTOCOL_VERSION, "type": "view", "view": {}}
     )
-    ok, reason = protocol.validate_inbound({"v": 1, "type": "view", "view": {}})
     assert not ok and "unknown frame type" in reason
     assert protocol.is_product_frame("sheet") and not protocol.is_product_frame("view")
 

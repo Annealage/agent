@@ -187,14 +187,50 @@ async def test_agent_mode_writes_the_conversation_to_the_sessions_event_log(tmp_
 # ---------------------------------------------------------------------------
 
 
-async def test_a_fresh_connection_after_a_live_model_switch_sees_the_new_model(served_dir):
-    """``session_info["model"]`` is built once from ``settings`` at session
-    construction; without ``_event_publisher`` writing a live
-    ``AgentModelChanged`` back into that same dict, a browser tab connecting
-    after the switch only recovers the running model while the event
-    announcing it is still inside the replay ring buffer -- once evicted, a
-    fresh ``hello`` would permanently show the CLI-configured starting model
-    instead of what the session is actually running.
+class _RawSock:
+    def __init__(self, initial_bytes):
+        self.buffer = initial_bytes
+        self.written = []
+
+    async def read(self, n):
+        data = self.buffer[:n]
+        self.buffer = self.buffer[n:]
+        return data
+
+    async def readexactly(self, n):
+        return await self.read(n)
+
+    async def readline(self):
+        line = b""
+        while True:
+            byte = await self.read(1)
+            if not byte:
+                return line
+            line += byte
+            if line[-1:] == b"\n":
+                return line
+
+    async def awrite(self, data):
+        self.written.append(bytes(data))
+
+
+def _decode_text_frame(frame_bytes):
+    import struct
+
+    opcode = frame_bytes[0] & 0x0F
+    length = frame_bytes[1] & 0x7F
+    offset = 2
+    if length == 126:
+        length = struct.unpack("!H", frame_bytes[2:4])[0]
+        offset = 4
+    elif length == 127:
+        length = struct.unpack("!Q", frame_bytes[2:10])[0]
+        offset = 10
+    return opcode, frame_bytes[offset : offset + length]
+
+
+async def _hello_of(app):
+    """The ``hello`` frame a tab connecting now would get from ``app``.
 
     ``TestClient.websocket()``'s fake socket drops anything the server sends
     before its own first ``read()``, which is exactly when ``hello`` is sent
@@ -203,75 +239,12 @@ async def test_a_fresh_connection_after_a_live_model_switch_sees_the_new_model(s
     with a raw duplex buffer and decodes the literal ``hello`` frame bytes.
     """
     import json
-    import struct
 
     from microdot import Response
     from microdot.microdot import Request
     from microdot.websocket import WebSocket
 
     from annealage_agent import protocol
-    from annealage_agent.session.base import AgentModelChanged
-    from annealage_agent.session.fake import FakeSession
-
-    class _RawSock:
-        def __init__(self, initial_bytes):
-            self.buffer = initial_bytes
-            self.written = []
-
-        async def read(self, n):
-            data = self.buffer[:n]
-            self.buffer = self.buffer[n:]
-            return data
-
-        async def readexactly(self, n):
-            return await self.read(n)
-
-        async def readline(self):
-            line = b""
-            while True:
-                byte = await self.read(1)
-                if not byte:
-                    return line
-                line += byte
-                if line[-1:] == b"\n":
-                    return line
-
-        async def awrite(self, data):
-            self.written.append(bytes(data))
-
-    def _decode_text_frame(frame_bytes):
-        opcode = frame_bytes[0] & 0x0F
-        length = frame_bytes[1] & 0x7F
-        offset = 2
-        if length == 126:
-            length = struct.unpack("!H", frame_bytes[2:4])[0]
-            offset = 4
-        elif length == 127:
-            length = struct.unpack("!Q", frame_bytes[2:10])[0]
-            offset = 10
-        return opcode, frame_bytes[offset : offset + length]
-
-    built = []
-    from annealage_agent import sessions
-
-    sid = sessions.create_session(served_dir)
-
-    def build_session(on_event, *, bus):
-        session = FakeSession(on_event, session_id=sid)
-        built.append(session)
-        return session
-
-    app = create_toy_app(
-        served_dir,
-        token="tok",
-        session_id=sid,
-        build_session=build_session,
-        settings={"model": "claude-opus-4"},
-    )
-    # The live switch this fix keeps session_info current for -- a real
-    # driver emits this once its own control-plane set_model call takes
-    # effect (session/omp.py, session/sdk.py, session/codex.py all do).
-    built[0].emit(AgentModelChanged(model="claude-haiku-5"))
 
     client = make_test_client(app)
     headers = {
@@ -290,7 +263,6 @@ async def test_a_fresh_connection_after_a_live_model_switch_sees_the_new_model(s
     req = await Request.create(client.app, sock, sock, ("127.0.0.1", 1234), scheme=None)
     res = await client.app.dispatch_request(req)
     assert res is Response.already_handled
-
     # The upgrade handshake's own HTTP response lines go through the same
     # `awrite` call `_RawSock` records, ahead of the first real WebSocket
     # frame; `\x81` (FIN + TEXT opcode) is what distinguishes it from those.
@@ -298,11 +270,152 @@ async def test_a_fresh_connection_after_a_live_model_switch_sees_the_new_model(s
     assert ws_frames, "the server never sent a hello frame"
     opcode, payload = _decode_text_frame(ws_frames[0])
     assert opcode == WebSocket.TEXT
-    hello = json.loads(payload)
+    return json.loads(payload)
+
+
+def _app_with_fake_session(served_dir, **kwargs):
+    from annealage_agent import sessions
+    from annealage_agent.session.fake import FakeSession
+
+    built = []
+    sid = sessions.create_session(served_dir)
+
+    def build_session(on_event, *, bus):
+        built.append(FakeSession(on_event, session_id=sid))
+        return built[-1]
+
+    app = create_toy_app(
+        served_dir, token="tok", session_id=sid, build_session=build_session, **kwargs
+    )
+    return app, built[0]
+
+
+async def test_a_fresh_connection_after_a_live_model_switch_sees_the_new_model(served_dir):
+    """``session_info["model"]`` is built once from ``settings`` at session
+    construction; without ``_event_publisher`` writing a live
+    ``AgentModelChanged`` back into that same dict, a browser tab connecting
+    after the switch only recovers the running model while the event
+    announcing it is still inside the replay ring buffer -- once evicted, a
+    fresh ``hello`` would permanently show the CLI-configured starting model
+    instead of what the session is actually running."""
+    from annealage_agent.session.base import AgentModelChanged
+
+    app, session = _app_with_fake_session(served_dir, settings={"model": "claude-opus-4"})
+    # The live switch this fix keeps session_info current for -- a real
+    # driver emits this once its own control-plane set_model call takes
+    # effect (session/omp.py, session/sdk.py, session/codex.py all do).
+    session.emit(AgentModelChanged(model="claude-haiku-5"))
+    # And the agent's status as it is now, not as it was when the app was
+    # built: the page takes it from here, not from replayed agent_status
+    # events, which may be an earlier process's.
+    session.set_status("unavailable")
+
+    hello = await _hello_of(app)
     # The property under test: a connection opened *after* the switch reads
     # the live model, not the settings-time snapshot ("claude-opus-4") --
     # even though this event has never left the still-full replay ring.
     assert hello["session"]["model"] == "claude-haiku-5"
+    assert hello["session"]["agent"] == "unavailable"
+
+
+async def test_a_page_opened_while_the_agent_is_down_is_told_why(served_dir):
+    """The page raises no banner from a replayed ``agent_error``, so a tab
+    opened after the agent failed to start (omp not logged in) would show an
+    unavailable pane with no reason. The hello carries the latest error while
+    the agent is not ready, and nothing once it is."""
+    from annealage_agent.session.base import AgentError, AgentStatus
+
+    app, session = _app_with_fake_session(served_dir)
+    session.emit(AgentError(stderr="401 no credentials", remediation="log omp in"))
+    session.set_status("unavailable")
+    session.emit(AgentStatus(status="unavailable"))
+    down = await _hello_of(app)
+    assert down["session"]["agent_error"] == {
+        "remediation": "log omp in",
+        "stderr": "401 no credentials",
+    }
+
+    session.set_status("ready")
+    session.emit(AgentStatus(status="ready"))
+    up = await _hello_of(app)
+    assert up["session"]["agent_error"] is None
+
+
+async def test_a_human_turn_the_last_process_never_answered_is_closed_on_resume(served_dir):
+    """The process died after logging the human's message and before the
+    agent said anything. The resumed app closes that turn, so the page does
+    not show it as running, and continues the numbering after it."""
+    from annealage_agent import sessions
+    from annealage_agent.session.base import TextDelta, TurnEnd, UserTurn
+    from annealage_agent.session.events import EventLog, read_records
+    from annealage_agent.session.fake import FakeSession
+
+    sid = sessions.create_session(served_dir)
+    log = EventLog(str(sessions.events_path(served_dir, sid)))
+    log.append(UserTurn(turn=1, blocks=[{"type": "text", "text": "first"}]))
+    log.append(TextDelta(turn=1, text="answered"))
+    log.append(TurnEnd(turn=1, stop_reason="end", cost_usd=0.0))
+    log.append(UserTurn(turn=2, blocks=[{"type": "text", "text": "never answered"}]))
+    log.close()
+
+    app = create_toy_app(
+        served_dir,
+        token="tok",
+        session_id=sid,
+        build_session=lambda on_event, *, bus: FakeSession(on_event, session_id=sid),
+    )
+    try:
+        ends = [
+            (r["event"]["turn"], r["event"]["stop_reason"])
+            for r in read_records(sessions.events_path(served_dir, sid))
+            if r["event"]["kind"] == "turn_end"
+        ]
+        assert ends == [(1, "end"), (2, "interrupted")]
+        assert app.agent_bus.turn == 2
+    finally:
+        app.agent_event_log.close()
+
+
+async def test_a_permission_request_the_last_process_never_resolved_is_closed_on_resume(
+    served_dir,
+):
+    """Killed while a card waited: nobody can answer it now, so the resumed
+    app resolves it, and the page replaying the history shows no live card.
+    An answered request is left alone."""
+    from annealage_agent import sessions
+    from annealage_agent.session.base import PermissionRequest, PermissionResolved
+    from annealage_agent.session.events import EventLog
+    from annealage_agent.session.fake import FakeSession
+
+    sid = sessions.create_session(served_dir)
+    log = EventLog(str(sessions.events_path(served_dir, sid)))
+    log.append(PermissionRequest(request_id="pr_1", tool="add_note", input={}))
+    log.append(PermissionResolved(request_id="pr_1", outcome="allow"))
+    log.append(PermissionRequest(request_id="pr_2", tool="add_note", input={}))
+    log.close()
+
+    app = create_toy_app(
+        served_dir,
+        token="tok",
+        session_id=sid,
+        build_session=lambda on_event, *, bus: FakeSession(on_event, session_id=sid),
+    )
+    try:
+        open_cards = set()
+        for _seq, wire in app.agent_event_log.replay(0).events:
+            if wire["kind"] == "permission_request":
+                open_cards.add(wire["request_id"])
+            elif wire["kind"] == "permission_resolved":
+                open_cards.discard(wire["request_id"])
+        assert open_cards == set()
+        resolved = [
+            (w["request_id"], w["outcome"])
+            for _s, w in app.agent_event_log.replay(0).events
+            if w["kind"] == "permission_resolved"
+        ]
+        assert resolved == [("pr_1", "allow"), ("pr_2", "shutdown")]
+    finally:
+        app.agent_event_log.close()
 
 
 async def test_viewer_only_mode_writes_no_event_log(tmp_path):

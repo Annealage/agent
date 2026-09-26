@@ -311,7 +311,14 @@ class ViewerRegistry:
     async def _broadcast_primary(self) -> None:
         primary_tab_id = self._primary.tab_id if self._primary is not None else None
         event = ViewerPrimary(primary=primary_tab_id)
-        await self.broadcast(build_event(self._next_seq(event), event.to_wire()))
+        frame = build_event(self._next_seq(event), event.to_wire())
+        # Scheduled, then awaited, rather than awaited directly: a session's
+        # events are appended and their broadcasts scheduled (the app's
+        # publisher), so one appended before this event may still be waiting
+        # to be enqueued. Scheduling behind it keeps every connection's frames
+        # in seq order, which the page relies on (static/ws.js drops an event
+        # at or below the last seq it has).
+        await asyncio.ensure_future(self.broadcast(frame))
 
     def _next_seq(self, event) -> int:
         """Assign a seq to a self-originated event.

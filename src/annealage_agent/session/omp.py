@@ -197,6 +197,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -205,7 +206,7 @@ from omp_rpc import RpcClient, host_tool
 
 from .. import product
 from ..tools import host_tool_name
-from . import turn_images
+from . import logfiles, turn_images
 from .base import (
     AGENT_CONNECTING,
     AGENT_READY,
@@ -220,6 +221,7 @@ from .base import (
     ToolUse,
     TurnEnd,
     UnknownRequest,
+    turn_not_sent,
 )
 
 
@@ -334,6 +336,16 @@ class OmpSession:
         self._resume = resume or None
         self._on_session_file = on_session_file
         self.session_file: Optional[str] = None
+        # For backend_logs: the client whose stderr omp_rpc keeps (bounded, and
+        # still readable once that client has stopped, which is when it
+        # matters), the omp process's pid once it is known, when start() began
+        # and when it failed, and the logs directory the environment omp was
+        # given points at.
+        self._stderr_client = None
+        self._omp_pid: Optional[int] = None
+        self._started_at: Optional[float] = None
+        self._start_failed_at: Optional[float] = None
+        self._omp_logs_dir: Optional[str] = None
 
         self._status = AGENT_CONNECTING
         self._client = None
@@ -398,6 +410,24 @@ class OmpSession:
         """
         return SandboxStatus(requested=False, active=False, missing=())
 
+    def backend_logs(self) -> list:
+        """omp's own process log, its conversation file and the stderr
+        omp_rpc kept (``logfiles.omp_logs``). Without omp's pid (it exited
+        before it was ready), the log is guessed only once the start has failed
+        and the session is unavailable: the newest log a no longer running omp
+        wrote between the start and its failure. Until then, no process log."""
+        stderr = getattr(self._stderr_client, "stderr", None)
+        failed_at = self._start_failed_at if self._status == AGENT_UNAVAILABLE else None
+        return logfiles.omp_logs(
+            logs_dir=self._omp_logs_dir,
+            pid=self._omp_pid,
+            since=self._started_at,
+            until=failed_at,
+            session_file=self.session_file,
+            session_dir=self._session_dir,
+            stderr=stderr if isinstance(stderr, str) else None,
+        )
+
     def on_viewer_presence(self, count: int) -> None:
         """Keep the broker's view of viewer count in step with the
         registry's. Identical in intent to ``SdkSession.on_viewer_presence``
@@ -429,14 +459,9 @@ class OmpSession:
         same "the pump runs whether or not a browser is attached" invariant
         ``SdkSession``'s single persistent pump keeps.
         """
-        if self._client is None or self._status == AGENT_UNAVAILABLE:
+        if self._client is None or self._status != AGENT_READY:
             self._emit(
-                AgentError(
-                    stderr="",
-                    remediation="the agent is not running, so this turn was not sent; "
-                    "check the startup output for why and use Retry",
-                    viewer=viewer,
-                )
+                AgentError(stderr="", remediation=turn_not_sent(self._status), viewer=viewer)
             )
             return
         steering = self._running
@@ -605,6 +630,7 @@ class OmpSession:
         if refusal is not None:
             self._fail(ValueError(refusal))
             return
+        self._started_at = time.time()
         try:
             if self._base_url:
                 # An arbitrary/self-hosted OpenAI-compatible endpoint `omp`
@@ -633,6 +659,10 @@ class OmpSession:
                 model_arg = self._model
             if self._config_rel is not None:
                 env["PI_CONFIG_DIR"] = self._config_rel
+            # omp's logs directory is decided by what it is launched with.
+            self._omp_logs_dir = logfiles.omp_logs_dir(
+                self._config_rel, env.get("PI_CODING_AGENT_DIR")
+            )
             client_kwargs = {}
             instructions = "\n\n".join(
                 p for p in (self._instructions, _renamed_tools_note(self._tool_table)) if p
@@ -661,9 +691,14 @@ class OmpSession:
                 custom_tools=self._build_host_tools(),
                 extra_args=("--auto-approve", "--no-extensions"),
             )
+            self._stderr_client = self._client
             self._register_listeners()
             await self._run_blocking(self._client.start)
+            self._omp_pid = _process_id(self._client)
         except Exception as exc:
+            # Before the stop below: omp itself has already gone, and its log
+            # was last written before this (backend_logs's window).
+            self._start_failed_at = time.time()
             # start() may already have spawned the subprocess and its
             # reader/stderr threads by the time a later step raises;
             # dropping the only reference without stopping it first would
@@ -1133,6 +1168,15 @@ def _process_gone(exc: BaseException) -> bool:
     return type(exc).__name__ == "RpcProcessExitError" or isinstance(exc, BrokenPipeError)
 
 
+def _process_id(client) -> Optional[int]:
+    """The pid of the `omp` process ``client`` spawned, which names its log
+    file. ``omp_rpc`` keeps it only on its private ``_process`` (a ``Popen``),
+    so it is read defensively: a client without one (a test's fake, a later
+    ``omp_rpc``) leaves the log to be found by time instead."""
+    pid = getattr(getattr(client, "_process", None), "pid", None)
+    return pid if isinstance(pid, int) else None
+
+
 # ---------------------------------------------------------------------------
 # Custom-provider config generation (Q4, roadmap.md - DECIDED 2026-09-19).
 # ---------------------------------------------------------------------------
@@ -1318,5 +1362,5 @@ def _remediation_for(exc: BaseException) -> str:
             "reachable and that the omp CLI is not stuck waiting on input"
         )
     if name == "RpcProcessExitError":
-        return "the omp process exited before it was ready; check its stderr above"
-    return "the agent is unavailable; the captured output above is what it reported"
+        return "the omp process exited before it was ready; its stderr says why"
+    return "the agent is unavailable; its captured output says why"
