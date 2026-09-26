@@ -1,11 +1,24 @@
-# Mirrors this project's own CI lint job (.github/workflows/test.yml's
-# `lint` job runs the identical two hooks via `uvx pre-commit run
-# --all-files`), so a change that passes locally cannot fail in CI for a
-# tooling-version reason, and vice versa. `rev` is pinned to the exact ruff
-# release this project develops against (ruff-pre-commit publishes one tag
-# per ruff release, in lockstep), not a floating major, so a contributor's
-# local hook run and CI always resolve to the same ruff.
+# The ruff hooks mirror this project's own CI lint job
+# (.github/workflows/test.yml's `lint` job runs the identical two hooks via
+# `uvx pre-commit run --all-files`), so a change that passes locally cannot
+# fail in CI for a tooling-version reason, and vice versa. `rev` is pinned to
+# the exact ruff release this project develops against (ruff-pre-commit
+# publishes one tag per ruff release, in lockstep), not a floating major, so a
+# contributor's local hook run and CI always resolve to the same ruff.
+#
+# The verifygitlog hook checks each commit message for a Developer
+# Certificate of Origin sign-off before the commit lands; CI's verifygitlog
+# workflow runs the same script over every pull request and push to main.
+default_install_hook_types: [pre-commit, commit-msg]
+default_stages: [pre-commit]
 repos:
+  - repo: local
+    hooks:
+      - id: verifygitlog
+        name: verify the commit is signed off
+        entry: tools/verifygitlog.py --check-file
+        language: script
+        stages: [commit-msg]
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.8
     hooks:

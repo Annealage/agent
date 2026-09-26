@@ -1,0 +1,34 @@
+name: verifygitlog
+
+# Every commit carries a Developer Certificate of Origin sign-off
+# (CONTRIBUTING.md), the provenance record the dual licence relies on.
+# tools/verifygitlog.py is the same check the commit-msg hook runs locally.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The base of the range (origin/main, or the commit the push
+          # replaced) has to be in the clone.
+          fetch-depth: 0
+      - name: every commit is signed off
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
+        run: |
+          # A push that creates the branch has no previous commit, so the
+          # whole history is the pushed range.
+          if [ "$BASE" = 0000000000000000000000000000000000000000 ]; then
+            python3 tools/verifygitlog.py HEAD
+          else
+            python3 tools/verifygitlog.py "$BASE..HEAD"
+          fi

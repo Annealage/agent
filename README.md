@@ -366,8 +366,10 @@ The agent holds a shell in a directory whose contents may have come from anywher
     uv pip install "omp-rpc @ git+https://github.com/can1357/oh-my-pi.git@71c5eec978b0e7ce9ff057eb4e311f67f4f03eb9#subdirectory=python/omp-rpc"
     uv run --extra dev --extra codex pytest -q
 
-[CONTRIBUTING.md](CONTRIBUTING.md) covers why omp-rpc is installed separately (and what to do on Python 3.10, where it isn't available), the live `integration` tier and the pre-commit hook. The suite runs as a small made-up product (`tests/toy_product.py`). The front end has no browser suite of its own, because only a product has a page: Annealage Mesh's end-to-end suite drives these modules in Chromium, so run it too after changing them. [RELEASING.md](RELEASING.md) covers publishing.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers why omp-rpc is installed separately (and what to do on Python 3.10, where it isn't available), the live `integration` tier and the pre-commit hooks. The suite runs as a small made-up product (`tests/toy_product.py`). The front end has no browser suite of its own, because only a product has a page: Annealage Mesh's end-to-end suite drives these modules in Chromium, so run it too after changing them. [RELEASING.md](RELEASING.md) covers publishing.
 
 ## Licence
 
-[PolyForm Noncommercial 1.0.0](LICENSE), free to use for any noncommercial purpose. Commercial use needs a separate licence, covered in [COMMERCIAL.md](COMMERCIAL.md). Contributions are welcome under the terms in [CONTRIBUTING.md](CONTRIBUTING.md).
+[PolyForm Noncommercial 1.0.0](LICENSE), free to use for any noncommercial purpose. Commercial use needs a separate licence, covered in [COMMERCIAL.md](COMMERCIAL.md). A commercial licence for Annealage Mesh or Annealage Loom includes this package for use with that product, and it can also be licensed on its own. A commercial licence covers this package's own code only: the Claude Agent SDK (MIT, with its use governed by Anthropic's Commercial Terms of Service), the Claude Code CLI it bundles (© Anthropic PBC, all rights reserved), and the Codex and omp backends come under their owners' terms.
+
+Contributions are welcome under the terms in [CONTRIBUTING.md](CONTRIBUTING.md). Every commit needs a Developer Certificate of Origin sign-off (`git commit -s`), which CI checks.

@@ -13,6 +13,12 @@ Optional body explaining what the change makes true and why, wrapped at
 Signed-off-by: Your Name <you@example.com>
 ```
 
+The `Signed-off-by:` trailer is mandatory: it is the Developer Certificate of Origin sign-off described under Contribution licensing below, which the dual-licence model depends on. `tools/verifygitlog.py` checks for it, as a commit-msg hook once pre-commit is installed (see Pull requests) and in CI on every pull request and push to `main` (`.github/workflows/verifygitlog.yml`). A pull request with an unsigned commit fails that check; add the sign-off with `git commit --amend -s` (or `git rebase --signoff main` for several commits). To check a range yourself before pushing:
+
+```
+python3 tools/verifygitlog.py origin/main..HEAD
+```
+
 ## Running the tests
 
 ```
@@ -32,7 +38,7 @@ The suite runs as a small made-up product (`tests/toy_product.py`) whose every n
 - Include a test or a reproducer in the same PR where it is reasonable to do so.
 - Run the suite (above) before pushing.
 - Run the suite of every product that depends on this package as well (Annealage Mesh's includes the browser suite that exercises this package's front end); a change here is a change to each of them.
-- Install the pre-commit hook once per checkout (`uv run --extra dev pre-commit install`), so `ruff check --fix` and `ruff format` run automatically on `git commit`. CI's `lint` job runs the identical hooks (`.pre-commit-config.yaml`) and fails a PR where they were skipped.
+- Install the pre-commit hooks once per checkout (`uv run --extra dev pre-commit install`), so `ruff check --fix` and `ruff format` run automatically on `git commit` and the commit message is checked for its sign-off. CI's `lint` job runs the identical ruff hooks (`.pre-commit-config.yaml`) and fails a PR where they were skipped.
 
 ## Contribution licensing
 
@@ -48,7 +54,7 @@ You certify the contribution under the Developer Certificate of Origin 1.1 (<htt
 Signed-off-by: Your Name <your.email@example.com>
 ```
 
-(`git commit -s` adds this line.) The sign-off certifies that you wrote the contribution or otherwise have the right to submit it under the terms below.
+(`git commit -s` adds this line.) The sign-off certifies that you wrote the contribution or otherwise have the right to submit it under the terms below. Every commit must carry it; CI rejects a pull request that has a commit without one.
 
 ### Licence grant
 

@@ -2,7 +2,9 @@
 
 Annealage Agent is published under the **PolyForm Noncommercial License 1.0.0** (see [LICENSE](LICENSE)) for noncommercial use only. This document explains when a commercial licence is required and how to obtain one.
 
-Annealage Agent is the embedded-agent layer the Annealage products (Annealage Mesh and Annealage Loom) are built on. A commercial licence for an Annealage product that depends on it is the place to cover this package as well; ask when you enquire.
+Annealage Agent is the embedded-agent layer the Annealage products (Annealage Mesh and Annealage Loom) are built on. A commercial licence for an Annealage product that depends on this package includes it for use with that product. Annealage Agent can also be licensed commercially on its own, to use it by itself or in a product of your own; say so when you enquire.
+
+A commercial licence covers the Licensor's own code only. Third-party dependencies are licensed by their owners, under their own licences and terms. In particular, the Claude Agent SDK (MIT, with its use governed by Anthropic's [Commercial Terms of Service](https://www.anthropic.com/legal/commercial-terms)) and the Claude Code CLI it bundles (© Anthropic PBC, all rights reserved) are subject to Anthropic's terms, including when you use them to power products and services you make available to your own customers, and the Codex and omp backends to their own terms.
 
 ## When a commercial licence is required
 
@@ -21,7 +23,7 @@ These are illustrations of commercial-purpose use, not an exhaustive list. If yo
 
 Any noncommercial purpose is permitted free of charge under the PolyForm Noncommercial License. This includes:
 
-- Personal projects, hobby work, amateur pursuits, and private experimentation.
+- Personal projects, hobby work, amateur pursuits, religious observance, private entertainment, and private experimentation.
 - Education, including teaching, coursework, and student projects (whether or not the student is paid as a teaching assistant).
 - Academic research and experimentation, including funded research at universities and public research institutions.
 - Use by charitable organisations, government agencies, public research institutions, public safety and health organisations, and environmental protection organisations, regardless of funding source.
