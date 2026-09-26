@@ -128,7 +128,7 @@ parentheses are Annealage Mesh's, as an example:
     Codex (Annealage Loom refuses it).
 ``cli_command``
     How the human starts the product, as a hint in refusals ("annealage-mesh";
-    Loom: "loom-review --design <id>"). ``None`` (the default) is
+    Loom: "loom --design <id>"). ``None`` (the default) is
     ``distribution``. Read through ``run_command``; the workspace-trust
     refusal appends ``--trust-project-config`` to it.
 ``doctor_command``

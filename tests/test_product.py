@@ -278,7 +278,7 @@ def test_command_hints_default_to_the_distribution_and_follow_the_product(swap_p
 
     swap_product(
         _other(
-            cli_command="loom-review --design <id>",
+            cli_command="loom --design <id>",
             doctor_command="",
             codex_install_hint="uv sync --extra codex",
         )
@@ -286,6 +286,6 @@ def test_command_hints_default_to_the_distribution_and_follow_the_product(swap_p
     assert "doctor" not in sdk._remediation_for(CLIConnectionError())
     assert "doctor" not in codex._remediation_for(TransportClosedError())
     assert "`uv sync --extra codex`" in codex._remediation_for(FileNotFoundError())
-    assert "loom-review --design <id> --trust-project-config" in workspace_trust.refusal_message(
+    assert "loom --design <id> --trust-project-config" in workspace_trust.refusal_message(
         tmp_path, ()
     )

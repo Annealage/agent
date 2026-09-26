@@ -43,7 +43,7 @@ version 1 file is refused with a message that says so, rather than misread.
 - Every write replaces the file atomically (``files.atomic_replace``), under
   ``file_lock`` so two writers in this process cannot lose each other's
   comment or hand out one id twice. **The lock is per process**: two
-  processes serving one file (two ``loom-review`` runs of one design, or a
+  processes serving one file (two ``loom`` runs of one design, or a
   separately running agent editing the file directly) can still race, so one
   writer's change can replace the other's. The atomic replace keeps that to a
   lost change, never a corrupt file; running one server per review file is
