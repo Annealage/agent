@@ -25,6 +25,7 @@ docstring). ``tests/test_codex_session.py``'s identical pattern for
 
 import asyncio
 import json
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -1208,7 +1209,14 @@ async def test_a_conversation_omp_cannot_open_is_reported_and_the_session_starts
 
 
 @pytest.mark.asyncio
-async def test_the_agent_dir_and_binary_reach_the_omp_command_line_and_environment(tmp_path):
+async def test_the_agent_dir_config_dir_and_binary_reach_the_omp_command_line_and_environment(
+    tmp_path, monkeypatch
+):
+    """``PI_CONFIG_DIR`` is joined to ``$HOME`` by omp, so a config directory
+    under the home is passed relative to it."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
     seen = {}
 
     def factory(**kwargs):
@@ -1226,6 +1234,7 @@ async def test_the_agent_dir_and_binary_reach_the_omp_command_line_and_environme
         client_factory=factory,
         agent_dir=str(tmp_path / "profile"),
         binary="/opt/omp/bin/omp",
+        config_dir=str(home / "loom" / "omp-config"),
         session_dir=tmp_path / "state" / "omp",
     )
     await session.start()
@@ -1235,6 +1244,7 @@ async def test_the_agent_dir_and_binary_reach_the_omp_command_line_and_environme
         assert command[command.index("--session-dir") + 1] == str(tmp_path / "state" / "omp")
         assert "--no-session" not in command
         assert seen["env"]["PI_CODING_AGENT_DIR"] == str(tmp_path / "profile")
+        assert seen["env"]["PI_CONFIG_DIR"] == os.path.join("loom", "omp-config")
     finally:
         await session.close()
 
@@ -1248,9 +1258,11 @@ async def test_the_agent_dir_and_binary_reach_the_omp_command_line_and_environme
             {"agent_dir": "/srv/loom/omp", "base_url": "http://127.0.0.1:11434/v1"},
             "PI_CODING_AGENT_DIR",
         ),
+        ({"config_dir": "/etc/omp"}, "must be inside"),
+        ({"config_dir": "../elsewhere"}, "must be inside"),
     ],
 )
-async def test_a_relative_binary_or_a_profile_beside_a_custom_endpoint_is_refused(kwargs, reason):
+async def test_a_profile_the_omp_process_could_not_use_as_meant_is_refused(kwargs, reason):
     launched = []
     recorder = EventRecorder()
     session = OmpSession(

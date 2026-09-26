@@ -43,10 +43,11 @@ effect. The record holds a pid and a port and nothing secret (see
 
 Two lookups reach past ``net.py``'s and ``lock.py``'s public surface into a
 private helper each: ``net._reachable_addresses`` for the addresses this
-machine answers on, and ``lock._read_record`` plus ``lock._pid_is_live`` for
+machine answers on, and ``lock._read_record`` plus ``lock._stale_reason`` for
 a read-only look at the lock. Both modules already compute exactly this
 correctly, the second with a liveness rule (an ``EPERM`` on ``os.kill``
-counts as alive) that is easy to get subtly wrong a second time, and neither
+counts as alive, a holder from another boot or a reused pid does not) that
+is easy to get subtly wrong a second time, and neither
 currently exposes a public, side-effect-free way to ask the question this
 module needs answered. Reimplementing either would be the second copy of a
 fact one function already gets right.
@@ -432,7 +433,7 @@ def _lock_info(project_dir):
         return None
     path = lock.lock_path(sessions.state_dir(project_dir))
     try:
-        pid, held_port = lock._read_record(path)
+        record = lock._read_record(path)
     except FileNotFoundError:
         return None
     except lock.LockCorrupt as exc:
@@ -440,9 +441,11 @@ def _lock_info(project_dir):
     return {
         "path": str(path),
         "corrupt": False,
-        "pid": pid,
-        "port": held_port,
-        "alive": lock._pid_is_live(pid),
+        "pid": record["pid"],
+        "port": record["port"],
+        # What acquire would decide: a holder from another boot, or whose pid
+        # is now another process, is as gone as one that exited.
+        "alive": lock._stale_reason(record) is None,
     }
 
 

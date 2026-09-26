@@ -34,7 +34,10 @@ def test_exclusive_creation_writes_pid_and_port_and_no_token(tmp_path):
     assert path.exists()
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     record = json.loads(path.read_bytes())
-    assert record == {"pid": os.getpid(), "port": 4242}
+    assert {k: record[k] for k in ("pid", "port")} == {"pid": os.getpid(), "port": 4242}
+    # Nothing else a token or anything secret could hide in: the boot and the
+    # holder's start time, where /proc can say (test_lock_records_... below).
+    assert set(record) <= {"pid", "port", "boot_id", "start_time"}
 
     held.release()
     assert not path.exists()
@@ -96,10 +99,86 @@ def test_stale_pid_is_reclaimed(tmp_path, monkeypatch, capsys):
     held = lock.acquire(state_dir, 4242)
     try:
         record = json.loads(path.read_bytes())
-        assert record == {"pid": os.getpid(), "port": 4242}
+        assert (record["pid"], record["port"]) == (os.getpid(), 4242)
         assert "annealage-toy: reclaiming stale lock" in capsys.readouterr().err
     finally:
         held.release()
+
+
+def test_the_lock_records_this_boot_and_the_holder_s_start_time(tmp_path, monkeypatch):
+    monkeypatch.setattr(lock, "_boot_id", lambda: "boot-a")
+    monkeypatch.setattr(lock, "_start_time", lambda pid: 12345 if pid == os.getpid() else None)
+    state_dir = tmp_path / ".toy"
+    held = lock.acquire(state_dir, 4242)
+    try:
+        record = json.loads(lock.lock_path(state_dir).read_bytes())
+        assert record == {
+            "pid": os.getpid(),
+            "port": 4242,
+            "boot_id": "boot-a",
+            "start_time": 12345,
+        }
+    finally:
+        held.release()
+
+
+def test_the_real_proc_start_time_of_this_process_is_read_when_proc_exists():
+    if not os.path.exists("/proc/self/stat"):
+        pytest.skip("no /proc on this platform")
+    start = lock._start_time(os.getpid())
+    assert isinstance(start, int) and start > 0
+    assert lock._start_time(os.getpid()) == start
+    assert lock._boot_id()
+
+
+def _held_by_this_live_pid(state_dir, **extra):
+    """A lock record naming this (certainly live) process."""
+    state_dir.mkdir()
+    record = {"pid": os.getpid(), "port": 9001}
+    record.update(extra)
+    lock.lock_path(state_dir).write_bytes(json.dumps(record).encode())
+
+
+def test_a_lock_from_another_boot_is_reclaimed_even_though_its_pid_is_live(
+    tmp_path, monkeypatch, capsys
+):
+    """After a power cut, a boot-time pid is routinely some other process:
+    the pid being live says nothing when the boot is not the same."""
+    monkeypatch.setattr(lock, "_boot_id", lambda: "boot-b")
+    state_dir = tmp_path / ".toy"
+    _held_by_this_live_pid(state_dir, boot_id="boot-a")
+    held = lock.acquire(state_dir, 4242)
+    held.release()
+    assert "taken before this machine last booted" in capsys.readouterr().err
+
+
+def test_a_live_pid_that_is_now_another_process_is_reclaimed(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(lock, "_boot_id", lambda: "boot-a")
+    monkeypatch.setattr(lock, "_start_time", lambda pid: 222)
+    state_dir = tmp_path / ".toy"
+    _held_by_this_live_pid(state_dir, boot_id="boot-a", start_time=111)
+    held = lock.acquire(state_dir, 4242)
+    held.release()
+    assert "is now a different process" in capsys.readouterr().err
+
+
+def test_the_same_boot_and_start_time_is_still_held(tmp_path, monkeypatch):
+    monkeypatch.setattr(lock, "_boot_id", lambda: "boot-a")
+    monkeypatch.setattr(lock, "_start_time", lambda pid: 111)
+    state_dir = tmp_path / ".toy"
+    _held_by_this_live_pid(state_dir, boot_id="boot-a", start_time=111)
+    with pytest.raises(lock.LockHeld):
+        lock.acquire(state_dir, 4242)
+
+
+def test_without_proc_only_the_pid_decides_as_before(tmp_path, monkeypatch):
+    """No /proc (or a record an older version wrote): a live pid holds."""
+    monkeypatch.setattr(lock, "_boot_id", lambda: None)
+    monkeypatch.setattr(lock, "_start_time", lambda pid: None)
+    state_dir = tmp_path / ".toy"
+    _held_by_this_live_pid(state_dir, boot_id="boot-a", start_time=111)
+    with pytest.raises(lock.LockHeld):
+        lock.acquire(state_dir, 4242)
 
 
 def test_garbage_lock_file_raises_lock_corrupt_and_is_left_in_place(tmp_path):
@@ -244,7 +323,8 @@ def test_the_record_is_complete_before_the_lock_name_exists(tmp_path, monkeypatc
     try:
         assert observed, "the lock name was published without os.link"
         assert observed["name_existed_first"] is False
-        assert json.loads(observed["published_bytes"]) == {"pid": os.getpid(), "port": 4242}
+        published = json.loads(observed["published_bytes"])
+        assert (published["pid"], published["port"]) == (os.getpid(), 4242)
     finally:
         held.release()
 

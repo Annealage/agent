@@ -11,6 +11,16 @@ The file holds the holder's pid and port as JSON, so a refused second start
 can say which process holds the project and where it is listening instead of
 a bare refusal with no next step.
 
+Where ``/proc`` can say (Linux), the record also holds the boot it was taken
+in (``/proc/sys/kernel/random/boot_id``) and the holder's start time (field
+22 of ``/proc/<pid>/stat``, clock ticks since boot). A pid alone is not proof
+of a holder: after a power cut a service's boot-time pid is routinely reused
+by some other early process, and a lock naming it would keep the service
+down for good. A record from another boot, or whose pid now names a process
+started at a different time, is stale and reclaimed. Where ``/proc`` is
+absent, or a record carries neither (an older version wrote it), only the
+pid is checked, as before.
+
 It deliberately holds no token. The lock lives inside the served directory,
 which the agent's own shell can read, sandboxed or not, and the browser token
 is what authorises a permission decision over ``/ws``: a token written here
@@ -70,6 +80,28 @@ def lock_path(state_dir: Path) -> Path:
     return Path(state_dir) / LOCK_FILENAME
 
 
+def _boot_id() -> Optional[str]:
+    """This boot's id, or None where the kernel does not expose one."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as f:
+            return f.read().strip() or None
+    except (OSError, ValueError):
+        return None
+
+
+def _start_time(pid: int) -> Optional[int]:
+    """When ``pid`` started, in clock ticks since boot (``/proc/<pid>/stat``
+    field 22), or None where that cannot be read. The command name (field 2)
+    may hold spaces and parentheses, so fields are counted after its last
+    ``)``, which is followed by field 3."""
+    try:
+        with open("/proc/%d/stat" % pid, encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+        return int(raw[raw.rindex(")") + 1 :].split()[22 - 3])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def _pid_is_live(pid: int) -> bool:
     """Whether ``pid`` names a process visible to this user right now.
 
@@ -92,19 +124,40 @@ def _pid_is_live(pid: int) -> bool:
     return True
 
 
-def _read_record(path: Path):
-    """Return ``(pid, port)`` from an existing lock file, or raise
-    ``LockCorrupt``. Never called on a path known not to exist."""
+def _stale_reason(record: dict) -> Optional[str]:
+    """Why the holder ``record`` names is gone, or None if it may be alive.
+    Each check applies only where both the record and this machine can say."""
+    pid = record["pid"]
+    held_boot = record.get("boot_id")
+    boot = _boot_id()
+    if held_boot and boot and held_boot != boot:
+        return "it was taken before this machine last booted"
+    if not _pid_is_live(pid):
+        return "pid %d is no longer running" % pid
+    held_start = record.get("start_time")
+    start = _start_time(pid)
+    if held_start is not None and start is not None and held_start != start:
+        return "pid %d is now a different process" % pid
+    return None
+
+
+def _read_record(path: Path) -> dict:
+    """Return the record (``pid``, ``port``, and ``boot_id``/``start_time``
+    where present) from an existing lock file, or raise ``LockCorrupt``.
+    Never called on a path known not to exist."""
     try:
         raw = path.read_bytes()
         data = json.loads(raw)
-        pid = int(data["pid"])
-        port = int(data["port"])
+        record = {"pid": int(data["pid"]), "port": int(data["port"])}
+        if data.get("boot_id") is not None:
+            record["boot_id"] = str(data["boot_id"])
+        if data.get("start_time") is not None:
+            record["start_time"] = int(data["start_time"])
     except FileNotFoundError:
         raise
-    except (ValueError, KeyError, TypeError, OSError) as exc:
+    except (ValueError, KeyError, TypeError, AttributeError, OSError) as exc:
         raise LockCorrupt("%s exists but is not a valid lock record (%s)" % (path, exc)) from exc
-    return pid, port
+    return record
 
 
 class Lock:
@@ -214,7 +267,13 @@ def acquire(state_dir, port: int, *, pid: Optional[int] = None) -> Lock:
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     path = lock_path(state_dir)
-    payload = json.dumps({"pid": pid, "port": port}).encode("utf-8")
+    record = {"pid": pid, "port": port}
+    boot, start = _boot_id(), _start_time(pid)
+    if boot is not None:
+        record["boot_id"] = boot
+    if start is not None:
+        record["start_time"] = start
+    payload = json.dumps(record).encode("utf-8")
 
     while True:
         acquired = _claim(path, payload)
@@ -222,7 +281,7 @@ def acquire(state_dir, port: int, *, pid: Optional[int] = None) -> Lock:
             return acquired
 
         try:
-            held_pid, held_port = _read_record(path)
+            held = _read_record(path)
         except FileNotFoundError:
             # Released between this loop's failed create and this read
             # (the holder exited and released, or another process's own
@@ -230,12 +289,13 @@ def acquire(state_dir, port: int, *, pid: Optional[int] = None) -> Lock:
             # a file that is not there as anything to reclaim.
             continue
 
-        if _pid_is_live(held_pid):
-            raise LockHeld(held_pid, held_port)
+        reason = _stale_reason(held)
+        if reason is None:
+            raise LockHeld(held["pid"], held["port"])
 
         sys.stderr.write(
-            "%s: reclaiming stale lock at %s (pid %d is no longer "
-            "running)\n" % (product.current().distribution, path, held_pid)
+            "%s: reclaiming stale lock at %s (%s)\n"
+            % (product.current().distribution, path, reason)
         )
         try:
             os.unlink(path)

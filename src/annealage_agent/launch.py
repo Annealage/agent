@@ -43,6 +43,7 @@ def build_session(
     trusted_config_digest=None,
     omp_agent_dir=None,
     omp_binary=None,
+    omp_config_dir=None,
 ):
     """The session ``backend`` names, constructed and not yet started.
 
@@ -64,16 +65,20 @@ def build_session(
     ``trusted_config_digest`` is the Claude configuration digest the startup
     trust gate accepted, if it ran.
 
-    ``omp_agent_dir`` and ``omp_binary`` are the omp backend's profile
-    directory (its ``PI_CODING_AGENT_DIR``: its own config, auth and models,
-    and none of the user's context files) and an absolute path to the omp
-    executable; ``None`` uses omp as installed on ``PATH``, with the user's
-    own profile. A service running under its own account passes both. They
-    are arguments rather than settings keys because a settings key is
-    writable from the page (``PUT /settings``), and neither an executable
-    nor a profile directory is something a browser should choose. The omp
-    conversation is kept under ``<state dir>/omp`` and resumed from the file
-    recorded in the session's ``meta.json``.
+    ``omp_agent_dir``, ``omp_config_dir`` and ``omp_binary`` are the omp
+    backend's agent directory (its ``PI_CODING_AGENT_DIR``: its own auth,
+    settings and models), its config root (``PI_CONFIG_DIR``, in place of
+    ``~/.omp`` with the user's ``APPEND_SYSTEM.md``, plugins and ``.env``;
+    it must lie under ``$HOME``) and an absolute path to the omp executable;
+    ``None`` uses omp as installed on ``PATH``, with the user's own
+    directories. A service running under its own account passes all three;
+    the agent directory alone still leaves the user's config root in effect.
+    A project's own context files are read either way. They are arguments
+    rather than settings keys because a settings key is writable from the
+    page (``PUT /settings``), and neither an executable nor a profile
+    directory is something a browser should choose. The omp conversation is
+    kept under ``<state dir>/omp`` and resumed from the file recorded in the
+    session's ``meta.json``.
 
     The session's write-protected patterns are ``bus.write_protected``, the
     app's (``create_app``); a stand-in bus without them takes the product's.
@@ -177,6 +182,7 @@ def build_session(
             on_sdk_session_id=_record_sdk_id,
             instructions=instructions,
             agent_dir=omp_agent_dir,
+            config_dir=omp_config_dir,
             binary=omp_binary,
             session_dir=sessions.state_dir(serve_dir) / "omp",
             resume=info.omp_session_file if info is not None else None,

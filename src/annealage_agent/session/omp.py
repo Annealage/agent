@@ -139,13 +139,20 @@ valid YAML, `omp`'s config loader accepts a `.yml` path with JSON content
 without complaint, and this avoids adding a YAML dependency for a one-off
 machine-generated file no human ever hand-edits.
 
-**A profile of its own.** ``agent_dir`` points ``PI_CODING_AGENT_DIR`` at a
-directory the product names (a service's own auth, settings and
-``models.yml``, and none of the human's global context files); it and
-``omp_base_url`` are exclusive, since both would own that variable (a
-profile names its custom endpoint in its own ``models.yml``). ``binary`` is
-an absolute path to the `omp` executable, for a service whose ``PATH`` does
-not have it; never relative, which would resolve inside the served
+**A profile of its own.** `omp` reads two directories of the user's:
+its config root (``~/.omp``: ``agent/APPEND_SYSTEM.md``, ``plugins/``,
+``.env`` and the rest) and, inside it by default, its agent directory (auth,
+settings, ``models.yml``, sessions). ``agent_dir`` points
+``PI_CODING_AGENT_DIR`` at a directory the product names (a service's own
+auth, settings and ``models.yml``); it and ``omp_base_url`` are exclusive,
+since both would own that variable (a profile names its custom endpoint in
+its own ``models.yml``). ``agent_dir`` alone still leaves the user's config
+root in effect; ``config_dir`` replaces that too, through ``PI_CONFIG_DIR``,
+which `omp` joins to ``$HOME``, so it must lie under ``$HOME`` and is passed
+relative to it. A project's own context files (``AGENTS.md`` and the like in
+the served directory and above it) are read whatever these say. ``binary``
+is an absolute path to the `omp` executable, for a service whose ``PATH``
+does not have it; never relative, which would resolve inside the served
 directory.
 
 **Steering and resuming.** Every human message is sent as ``prompt`` with
@@ -267,8 +274,9 @@ class OmpSession:
     docstring). A write-grade call asks the broker under that same name.
     ``set_tool_table`` replaces it mid-session (a remote reached late).
 
-    ``agent_dir``, ``binary``, ``session_dir``, ``resume`` and
-    ``on_session_file`` are this module's docstring's profile, executable,
+    ``agent_dir``, ``config_dir``, ``binary``, ``session_dir``, ``resume`` and
+    ``on_session_file`` are this module's docstring's profile (agent and
+    config directories), executable,
     conversation directory, conversation file to resume, and the callback
     that records the conversation file `omp` reports. Without
     ``session_dir`` the conversation is not kept (``--no-session``).
@@ -292,6 +300,7 @@ class OmpSession:
         client_factory: Optional[Callable[..., Any]] = None,
         instructions: Optional[str] = None,
         agent_dir=None,
+        config_dir=None,
         binary: Optional[str] = None,
         session_dir=None,
         resume: Optional[str] = None,
@@ -315,6 +324,9 @@ class OmpSession:
         self._profile_dir = (
             os.path.abspath(os.path.expanduser(str(agent_dir))) if agent_dir else None
         )
+        self._config_dir = os.path.expanduser(str(config_dir)) if config_dir else None
+        # PI_CONFIG_DIR's value, relative to $HOME; set by _configuration_refusal.
+        self._config_rel: Optional[str] = None
         self._binary = os.path.expanduser(binary) if binary else None
         self._session_dir = Path(session_dir) if session_dir is not None else None
         self._resume = resume or None
@@ -615,6 +627,8 @@ class OmpSession:
                 if self._profile_dir is not None:
                     env["PI_CODING_AGENT_DIR"] = self._profile_dir
                 model_arg = self._model
+            if self._config_rel is not None:
+                env["PI_CONFIG_DIR"] = self._config_rel
             client_kwargs = {}
             if self._instructions:
                 client_kwargs["append_system_prompt"] = self._instructions
@@ -691,6 +705,16 @@ class OmpSession:
                 "the omp binary must be an absolute path, not %r, which would be "
                 "looked for relative to the served directory" % self._binary
             )
+        if self._config_dir is not None:
+            home = os.path.realpath(os.path.expanduser("~"))
+            target = os.path.realpath(os.path.join(home, self._config_dir))
+            rel = os.path.relpath(target, home)
+            if rel == "." or rel == ".." or rel.startswith(".." + os.sep):
+                return (
+                    "the omp config directory must be inside %s (omp joins "
+                    "PI_CONFIG_DIR to $HOME), not %r" % (home, self._config_dir)
+                )
+            self._config_rel = rel
         return None
 
     async def _switch_to(self, session_file: str) -> None:
