@@ -54,26 +54,29 @@ dependencies = [
     # http/routes_mcp.py builds the /mcp endpoint's request and response
     # bodies from mcp.types (Tool/CallToolResult/ListToolsResult), and
     # session/codex_mcp_stdio_bridge.py's stdio side is built entirely on
-    # mcp.server (Server/stdio_server): both are direct imports of this
+    # mcp.server (Server/stdio_server), and remote.py's client for a
+    # product's remote MCP servers on mcp.client: all direct imports of this
     # project's own code, not merely something claude-agent-sdk happens to
-    # pull in underneath it (it does, which is how this floor was verified:
-    # 1.21.0 is the version already resolved and exercised in this
-    # environment through that existing dependency chain), so it is declared
-    # here rather than relied on transitively - a future claude-agent-sdk
-    # release dropping its own use of mcp must not silently break this
-    # project's own direct imports of it. The `<2` cap follows this
-    # project's usual practice of not trusting an unreleased next major to
-    # keep today's API shape.
-    "mcp>=1.21,<2",
-    # session/codex_mcp_stdio_bridge.py's only HTTP client, used to reach
-    # the product's own /mcp endpoint from the stdio-proxy subprocess. Also
+    # pull in underneath it, so it is declared here rather than relied on
+    # transitively - a future claude-agent-sdk release dropping its own use
+    # of mcp must not silently break this project's own direct imports of
+    # it. 1.24 is the first release with streamable_http_client (the client
+    # transport taking an httpx client, which replaced the deprecated
+    # streamablehttp_client) that remote.py connects with. The `<2` cap
+    # follows this project's usual practice of not trusting an unreleased
+    # next major to keep today's API shape.
+    "mcp>=1.24,<2",
+    # The HTTP client session/codex_mcp_stdio_bridge.py reaches the
+    # product's own /mcp endpoint with from the stdio-proxy subprocess, and
+    # the one remote.py hands mcp's transport for a remote server. Also
     # already transitively present (mcp's own dependency), declared directly
     # for the same reason as mcp above. 0.28.1 is what this floor was
     # verified against; httpx's own versioning has stayed stable through the
     # 0.2x series, so no upper cap tighter than the next major is warranted.
     "httpx>=0.27,<1",
     # session/codex_mcp_stdio_bridge.py imports anyio directly (anyio.run()
-    # and anyio.get_cancelled_exc_class()), so it is declared here for the
+    # and anyio.get_cancelled_exc_class()), and remote.py bounds its calls
+    # with anyio.fail_after, so it is declared here for the
     # same reason as mcp above rather than relied on through mcp and httpx,
     # which both pull it in. The floor follows mcp's own (anyio>=4.5), the
     # package whose stdio server the bridge runs under it; the `<5` cap

@@ -67,7 +67,6 @@ exactly as ``session/sdk.py`` does for its own.
 
 import mcp.types as types
 
-from .. import product
 from ..tools import namespaced
 from . import read_json_body
 from .ws import _origin_is_allowed, _token_is_allowed, refusal
@@ -107,18 +106,17 @@ async def _call_tool_result(tool_table, broker, name, arguments, *, server_name)
     """A ``CallToolResult`` for one ``tools/call``, the broker consulted
     first and exactly once when ``name`` is write-class. See this module's
     docstring for why that gate lives here rather than in ``tool_table()``'s
-    own already-``_wrap``-gated handler. ``server_name`` is the tool server's
-    own name, which the broker is asked under (``mcp__<server>__<tool>``), the
-    same name Claude's own ``can_use_tool`` hook would see for this call.
+    own already-``_wrap``-gated handler. ``server_name`` is the name of the
+    server ``tool_table`` belongs to (the product's, or a remote's), which the
+    broker is asked under (``mcp__<server>__<tool>``), the same name Claude's
+    own ``can_use_tool`` hook would see for this call.
     """
     spec = tool_table.get(name)
     if spec is None:
         return types.CallToolResult(
             isError=True,
             content=[
-                types.TextContent(
-                    type="text", text="no such %s tool: %r" % (product.current().name, name)
-                )
+                types.TextContent(type="text", text="no such %s tool: %r" % (server_name, name))
             ],
         )
     if spec.write:
@@ -148,17 +146,21 @@ async def _call_tool_result(tool_table, broker, name, arguments, *, server_name)
 
 
 def register_mcp_routes(app, *, tools, broker, agent_token, allowed_origins=()):
-    """Register ``POST /mcp`` on ``app``.
+    """Register ``POST /mcp``, and ``POST /mcp/<remote>`` for each remote MCP
+    server the tool server reached, on ``app``.
 
     ``tools`` is the product's ``ToolServer`` ``create_app`` builds once
     and shares with ``build_session`` (see its own comment for why one
     instance, not two): its already-``_wrap``-gated handlers are read once,
     here, into ``tool_table()``'s transport-neutral shape, at registration
     time rather than per request, since the tool set is fixed for the life
-    of one served directory's app.
+    of one served directory's app. A remote's tools (``remote_tables()``) are
+    served on a route of their own, the path the Codex bridge registered for
+    that remote is pointed at (``session/codex.py``), under bare names, with
+    the broker asked under ``mcp__<remote>__<tool>``.
 
-    ``agent_token`` is the run's agent token, and the only credential this
-    route accepts. It is deliberately not the browser token: this route's
+    ``agent_token`` is the run's agent token, and the only credential these
+    routes accept. It is deliberately not the browser token: this route's
     caller is a subprocess the agent's own backend launches, whose command
     line and environment the agent's shell may be able to read, and the
     browser token is what authorises a permission decision over ``/ws``.
@@ -174,14 +176,15 @@ def register_mcp_routes(app, *, tools, broker, agent_token, allowed_origins=()):
     exists).
     """
     tool_table = tools.tool_table()
-    server_name = tools.name
+    remote_tables = tools.remote_tables()
 
-    @app.post("/mcp")
-    async def mcp_route(req):
+    async def serve(req, table, server_name):
         if not _token_is_allowed(req, agent_token):
             return refusal()
         if not _origin_is_allowed(req, allowed_origins):
             return refusal()
+        if table is None:
+            return {"ok": False, "error": "no such MCP server"}, 404
 
         data, error = await read_json_body(req)
         if error is not None:
@@ -198,7 +201,7 @@ def register_mcp_routes(app, *, tools, broker, agent_token, allowed_origins=()):
             return {"ok": False, "error": '"params" must be an object'}, 400
 
         if method == "tools/list":
-            return {"result": _tool_list_result(tool_table)}, 200
+            return {"result": _tool_list_result(table)}, 200
 
         if method == "tools/call":
             name = params.get("name")
@@ -209,10 +212,18 @@ def register_mcp_routes(app, *, tools, broker, agent_token, allowed_origins=()):
                     "error": '"params" must be {"name": str, "arguments"?: object}',
                 }, 400
             call_result = await _call_tool_result(
-                tool_table, broker, name, arguments, server_name=server_name
+                table, broker, name, arguments, server_name=server_name
             )
             return {
                 "result": call_result.model_dump(mode="json", by_alias=True, exclude_none=True)
             }, 200
 
         return {"ok": False, "error": "unknown method: %r" % method}, 400
+
+    @app.post("/mcp")
+    async def mcp_route(req):
+        return await serve(req, tool_table, tools.name)
+
+    @app.post("/mcp/<remote>")
+    async def remote_mcp_route(req, remote):
+        return await serve(req, remote_tables.get(remote), remote)

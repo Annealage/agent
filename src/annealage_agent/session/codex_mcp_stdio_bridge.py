@@ -75,12 +75,14 @@ AGENT_TOKEN_ENV = "ANNEALAGE_AGENT_TOKEN"
 
 #: How long one forwarded call is given to reach the host process and come
 #: back. Generous: the host's own ``ViewerBus.CALL_TIMEOUT`` (10s) already bounds
-#: how long a viewer-facing tool call can take, and a write-class call adds
-#: however long the human takes to answer an approval card
-#: (``PermissionBroker.DEFAULT_TIMEOUT``, five minutes) - this must clear
-#: both comfortably, since a timeout here reaches Codex as a failed tool call
-#: with no way to tell "the host is slow" from "the human has not answered yet".
-CALL_TIMEOUT = 310.0
+#: how long a viewer-facing tool call can take, a remote MCP server's tool
+#: (``remote.CALL_TIMEOUT``, 60s) how long a proxied one can, and a
+#: write-class call adds however long the human takes to answer an approval
+#: card (``PermissionBroker.DEFAULT_TIMEOUT``, five minutes) - this must clear
+#: the longest of those sums comfortably, since a timeout here reaches Codex as
+#: a failed tool call with no way to tell "the host is slow" from "the human
+#: has not answered yet".
+CALL_TIMEOUT = 370.0
 
 
 class AuthorityError(RuntimeError):

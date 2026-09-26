@@ -18,6 +18,8 @@ Layout:
     tools.py       ToolSpec, READ/VIEW/WRITE Grading, ok/fail, the pause gate,
                    failure mapping, ToolServer (SDK server, pre-allowed list,
                    tool_table)
+    remote.py      remote MCP servers a product declares: discovery, grading
+                   and the per-call proxy behind their tools
     files.py       path safety, guarded fixed-file reads/appends, atomic
                    replace, image sniffing, images/ and review/ files
     settings.py    generic settings keys, layering, product key registration

@@ -324,6 +324,9 @@ def create_app(
     # for the tools, the routes and the watcher is what makes a tool's write
     # notify the watcher directly rather than wait for its next sample.
     bus.review_store = review_store
+    # The run's settings reach it the same way, so a product key can shape
+    # the tools (Annealage Loom's remote MCP server URL, say).
+    bus.settings = settings
     if session_id is not None or external_agents:
         tools = installed.build_tools(bus, serve_dir, session_id)
     # ``bus`` is the one object both this function and the CLI's

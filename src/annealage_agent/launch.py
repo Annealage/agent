@@ -95,9 +95,13 @@ def build_session(
     resume = _resumable_sdk_id(serve_dir, session_id) if resumed else None
 
     # What the product says this run is about (Product.session_context), added
-    # to the backend's system prompt; None adds nothing.
+    # to the backend's system prompt; None adds nothing. Followed by what each
+    # remote MCP server the tool server reached said about itself
+    # (ToolServer.remote_instructions), which every backend gets the same way.
     context_hook = product.current().session_context
-    instructions = context_hook(bus, serve_dir) if context_hook is not None else None
+    context = context_hook(bus, serve_dir) if context_hook is not None else None
+    remote_instructions = bus.tools.remote_instructions if bus.tools is not None else None
+    instructions = "\n\n".join(p for p in (context, remote_instructions) if p) or None
 
     if backend == "codex":
         # Imported only in this branch, per the module docstring's own
@@ -123,6 +127,8 @@ def build_session(
             mcp_host=mcp_host,
             mcp_port=mcp_port,
             mcp_token=agent_token,
+            # One more bridge per remote MCP server, each at /mcp/<remote>.
+            mcp_remotes=tuple(r.name for r in bus.tools.remotes) if bus.tools is not None else (),
             instructions=instructions,
         )
 
@@ -144,8 +150,10 @@ def build_session(
             api_key=settings["omp_api_key"],
             # Mirrors SdkSession's mcp_servers=bus.tools.mcp_servers:
             # a snapshot taken once, at construction, rather than a live
-            # reference to the tool server this run already built.
-            tool_table=bus.tools.tool_table(),
+            # reference to the tool server this run already built. The
+            # product's tools by their own names, each remote's as
+            # <remote>__<tool>.
+            tool_table=bus.tools.host_tool_table(),
             on_sdk_session_id=_record_sdk_id,
             instructions=instructions,
         )
@@ -159,7 +167,8 @@ def build_session(
         broker=broker,
         # The product's tool server, built once by create_app and shared
         # through bus.tools (see app.py's own comment on that channel)
-        # rather than built again here. Its read- and view-grade tools are
+        # rather than built again here: the product's own in-process server
+        # and one per remote MCP server. Their read- and view-grade tools are
         # the session's allow list, so they never prompt; the write-grade
         # ones are absent from every allow list, which is what makes them
         # reach the broker above and therefore the human.

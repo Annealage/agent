@@ -155,10 +155,12 @@ def _read_notes(serve_dir):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def build_toy_tools(bus, serve_dir, session_id=None):
+def build_toy_tools(bus, serve_dir, session_id=None, *, remote=()):
     """The toy's ``Product.build_tools``: a ``ToolServer`` over five tools
     graded by ``TOY_READ``/``TOY_VIEW``/``TOY_WRITE``, and the shared review
-    tools graded by ``TOY_REVIEW_*`` when the app has a review store."""
+    tools graded by ``TOY_REVIEW_*`` when the app has a review store.
+    ``remote`` is passed on as the server's remote MCP servers
+    (``tests/test_remote_tools.py``)."""
     from claude_agent_sdk import tool
 
     from annealage_agent import files
@@ -201,7 +203,9 @@ def build_toy_tools(bus, serve_dir, session_id=None):
             write=TOY_WRITE + TOY_REVIEW_WRITE,
         )
         built += review_tools(store, bus=bus)
-    return ToolServer(built, grading=grading, bus=bus, paused_message=TOY_PAUSED_MESSAGE)
+    return ToolServer(
+        built, grading=grading, bus=bus, paused_message=TOY_PAUSED_MESSAGE, remote=remote
+    )
 
 
 def register_toy_routes(app, allowed_origins):

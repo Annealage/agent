@@ -225,13 +225,15 @@ class OmpSession:
     keywords ``RpcClient()`` does and returning anything with its public
     method surface. Defaults to ``RpcClient`` itself.
 
-    ``tool_table`` is the product tool server's ``ToolServer.tool_table()``
-    snapshot (``{name: ToolSpec(schema, description, handler, write)}``),
-    taken once at construction the same way ``SdkSession`` is handed
-    ``bus.tools.mcp_servers`` once: every tool this session ever
-    exposes to `omp` comes from this snapshot, registered as `omp` host
-    tools rather than through a second transport (unlike Codex, which needs
-    its own stdio-to-HTTP MCP bridge -- see this file's module docstring).
+    ``tool_table`` is the product tool server's ``ToolServer.host_tool_table()``
+    snapshot (``{name: ToolSpec(schema, description, handler, write)}``: the
+    product's tools by their own names, each remote MCP server's as
+    ``<remote>__<tool>``), taken once at construction the same way
+    ``SdkSession`` is handed ``bus.tools.mcp_servers`` once: every tool this
+    session ever exposes to `omp` comes from this snapshot, registered as
+    `omp` host tools rather than through a second transport (unlike Codex,
+    which needs its own stdio-to-HTTP MCP bridge -- see this file's module
+    docstring). A write-grade call asks the broker under that same name.
     """
 
     def __init__(

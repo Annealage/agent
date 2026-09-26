@@ -180,7 +180,8 @@ class SdkSession:
     therefore never interrupt the human, namespaced, because an in-process MCP
     tool is visible to the model as ``mcp__<server>__<tool>`` and a bare name
     in this list silently matches nothing. The caller passes the product tool
-    server's own ``ToolServer.pre_allowed`` (read- and view-grade tools), so
+    server's own ``ToolServer.pre_allowed`` (read- and view-grade tools, of the
+    product's own server and of each remote MCP server it proxies), so
     the list this session pre-allows and the grading the server refuses to
     build without cannot disagree: a write-grade name reaching this list would
     silently remove the human's approval card. Empty (the default) pre-allows

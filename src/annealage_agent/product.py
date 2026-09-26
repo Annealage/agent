@@ -80,7 +80,12 @@ parentheses are Annealage Mesh's, as an example:
     refused at startup. A product that keeps a review hands its
     ``review.ReviewStore`` to ``create_app`` and finds it here on
     ``bus.review_store``, to build the shared review tools
-    (``review/tools.py``) over it beside its own.
+    (``review/tools.py``) over it beside its own. The run's resolved
+    settings are ``bus.settings``, so a product's own settings key can shape
+    what it builds. Beside its own tools, the product may declare remote MCP
+    servers (``ToolServer(..., remote=(remote.RemoteServer(name, url,
+    grading),))``), which every backend then reaches as server namespaces of
+    their own, graded by the product like its own tools (``remote.py``).
 ``settings_keys``
     Extra ``settings.Key`` rows the product adds to the generic key set (Mesh:
     ``up_axis``), registered by ``install``. A key's ``section`` names the
@@ -143,7 +148,9 @@ parentheses are Annealage Mesh's, as an example:
     after the tool server exists (``bus.tools``, ``bus.review_store``). Every
     backend takes it: Claude as its system prompt (the SDK's default one is
     empty), Codex as the thread's developer instructions, omp through
-    ``--append-system-prompt``. ``None`` (the default) adds nothing.
+    ``--append-system-prompt``. ``None`` (the default) adds nothing. The
+    ``initialize`` instructions of each remote MCP server the tool server
+    reached follow it, each under a heading naming the server.
 ``codex_bridge_module``
     The module Codex launches as the stdio MCP bridge. Defaults to the agent
     layer's own bridge, which is the only one that speaks its ``/mcp``

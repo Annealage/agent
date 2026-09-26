@@ -167,6 +167,7 @@ class CodexSession:
         mcp_host: Optional[str] = None,
         mcp_port: Optional[int] = None,
         mcp_token: Optional[str] = None,
+        mcp_remotes: tuple = (),
         instructions: Optional[str] = None,
     ):
         self._on_event = on_event
@@ -193,6 +194,10 @@ class CodexSession:
         self._mcp_host = mcp_host
         self._mcp_port = mcp_port
         self._mcp_token = mcp_token
+        # The remote MCP servers the product's tool server reached
+        # (ToolServer.remotes), by name: each gets a bridge of its own,
+        # pointed at /mcp/<name> (_mcp_config_overrides).
+        self._mcp_remotes = tuple(mcp_remotes)
         # The product's session context (Product.session_context), given to
         # the thread as its developer instructions.
         self._instructions = instructions or None
@@ -448,7 +453,10 @@ class CodexSession:
         tool-exposure bridge (``planning/tickets/phase3_codex-tool-mcp-bridge.md``)
         as an MCP server, named after the product's ``mcp_server_name``, scoped
         to this one launched app-server process - never written to the human's
-        real ``~/.codex/config.toml``.
+        real ``~/.codex/config.toml``. Each remote MCP server the product's
+        tool server reached (``mcp_remotes``) gets one more, named after it
+        and pointed at ``/mcp/<remote>`` (``--path``), so the model sees that
+        remote's tools as a server of their own.
 
         Empty when this session was constructed with no ``/mcp`` endpoint to
         point at (``mcp_host``/``_port``/``_token`` all ``None``, the
@@ -501,28 +509,37 @@ class CodexSession:
         if self._mcp_host is None or self._mcp_port is None or self._mcp_token is None:
             return ()
         installed = product.current()
+
         # No token here: this list becomes the app-server's own command line,
         # and so does anything in an ``env`` table, both readable through
         # ``ps``. The token travels in the app-server's environment instead
         # (``_mcp_env``), and ``env_vars`` names it as the one variable Codex
         # copies from there into the bridge's otherwise scrubbed environment.
-        proxy_args = [
-            "-m",
-            installed.codex_bridge_module,
-            "--host",
-            self._mcp_host,
-            "--port",
-            str(self._mcp_port),
-            "--server-name",
-            installed.distribution,
-            "--server-version",
-            installed.version,
-        ]
-        key = "mcp_servers.%s" % installed.mcp_server_name
-        return (
-            "%s.command=%s" % (key, _toml_string(sys.executable)),
-            "%s.args=[%s]" % (key, ", ".join(_toml_string(arg) for arg in proxy_args)),
-            "%s.env_vars=[%s]" % (key, _toml_string(AGENT_TOKEN_ENV)),
+        def bridge(key, server_name, path_args=()):
+            proxy_args = [
+                "-m",
+                installed.codex_bridge_module,
+                "--host",
+                self._mcp_host,
+                "--port",
+                str(self._mcp_port),
+                "--server-name",
+                server_name,
+                "--server-version",
+                installed.version,
+                *path_args,
+            ]
+            key = "mcp_servers.%s" % key
+            return (
+                "%s.command=%s" % (key, _toml_string(sys.executable)),
+                "%s.args=[%s]" % (key, ", ".join(_toml_string(arg) for arg in proxy_args)),
+                "%s.env_vars=[%s]" % (key, _toml_string(AGENT_TOKEN_ENV)),
+            )
+
+        overrides = bridge(installed.mcp_server_name, installed.distribution)
+        for name in self._mcp_remotes:
+            overrides += bridge(name, name, ("--path", "/mcp/%s" % name))
+        return overrides + (
             "shell_environment_policy.exclude=[%s]"
             % ", ".join(_toml_string(name) for name in _shell_excludes()),
         )
