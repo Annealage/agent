@@ -155,12 +155,18 @@ def _read_notes(serve_dir):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def build_toy_tools(bus, serve_dir, session_id=None, *, remote=()):
+#: The remote MCP servers the toy's tool server declares when its builder is
+#: not given any (``create_app`` calls it with none); a test that wants one
+#: in an app sets this with ``monkeypatch``.
+REMOTE = ()
+
+
+def build_toy_tools(bus, serve_dir, session_id=None, *, remote=None):
     """The toy's ``Product.build_tools``: a ``ToolServer`` over five tools
     graded by ``TOY_READ``/``TOY_VIEW``/``TOY_WRITE``, and the shared review
     tools graded by ``TOY_REVIEW_*`` when the app has a review store.
     ``remote`` is passed on as the server's remote MCP servers
-    (``tests/test_remote_tools.py``)."""
+    (``tests/test_remote_tools.py``), ``REMOTE`` when not given."""
     from claude_agent_sdk import tool
 
     from annealage_agent import files
@@ -204,7 +210,11 @@ def build_toy_tools(bus, serve_dir, session_id=None, *, remote=()):
         )
         built += review_tools(store, bus=bus)
     return ToolServer(
-        built, grading=grading, bus=bus, paused_message=TOY_PAUSED_MESSAGE, remote=remote
+        built,
+        grading=grading,
+        bus=bus,
+        paused_message=TOY_PAUSED_MESSAGE,
+        remote=REMOTE if remote is None else remote,
     )
 
 

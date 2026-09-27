@@ -147,6 +147,9 @@ let state = Object.freeze({
     banner: null,
     attachments: Object.freeze([]),
     usage: null,
+    uploadActions: Object.freeze([]),
+    documents: Object.freeze([]),
+    actionResults: Object.freeze([]),
   }),
 });
 
@@ -436,8 +439,12 @@ function dropChatUserTurn(clientId) {
 // already there. Replay re-emits every still-unanswered request on
 // reconnect, so this call is not proof of a first sighting.
 // `rememberable` is false for a request the server will never remember an
-// "always allow" for, so its card offers no such button.
-function addChatPermissionRequest(requestId, tool, input, suggestions, rememberable = true) {
+// "always allow" for, so its card offers no such button. `origin`, for a call
+// the human started from the page (an upload action), is `{action, by}`: the
+// action's label and the login of who started it (null for the token holder).
+function addChatPermissionRequest(
+  requestId, tool, input, suggestions, rememberable = true, origin = null,
+) {
   commit(() => {
     const chat = state.chat;
     if (chat.pending.some((p) => p.request_id === requestId)) return;
@@ -447,6 +454,7 @@ function addChatPermissionRequest(requestId, tool, input, suggestions, remembera
       input,
       suggestions: suggestions || null,
       rememberable: rememberable !== false,
+      origin: origin ? Object.freeze({ ...origin }) : null,
     });
     state = {
       ...state,
@@ -525,7 +533,72 @@ function clearChatBanner() {
 // turn number.
 function resetChatTurns() {
   commit(() => {
-    state = { ...state, chat: Object.freeze({ ...state.chat, turns: Object.freeze([]) }) };
+    state = {
+      ...state,
+      chat: Object.freeze({
+        ...state.chat, turns: Object.freeze([]), actionResults: Object.freeze([]),
+      }),
+    };
+  }, ["chat"]);
+}
+
+// The app's upload actions, from the hello: `[{name, label, accepts}]`.
+function setChatUploadActions(actions) {
+  commit(() => {
+    state = {
+      ...state,
+      chat: Object.freeze({ ...state.chat, uploadActions: Object.freeze([...(actions || [])]) }),
+    };
+  }, ["chat"]);
+}
+
+// A document uploaded for an upload action, in `documents`: `{id, name,
+// state, upload, bytes, actions, message}`, `state` 'uploading' | 'done' |
+// 'sent' | 'error'. Never part of a turn; the human starts an action on it.
+function reserveChatDocument(name) {
+  const id = nextAttachmentId++;
+  commit(() => {
+    const entry = Object.freeze({
+      id, name, state: "uploading", upload: null, bytes: null, actions: [], message: null,
+    });
+    state = {
+      ...state,
+      chat: Object.freeze({ ...state.chat, documents: Object.freeze([...state.chat.documents, entry]) }),
+    };
+  }, ["chat"]);
+  return id;
+}
+
+function updateChatDocument(id, fields) {
+  commit(() => {
+    const documents = Object.freeze(state.chat.documents.map(
+      (d) => (d.id === id ? Object.freeze({ ...d, ...fields }) : d)));
+    state = { ...state, chat: Object.freeze({ ...state.chat, documents }) };
+  }, ["chat"]);
+}
+
+function dropChatDocument(id) {
+  commit(() => {
+    const documents = Object.freeze(state.chat.documents.filter((d) => d.id !== id));
+    state = { ...state, chat: Object.freeze({ ...state.chat, documents }) };
+  }, ["chat"]);
+}
+
+// How an upload action ended (an `upload_action` event), once per id: part
+// of the conversation, so a replay adds what a live event already added only
+// once.
+function addChatActionResult(event) {
+  commit(() => {
+    const chat = state.chat;
+    if (chat.actionResults.some((r) => r.id === event.id)) return;
+    const entry = Object.freeze({
+      id: event.id, label: event.label, file: event.file, bytes: event.bytes,
+      tool: event.tool, outcome: event.outcome, text: event.text || "", by: event.by || null,
+    });
+    state = {
+      ...state,
+      chat: Object.freeze({ ...chat, actionResults: Object.freeze([...chat.actionResults, entry]) }),
+    };
   }, ["chat"]);
 }
 
@@ -616,6 +689,11 @@ export const store = Object.freeze({
   setChatAgentStatus,
   setChatModel,
   setChatUsage,
+  setChatUploadActions,
+  reserveChatDocument,
+  updateChatDocument,
+  dropChatDocument,
+  addChatActionResult,
   setChatBanner,
   clearChatBanner,
   resetChatTurns,

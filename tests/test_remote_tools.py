@@ -86,11 +86,14 @@ LATER = [
 
 class FakeRemote:
     """The fake remote, started on a free loopback port. ``calls`` are the
-    tools called, in order; ``stored`` what ``store`` kept; ``headers`` the
-    headers of every HTTP request it received."""
+    tools called, in order, and ``arguments`` what each was called with;
+    ``stored`` what ``store`` kept; ``headers`` the headers of every HTTP
+    request it received. ``submit`` answers with a job number, as a remote
+    taking a document does."""
 
     def __init__(self):
         self.calls = []
+        self.arguments = []
         self.stored = []
         self.headers = []
         server = Server("fake", instructions=INSTRUCTIONS)
@@ -104,6 +107,9 @@ class FakeRemote:
         @server.call_tool(validate_input=False)
         async def call_tool(name, arguments):
             self.calls.append(name)
+            self.arguments.append((name, arguments))
+            if name == "submit":
+                return [types.TextContent(type="text", text="job 123")]
             if name == "begin":
                 primed.add(id(server.request_context.session))
                 return [types.TextContent(type="text", text="welcome")]

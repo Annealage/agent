@@ -331,42 +331,52 @@ def _proxied(server, tool):
     name = tool.name
 
     async def handler(args):
-        # Set once the connection is initialized, just before tools/call is
-        # sent: a failure before it means the call never reached the remote,
-        # one after it that the remote may have acted on it.
-        sent = False
-        result = None
-        try:
-            with anyio.fail_after(CALL_TIMEOUT):
-                async with _session(server) as (session, _):
-                    sent = True
-                    result = await _call(session, name, args)
-        except Exception as exc:
-            if result is not None:
-                # Only closing the connection failed; the call itself answered.
-                return _result(server.name, name, result)
-            leaf = _leaf(exc)
-            if sent and isinstance(leaf, McpError):
-                return fail(
-                    "the %s MCP server refused %s: %s" % (server.name, name, leaf.error.message)
-                )
-            reason = _reason(leaf, CALL_TIMEOUT)
-            if reason is None:
-                raise
-            if sent:
-                return fail(
-                    "%s was sent to the %s MCP server but no answer came back (%s), so it "
-                    "may or may not have happened; check before retrying, and if it keeps "
-                    "failing, tell the human and carry on without it" % (name, server.name, reason)
-                )
-            return fail(
-                "%s did not run: the %s MCP server could not be reached (%s). Try again "
-                "shortly; if it keeps failing, tell the human and carry on without it"
-                % (name, server.name, reason)
-            )
-        return _result(server.name, name, result)
+        return await call(server, name, args)
 
     return SdkMcpTool(name=name, description=description, input_schema=schema, handler=handler)
+
+
+async def call(server, name, arguments):
+    """Call tool ``name`` on ``server`` (a ``RemoteServer``) with
+    ``arguments``, on a connection of its own, and return the result in
+    ``tools.ok``/``fail``'s shape: the remote's own failure, or one saying
+    whether the call reached the remote. Grades, gates and asks nothing;
+    that is the caller's (``_proxied``'s tool, wrapped by ``tools._wrap``, or
+    an upload action the human approved, ``uploads.py``)."""
+    # Set once the connection is initialized, just before tools/call is
+    # sent: a failure before it means the call never reached the remote,
+    # one after it that the remote may have acted on it.
+    sent = False
+    result = None
+    try:
+        with anyio.fail_after(CALL_TIMEOUT):
+            async with _session(server) as (session, _):
+                sent = True
+                result = await _call(session, name, arguments)
+    except Exception as exc:
+        if result is not None:
+            # Only closing the connection failed; the call itself answered.
+            return _result(server.name, name, result)
+        leaf = _leaf(exc)
+        if sent and isinstance(leaf, McpError):
+            return fail(
+                "the %s MCP server refused %s: %s" % (server.name, name, leaf.error.message)
+            )
+        reason = _reason(leaf, CALL_TIMEOUT)
+        if reason is None:
+            raise
+        if sent:
+            return fail(
+                "%s was sent to the %s MCP server but no answer came back (%s), so it "
+                "may or may not have happened; check before retrying, and if it keeps "
+                "failing, tell the human and carry on without it" % (name, server.name, reason)
+            )
+        return fail(
+            "%s did not run: the %s MCP server could not be reached (%s). Try again "
+            "shortly; if it keeps failing, tell the human and carry on without it"
+            % (name, server.name, reason)
+        )
+    return _result(server.name, name, result)
 
 
 def _result(server_name, tool_name, result):

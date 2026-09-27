@@ -9,6 +9,12 @@ Registers, against one served directory:
                                    (uploads, captured views, and anything a
                                    project already keeps there)
     POST /session/<sid>/export    renders that session's event log into review/
+    POST /upload/action           starts an upload action on a document
+                                   (``uploads.py``), when the app has any
+
+With upload actions, ``/upload`` also takes ``kind=document`` (and ``name``):
+a PDF, up to ``files.MAX_DOCUMENT_BYTES``, sniffed by ``files.sniff_document``
+and kept in the state directory, never under images/ and never served back.
 
 The export route deliberately does not go through the permission broker, while
 the ``export_transcript`` tool the model calls does. That asymmetry is the
@@ -81,6 +87,11 @@ class _Refused(Exception):
 # composer. It is also what an absent "kind" means.
 GENERIC_UPLOAD_KIND = "upload"
 
+# The kind of a document (a PDF) the human uploads for an upload action
+# (``uploads.py``): accepted only by an app that offers one, sniffed as a
+# document and kept in the state directory rather than under images/.
+DOCUMENT_UPLOAD_KIND = "document"
+
 # What a product's own upload kind may look like. The kind becomes the first
 # component of the written file's name (``files.create_unique_image_file``),
 # so it is held to a short lowercase slug that keeps every generated name
@@ -102,7 +113,7 @@ def check_product_upload_kinds(kinds):
     for kind in kinds:
         if not isinstance(kind, str) or not _PRODUCT_KIND_RE.fullmatch(kind):
             raise ValueError("product upload kind %r is not a short lowercase slug" % (kind,))
-        if kind == GENERIC_UPLOAD_KIND or kind in seen:
+        if kind in (GENERIC_UPLOAD_KIND, DOCUMENT_UPLOAD_KIND) or kind in seen:
             raise ValueError("product upload kind %r collides with another kind" % kind)
         seen.add(kind)
 
@@ -119,6 +130,10 @@ def upload_kinds():
 
 _ALLOWED_QUERY_KEYS = frozenset(("t", "kind"))
 
+# A document's upload also names the human's file, whose stem the stored name
+# keeps (``files.document_stem``), for the card and the call that sends it.
+_DOCUMENT_QUERY_KEYS = _ALLOWED_QUERY_KEYS | {"name"}
+
 
 def _query_values(req, key):
     """Every value ``key`` was given in ``req``'s query string, in order.
@@ -133,25 +148,29 @@ def _query_values(req, key):
     return [req.args[key]] if key in req.args else []
 
 
-def _upload_kind(req):
+def _upload_kind(req, allowed):
     """Return ``(kind, None)`` or ``(None, error)`` for this request's query string.
 
-    Only ``t`` and ``kind`` may appear, ``kind`` at most once and only from
-    ``upload_kinds()``; anything else is refused without reading any of the
-    body. Called only once the request is authenticated, so this whitelist
-    is never a way to probe the route unauthenticated.
+    Only ``t`` and ``kind`` may appear (and ``name``, for a document),
+    ``kind`` at most once and only from ``allowed``; anything else is refused
+    without reading any of the body. Called only once the request is
+    authenticated, so this whitelist is never a way to probe the route
+    unauthenticated.
     """
     keys = set(req.args.keys()) if hasattr(req.args, "keys") else set()
-    unknown = sorted(keys - _ALLOWED_QUERY_KEYS)
+    kind_values = _query_values(req, "kind")
+    kind = kind_values[0] if kind_values else GENERIC_UPLOAD_KIND
+    unknown = sorted(
+        keys - (_DOCUMENT_QUERY_KEYS if kind == DOCUMENT_UPLOAD_KIND else _ALLOWED_QUERY_KEYS)
+    )
     if unknown:
         return None, "unknown query parameter: %s" % ", ".join(unknown)
-    kind_values = _query_values(req, "kind")
     if len(kind_values) > 1:
         return None, "kind must not be given more than once"
-    allowed = upload_kinds()
-    kind = kind_values[0] if kind_values else GENERIC_UPLOAD_KIND
     if kind not in allowed:
         return None, "kind must be one of: %s" % ", ".join(allowed)
+    if len(_query_values(req, "name")) > 1:
+        return None, "name must not be given more than once"
     return kind, None
 
 
@@ -265,11 +284,15 @@ async def _file_or_same_404(target, ctype, method, request_key, expect_identity=
     return res
 
 
-def register_chat_routes(app, serve_dir, *, auth):
+def register_chat_routes(app, serve_dir, *, auth, upload_actions=()):
     """Register ``POST /upload``, ``GET /asset/<rel>`` and
     ``POST /session/<sid>/export`` on ``app``, the two POSTs gated by ``auth``
-    (``identity.BrowserAuth``)."""
+    (``identity.BrowserAuth``). ``upload_actions`` are the app's
+    ``uploads.UploadAction``s: with any, ``/upload`` also takes a document
+    one of them accepts (``DOCUMENT_UPLOAD_KIND``)."""
     serve_dir = files.resolve_serve_dir(serve_dir)
+    documents = sessions.state_dir(serve_dir) / files.DOCUMENTS_DIRNAME
+    kinds = upload_kinds() + ((DOCUMENT_UPLOAD_KIND,) if upload_actions else ())
 
     @app.post("/upload")
     async def upload(req):
@@ -278,9 +301,10 @@ def register_chat_routes(app, serve_dir, *, auth):
         if auth.authenticate(req) is None:
             return refusal()
 
-        kind, error = _upload_kind(req)
+        kind, error = _upload_kind(req, kinds)
         if error is not None:
             return {"ok": False, "error": error}, 400
+        document = kind == DOCUMENT_UPLOAD_KIND
 
         content_length = req.content_length
         if content_length <= 0:
@@ -288,11 +312,14 @@ def register_chat_routes(app, serve_dir, *, auth):
                 "ok": False,
                 "error": "Content-Length is required and must be greater than zero",
             }, 411
-        if content_length > files.MAX_IMAGE_BYTES:
+        limit, what = (
+            (files.MAX_DOCUMENT_BYTES, "document") if document else (files.MAX_IMAGE_BYTES, "image")
+        )
+        if content_length > limit:
             return {
                 "ok": False,
-                "error": "body is %d bytes, over the %d "
-                "byte image limit" % (content_length, files.MAX_IMAGE_BYTES),
+                "error": "body is %d bytes, over the %d byte %s limit"
+                % (content_length, limit, what),
             }, 413
 
         loop = asyncio.get_running_loop()
@@ -313,23 +340,34 @@ def register_chat_routes(app, serve_dir, *, auth):
             if not chunk:
                 break
             first += chunk
-        sniff = files.sniff_image(first)
+        if document:
+            sniff = files.sniff_document(first)
+            refused = "not a PDF; only a PDF (a file starting %PDF-) is accepted as a document"
+        else:
+            sniff = files.sniff_image(first)
+            refused = "not a recognised image; only PNG, JPEG and WEBP are accepted"
         if sniff is None:
-            return {
-                "ok": False,
-                "error": "not a recognised image; only PNG, JPEG and WEBP are accepted",
-            }, 415
+            return {"ok": False, "error": refused}, 415
         media_type, suffix = sniff
 
-        try:
-            created = await loop.run_in_executor(
-                None, files.create_unique_image_file, serve_dir, kind, suffix
+        if document:
+            names = _query_values(req, "name")
+            create = functools.partial(
+                files.create_unique_document_file,
+                documents,
+                files.document_stem(names[0] if names else ""),
             )
+            where = "the state directory's %s/" % files.DOCUMENTS_DIRNAME
+        else:
+            create = functools.partial(files.create_unique_image_file, serve_dir, kind, suffix)
+            where = "%s/" % files.IMAGES_DIRNAME
+        try:
+            created = await loop.run_in_executor(None, create)
         except FileExistsError:
             return {
                 "ok": False,
                 "error": "could not find a free name in "
-                "images/ after %d attempts" % files.UNIQUE_IMAGE_NAME_ATTEMPTS,
+                "%s after %d attempts" % (where, files.UNIQUE_IMAGE_NAME_ATTEMPTS),
             }, 500
         except OSError as exc:
             # A directory this process cannot write into, a full filesystem, a
@@ -340,8 +378,8 @@ def register_chat_routes(app, serve_dir, *, auth):
         if created is None:
             return {
                 "ok": False,
-                "error": "refusing to write: %s/ must be a "
-                "real directory this process can create a file in" % files.IMAGES_DIRNAME,
+                "error": "refusing to write: %s must be a "
+                "real directory this process can create a file in" % where,
             }, 500
         fd, target = created
 
@@ -361,6 +399,17 @@ def register_chat_routes(app, serve_dir, *, auth):
                 return {"ok": False, "error": exc.message}, exc.status
             raise
 
+        if document:
+            # Never served back: the page gets the id to name it by, the name
+            # to show, and the actions it can offer for it.
+            return {
+                "ok": True,
+                "upload": target.name,
+                "name": files.document_name(target.name),
+                "bytes": total,
+                "media_type": media_type,
+                "actions": [a.to_wire() for a in upload_actions if a.accepts == media_type],
+            }, 200
         return {
             "ok": True,
             "path": "images/%s" % target.name,
@@ -426,3 +475,48 @@ def register_chat_routes(app, serve_dir, *, auth):
             "format": fmt,
             "include": include,
         }, 200
+
+
+def register_upload_action_route(app, serve_dir, *, auth, actions, begin):
+    """Register ``POST /upload/action``, body ``{"upload": <id>, "action":
+    <name>}``: the human starting one of ``actions`` (``uploads.UploadAction``)
+    on a document they uploaded. Gated by ``auth`` like every browser POST,
+    ``Origin`` included, so the agent token never opens it. ``begin(action,
+    upload, human)`` is the app's: it returns None once the action is under
+    way (its card raised, its end published as ``upload_action``), or
+    ``(message, status)`` refusing it. Answers 202 once begun."""
+    from .. import uploads
+
+    by_name = {action.name: action for action in actions}
+    documents = sessions.state_dir(files.resolve_serve_dir(serve_dir)) / files.DOCUMENTS_DIRNAME
+
+    @app.post("/upload/action")
+    async def upload_action(req):
+        human = auth.authenticate(req)
+        if human is None:
+            return refusal()
+        data, error = await read_json_body(req)
+        if error is not None:
+            return error
+        if not isinstance(data, dict) or set(data) != {"upload", "action"}:
+            return {"ok": False, "error": 'body must be {"upload": ..., "action": ...}'}, 400
+        action = by_name.get(data["action"]) if isinstance(data["action"], str) else None
+        if action is None:
+            return {"ok": False, "error": "no upload action %r" % (data["action"],)}, 404
+        upload_id = data["upload"]
+        loop = asyncio.get_running_loop()
+        upload = None
+        if isinstance(upload_id, str):
+            upload = await loop.run_in_executor(None, uploads.find_upload, documents, upload_id)
+        if upload is None:
+            return {"ok": False, "error": "no upload %r" % (upload_id,)}, 404
+        if upload.media_type != action.accepts:
+            return {
+                "ok": False,
+                "error": "%s takes %s, not %s" % (action.label, action.accepts, upload.media_type),
+            }, 400
+        refused = await begin(action, upload, human)
+        if refused is not None:
+            message, status = refused
+            return {"ok": False, "error": message}, status
+        return {"ok": True}, 202

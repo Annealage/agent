@@ -34,9 +34,9 @@ import time
 
 from microdot import Microdot, Request
 
-from . import net, product, protocol, sessions
+from . import files, net, product, protocol, sessions, uploads
 from . import settings as settings_module
-from .http.routes_chat import register_chat_routes
+from .http.routes_chat import register_chat_routes, register_upload_action_route
 from .http.routes_login import LoginNonces, register_login_routes, register_whoami_route
 from .http.routes_logs import register_log_routes
 from .http.routes_mcp import register_mcp_routes
@@ -95,8 +95,7 @@ _URL_PREFIX_RE = re.compile(r"(?:/[A-Za-z0-9_~-]+)*")
 # on its /submit (microdot's 16 KiB default caps a submission at roughly 68
 # pins of the {id, part, label, point, normal, faceIndex, comment} shape its
 # viewer sends): a 400-pin submission measures about 84 KB, so 8 MiB is far more
-# headroom than the real payload needs, and it matches files.MAX_IMAGE_BYTES,
-# the separate cap /upload enforces on itself. The actual exposure of that
+# headroom than the real payload needs (the value is set below). The actual exposure of that
 # headroom is per in-flight request, not aggregate: microdot imposes no cap
 # on concurrent connections and no read timeout, so N slow or stalled
 # clients each declaring a large Content-Length can together hold open N
@@ -119,7 +118,12 @@ _URL_PREFIX_RE = re.compile(r"(?:/[A-Za-z0-9_~-]+)*")
 # nothing and carry on. So on every app this module builds, a request with a
 # body is a StreamedRequest, whose three raise instead, naming
 # http.read_json_body (install_response_handlers).
-MAX_REQUEST_BODY = 8 * 1024 * 1024
+#
+# The cap is the larger of the two /upload enforces on itself, an image's
+# (files.MAX_IMAGE_BYTES) and a document's for an upload action
+# (files.MAX_DOCUMENT_BYTES, 30 MiB), since microdot answers anything over it
+# before a route can look.
+MAX_REQUEST_BODY = max(files.MAX_IMAGE_BYTES, files.MAX_DOCUMENT_BYTES)
 
 
 def configure_request_limits():
@@ -230,6 +234,7 @@ def create_app(
     idle_timeout=None,
     identity=None,
     start_closed=False,
+    upload_actions=(),
 ):
     """Build a Microdot app serving ``serve_dir``, routes registered, not started.
 
@@ -344,6 +349,13 @@ def create_app(
     front door serving many workspaces, most of them unopened at any one
     time. A viewer-only app has no session to put off, and ignores it.
 
+    ``upload_actions`` are ``uploads.UploadAction``s: what the human can do
+    with a document they upload from the chat pane (submit a datasheet to a
+    remote MCP server, say), each call put in front of them as a permission
+    card and its result queued for the agent (``uploads.py``). Each names a
+    remote the product's tool server declares, which is checked here. An app
+    with no agent (viewer-only, and not ``external_agents``) offers none.
+
     Building an app blocks: the product's tool server connects to its remote
     MCP servers (up to ``remote.DISCOVERY_TIMEOUT`` each) and the event log is
     read back from disk. Nothing here needs a running event loop, so a
@@ -376,6 +388,8 @@ def create_app(
     allowed_origins = net.allowed_origins(bind, port, extra_origins)
     allowed_hosts = net.allowed_hosts(bind, port, extra_hosts)
     auth = BrowserAuth(token, identity, allowed_origins=allowed_origins)
+    agent_mode = session_id is not None or external_agents
+    upload_actions = uploads.check_upload_actions(upload_actions) if agent_mode else ()
     installed = product.current()
     server_header = installed.server_header
     if (session_id is not None or external_agents) and installed.build_tools is None:
@@ -395,7 +409,7 @@ def create_app(
 
     if register_routes is not None:
         register_routes(app, allowed_origins)
-    register_chat_routes(app, serve_dir, auth=auth)
+    register_chat_routes(app, serve_dir, auth=auth, upload_actions=upload_actions)
     register_agent_static_routes(app)
     app.agent_login = login if login is not None else LoginNonces()
     register_login_routes(app, token=token, nonces=app.agent_login, allowed_origins=allowed_origins)
@@ -489,8 +503,9 @@ def create_app(
     # The run's settings reach it the same way, so a product key can shape
     # the tools (Annealage Loom's remote MCP server URL, say).
     bus.settings = settings
-    if session_id is not None or external_agents:
+    if agent_mode:
         tools = installed.build_tools(bus, serve_dir, session_id)
+        uploads.check_upload_actions(upload_actions, tools)
     # ``bus`` is the one object both this function and the CLI's
     # ``build_session`` closure already share, so it doubles as the wiring
     # seam between them in both directions without widening
@@ -522,6 +537,8 @@ def create_app(
         # written back here is what makes it stay one that is current).
         "model": settings.get("model"),
         "steers": False,
+        # What the human can do with an uploaded document (uploads.py).
+        "upload_actions": [action.to_wire() for action in upload_actions],
         # The conversation's usage so far (``Usage.snapshot``), for the
         # hello: the last the log recorded until the backend reports afresh,
         # then kept live by ``_event_publisher``.
@@ -637,6 +654,44 @@ def create_app(
     # Listed from whatever session is live; a viewer-only run still answers,
     # with nothing to list.
     register_log_routes(app, current_session=lambda: holder.session, auth=auth)
+
+    if upload_actions:
+        publish_action = _event_publisher(registry, event_log)
+        # Held until each ends, so a running action is not collected mid-way.
+        running_actions = set()
+
+        async def _begin_upload_action(action, upload, human):
+            await holder.ensure()
+            holder.note_activity()
+            broker = bus.broker
+            if broker is None:
+                return "no agent session is running here to put this in front of you", 409
+            try:
+                args = uploads.call_args(action, upload, human)
+            except ValueError as exc:
+                return str(exc), 400
+            except Exception as exc:
+                sys.stderr.write("error: upload action %s: %r\n" % (action.name, exc))
+                return "%s is broken in %s: %s" % (action.label, installed.name, exc), 500
+            task = asyncio.ensure_future(
+                uploads.run(
+                    action,
+                    upload,
+                    human,
+                    args,
+                    broker=broker,
+                    server=tools.remote_servers[action.tool[0]],
+                    publish=publish_action,
+                    queue_note=bus.queue_note,
+                )
+            )
+            running_actions.add(task)
+            task.add_done_callback(running_actions.discard)
+            return None
+
+        register_upload_action_route(
+            app, serve_dir, auth=auth, actions=upload_actions, begin=_begin_upload_action
+        )
 
     register_ws(
         app,

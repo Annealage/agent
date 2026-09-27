@@ -416,6 +416,8 @@ _KIND_MIN_INCLUDE = {
     "permission_request": "full",
     "permission_resolved": "full",
     "turn_end": "full",
+    # Something the human did from the page, which the agent was told of.
+    "upload_action": "text",
 }
 
 
@@ -535,6 +537,21 @@ def _render_markdown(kept: list, include: str, session_id, project_dir, exported
             lines.append("Permission requested: %s" % event.get("tool", ""))
         elif kind == "permission_resolved":
             lines.append("Permission resolved: %s" % event.get("outcome", ""))
+        elif kind == "upload_action":
+            lines.append("")
+            lines.append(
+                "> **Human:** used %s on %s (%s, %s)"
+                % (
+                    event.get("label", ""),
+                    event.get("file", ""),
+                    event.get("tool", ""),
+                    event.get("outcome", ""),
+                )
+            )
+            if full and event.get("text"):
+                lines.append("```")
+                lines.append(event["text"])
+                lines.append("```")
         elif kind == "turn_end":
             cost = event.get("cost_usd")
             cost = cost if isinstance(cost, (int, float)) else 0.0

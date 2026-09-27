@@ -191,6 +191,7 @@ def register_ws(
                             session_info.get("agent_error") if agent != AGENT_READY else None
                         ),
                         usage=session_info.get("usage"),
+                        upload_actions=session_info.get("upload_actions"),
                     )
                 )
             )

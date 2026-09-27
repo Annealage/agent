@@ -39,6 +39,20 @@
    cost, every figure in its tooltip. */
 .chatusage { font-size: 11px; color: #9aa; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .chatusage[hidden] { display: none; }
+/* A PDF uploaded for an upload action (chat.js): a wider chip with its name,
+   its state and a button per action, never part of the message. */
+.attachchip.docchip { width: auto; height: auto; min-height: 36px; padding: 4px 26px 4px 8px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 11px; color: #cdd; }
+.docchip .docname { font-weight: 600; }
+.docchip .docstatus { color: #9aa; }
+.docchip .docactions button { font-size: 11px; padding: 2px 8px; }
+/* A permission card for a call the human started from the page. */
+.porigin { font-size: 11px; color: #e0c07f; margin-bottom: 4px; }
+.porigin[hidden] { display: none; }
+/* How an upload action ended, in the conversation. */
+.msg.action { border-left: 3px solid #2f4a5c; padding: 4px 8px; font-size: 12px; color: #cdd; }
+.msg.action[data-outcome="failed"] { border-left-color: #5c2f2f; }
+.msg.action[data-outcome="denied"] { border-left-color: #3a3f47; color: #9aa; }
+.msg.action .actionhead { font-weight: 600; }
 
 .chathint { flex: none; padding: 0 14px 8px; color: #778; font-size: 11px; }
 

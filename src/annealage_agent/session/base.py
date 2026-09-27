@@ -180,8 +180,14 @@ class PermissionRequest(AgentEvent):
     """A tool call waiting on the human's decision (``PermissionBroker.ask``).
 
     ``rememberable`` is ``False`` for a request the broker will never
-    remember an "always allow" for (its ``never_remembered`` names), so the
-    pane offers no such button; absent otherwise.
+    remember an "always allow" for (its ``never_remembered`` names, or a call
+    the human started), so the pane offers no such button; absent otherwise.
+
+    ``action``, on a call the human started from the page rather than one
+    the agent made (an upload action, ``uploads.py``), is that action's
+    label, and ``by`` the login of the human who started it (unset for the
+    browser token's holder). The card says so, since the human is approving
+    what leaves the page on their own behalf.
     """
 
     kind: ClassVar[str] = "permission_request"
@@ -190,6 +196,37 @@ class PermissionRequest(AgentEvent):
     input: dict
     suggestions: list = dataclasses.field(default_factory=list)
     rememberable: Optional[bool] = None
+    viewer: Optional[str] = None
+    action: Optional[str] = None
+    by: Optional[str] = None
+
+
+#: How an upload action ended (``UploadActionEnded.outcome``): the call ran
+#: and answered, the call ran and failed (or never reached the server), or
+#: the human (or the broker, on a timeout) did not approve it.
+ACTION_DONE = "done"
+ACTION_FAILED = "failed"
+ACTION_DENIED = "denied"
+
+
+@dataclasses.dataclass(frozen=True)
+class UploadActionEnded(AgentEvent):
+    """An action the human started on an uploaded file ended
+    (``uploads.py``): which (``label``), on what (``file``, ``bytes``), the
+    call it made (``tool``, as the card named it), ``outcome`` (one of the
+    ``ACTION_`` values) and ``text``, what the call answered or why it did not
+    run. ``by`` is the login of the human who started it. ``id`` is the
+    action's own, so a page adds it to the conversation once."""
+
+    kind: ClassVar[str] = "upload_action"
+    id: str
+    label: str
+    file: str
+    bytes: int
+    tool: str
+    outcome: str
+    text: str
+    by: Optional[str] = None
     viewer: Optional[str] = None
 
 
@@ -481,6 +518,7 @@ GENERIC_EVENTS = (
     ReviewChanged,
     Attention,
     UserTurn,
+    UploadActionEnded,
 )
 
 #: The installed product's event classes; see ``register_product_events``.

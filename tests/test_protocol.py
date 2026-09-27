@@ -148,6 +148,8 @@ def test_build_hello_round_trips():
             "steers": False,
             # Present and null until the backend has reported any usage.
             "usage": None,
+            # Empty unless the product offers something to do with an upload.
+            "upload_actions": [],
         },
         "protocol": PROTOCOL_VERSION,
     }

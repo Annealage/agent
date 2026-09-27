@@ -84,3 +84,63 @@ export async function uploadImage(blob, kind) {
   });
   return store.getState().chat.attachments.find((a) => a.id === id) || null;
 }
+
+/**
+ * Uploads a PDF for the app's upload actions (`kind=document`, with the
+ * file's own name), recording it in `state.chat.documents`, never in the
+ * message's attachments: it goes nowhere until the human starts an action
+ * on it. The server keeps it out of the project and never serves it back.
+ */
+export async function uploadDocument(file) {
+  const id = store.reserveChatDocument(file.name);
+  const base = withToken(appUrl("upload"));
+  const url = base + (base.includes("?") ? "&" : "?") + "kind=document&name="
+    + encodeURIComponent(file.name);
+  let res;
+  let data = null;
+  try {
+    res = await fetch(url, { method: "POST", body: file });
+    data = await res.json();
+  } catch (err) {
+    // A network failure, or the text/plain refusal (see uploadImage).
+  }
+  if (!res || !res.ok || !data || !data.ok) {
+    const message = (data && data.error) || UPLOAD_FAILED_MESSAGE;
+    store.updateChatDocument(id, { state: "error", message: "Upload failed" });
+    toast(message, false);
+    return null;
+  }
+  store.updateChatDocument(id, {
+    state: "done", upload: data.upload, name: data.name, bytes: data.bytes,
+    actions: data.actions || [],
+  });
+  return id;
+}
+
+/**
+ * Starts upload action `action` (its name) on document `id`: the server puts
+ * the call in front of the human as a permission card, and its end arrives as
+ * an `upload_action` event.
+ */
+export async function startUploadAction(id, action) {
+  const doc = store.getState().chat.documents.find((d) => d.id === id);
+  if (!doc || !doc.upload) return;
+  const label = (doc.actions.find((a) => a.name === action) || {}).label || action;
+  let res;
+  let data = null;
+  try {
+    res = await fetch(withToken(appUrl("upload/action")), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ upload: doc.upload, action }),
+    });
+    data = await res.json();
+  } catch (err) {
+    // As above.
+  }
+  if (!res || !res.ok || !data || !data.ok) {
+    toast((data && data.error) || label + " could not be started. Try again.", false);
+    return;
+  }
+  store.updateChatDocument(id, { state: "sent", message: label + ": approve or deny the card" });
+}

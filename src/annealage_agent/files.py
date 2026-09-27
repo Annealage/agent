@@ -10,12 +10,15 @@ What it provides is independent of what a product serves: resolving the
 served directory, joining a URL-supplied path under it without escaping it,
 reading and appending to the product's fixed-name exchange files (the names
 themselves are the product's, see e.g. Mesh's ``paths.py``), replacing a file
-atomically, sniffing an image from its bytes, and creating the two kinds of
-file the agent layer itself writes into a project:
+atomically, sniffing an image from its bytes, and creating the kinds of file
+the agent layer itself writes:
 
     images/*.png          created by ``create_image_file`` for a captured view
                           or an upload
     review/*.md,*.jsonl   created by ``create_review_file`` for a transcript
+    <state dir>/uploads/*.pdf
+                          created by ``create_unique_document_file`` for a
+                          document the human uploads for an upload action
 
 It also indexes a packaged static tree (``scan_static``, ``StaticIndex``): the
 agent layer's own front end under ``static/`` and a product's page and
@@ -106,9 +109,8 @@ _REVIEW_FILE_MODE = 0o644
 # inline turn block. Equal to review_tools.MAX_SNAPSHOT_BYTES, since both
 # bound one image landing in images/ as git-tracked evidence, and no larger
 # than app.MAX_REQUEST_BODY, which bounds a whole request body for every
-# route in the process. The two constants are equal today, which is why an
-# oversized upload's Content-Length is answered by microdot's own 413
-# before a route ever consults this one.
+# route in the process (the larger document cap, MAX_DOCUMENT_BYTES, sets
+# that), so /upload answers an oversized image itself.
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
 # Cap on one image copied *into a turn* as an inline base64 block, which is a
@@ -164,6 +166,58 @@ def sniff_image(head):
     if head[0:4] == b"RIFF" and head[8:12] == b"WEBP":
         return "image/webp", ".webp"
     return None
+
+
+#: Where an uploaded document is kept, under the product's state directory
+#: rather than the served tree: it exists for an upload action to send
+#: somewhere (``uploads.py``), not as evidence in the project, so it is neither
+#: committed nor served back, and never executed or rendered here.
+DOCUMENTS_DIRNAME = "uploads"
+
+#: Cap on one uploaded document. A datasheet runs to a few megabytes and a
+#: long reference manual to a few tens.
+MAX_DOCUMENT_BYTES = 30 * 1024 * 1024
+
+_PDF_MAGIC = b"%PDF-"
+
+#: A document's name as ``create_unique_document_file`` writes it: a stamp and
+#: a random suffix this process chose, then the stem of the human's own file
+#: name made safe (``document_stem``). The name is the upload's id, and this
+#: pattern is the whole containment check on an id a page sends back.
+_DOCUMENT_NAME_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}-([A-Za-z0-9][A-Za-z0-9._-]{0,63})\.pdf$")
+
+#: Mode for an uploaded document: the human's file, kept for this process
+#: alone, unlike the images and transcripts meant to be committed.
+_DOCUMENT_FILE_MODE = 0o600
+
+
+def sniff_document(head):
+    """``("application/pdf", ".pdf")`` if ``head`` begins a PDF, else None:
+    decided by the bytes, never by a client's label, as ``sniff_image``
+    decides an image."""
+    if head.startswith(_PDF_MAGIC):
+        return "application/pdf", ".pdf"
+    return None
+
+
+def document_stem(name):
+    """The stem of a client's file name, made safe to be part of a file name
+    here: the last path component, without a ``.pdf`` suffix, every run of
+    characters other than letters, digits, ``.``, ``_`` and ``-`` made one
+    ``-``, no leading punctuation, at most 64 characters, and ``document``
+    when nothing is left."""
+    base = re.split(r"[\\/]", name or "")[-1]
+    if base.lower().endswith(".pdf"):
+        base = base[:-4]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", base).lstrip("._-")[:64].rstrip("._-")
+    return stem or "document"
+
+
+def document_name(upload_id):
+    """The name the human's file went by (``<stem>.pdf``), for the upload
+    whose id is ``upload_id``, or None when ``upload_id`` is not one."""
+    match = _DOCUMENT_NAME_RE.match(upload_id or "")
+    return match.group(1) + ".pdf" if match else None
 
 
 def resolve_serve_dir(path):
@@ -556,6 +610,93 @@ def create_review_file(serve_dir, name):
             pass
         return None
     return fd, target
+
+
+def create_unique_document_file(directory, stem):
+    """Create a fresh, server-named document under ``directory`` (the state
+    directory's ``DOCUMENTS_DIRNAME``) for writing: ``(fd, target)``, or None
+    when ``directory`` is not a real directory this process can create a file
+    in. Raises ``FileExistsError`` when every one of
+    ``UNIQUE_IMAGE_NAME_ATTEMPTS`` names is taken.
+
+    ``stem`` is ``document_stem``'s, and the name
+    ``<%Y%m%d-%H%M%S>-<8 hex chars>-<stem>.pdf``, which is the upload's id
+    (``_DOCUMENT_NAME_RE``). ``directory`` is created if absent and refused
+    if it is a symlink, and its identity is checked around the open, as
+    ``create_review_file`` checks ``review/``."""
+    directory = Path(directory)
+    if directory.is_symlink():
+        return None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        before = os.stat(directory, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(before.st_mode):
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    name = None
+    for _attempt in range(UNIQUE_IMAGE_NAME_ATTEMPTS):
+        name = "%s-%s-%s.pdf" % (stamp, secrets.token_hex(4), stem)
+        if not _DOCUMENT_NAME_RE.match(name):
+            return None
+        target = directory / name
+        try:
+            fd = os.open(target, flags, _DOCUMENT_FILE_MODE)
+        except FileExistsError:
+            continue
+        try:
+            after = os.stat(directory, follow_symlinks=False)
+        except OSError:
+            after = None
+        if after is None or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+            os.close(fd)
+            try:
+                os.unlink(target)
+            except OSError:
+                pass
+            return None
+        return fd, target
+    raise FileExistsError(name)
+
+
+def open_document(directory, upload_id):
+    """``(path, size)`` of the document ``upload_id`` names under
+    ``directory``, or None when the id is not one this package writes, or
+    nothing a document should be is there: not a regular file, or a file with
+    a second link (``safe_join``'s reasons)."""
+    if document_name(upload_id) is None:
+        return None
+    target = Path(directory) / upload_id
+    try:
+        st = os.stat(target, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        return None
+    return target, st.st_size
+
+
+def read_document(path, size):
+    """The bytes of the document at ``path``, opened without following a
+    link and read no further than ``size`` (what ``open_document`` saw), or
+    ``OSError``."""
+    fd = os.open(path, os.O_RDONLY | OPEN_GUARD_FLAGS)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("%s is not a regular file" % path)
+        chunks = []
+        remaining = size
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def safe_join(base, rel):

@@ -145,6 +145,7 @@ def build_hello(
     steers: bool = False,
     agent_error: Optional[dict] = None,
     usage: Optional[dict] = None,
+    upload_actions: Optional[list] = None,
 ) -> dict:
     """The greeting sent once, immediately after a successful upgrade.
 
@@ -183,6 +184,10 @@ def build_hello(
     ``tokens``, ``context``), or None before the backend has said anything.
     A page shows it from here and from live ``usage`` events, never from a
     replayed one, which is older than this.
+
+    ``upload_actions`` are what the human can do with a document they upload
+    (``uploads.UploadAction.to_wire``: ``name``, ``label``, ``accepts``), so
+    the pane's attach button takes a PDF only when some action does.
     """
     return {
         "v": PROTOCOL_VERSION,
@@ -198,6 +203,7 @@ def build_hello(
             "paused": bool(paused),
             "steers": bool(steers),
             "usage": usage,
+            "upload_actions": list(upload_actions or ()),
         },
         "protocol": PROTOCOL_VERSION,
     }

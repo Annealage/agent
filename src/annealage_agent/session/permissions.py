@@ -240,7 +240,15 @@ class PermissionBroker:
 
     # -- can_use_tool itself ----------------------------------------------
 
-    async def ask(self, tool_name: str, input_data: dict, context: Any) -> Decision:
+    async def ask(
+        self,
+        tool_name: str,
+        input_data: dict,
+        context: Any,
+        *,
+        action: Optional[str] = None,
+        by: Optional[str] = None,
+    ) -> Decision:
         """The ``can_use_tool`` callback: every backend's session adapter
         calls this directly and converts the ``Decision`` it returns into
         whatever its own SDK expects (``session/sdk.py``'s
@@ -261,6 +269,14 @@ class PermissionBroker:
         ``permission_request`` event this method emits, which does not
         currently carry them (plan section 3.3's wire example has none).
 
+        ``action`` is set for a call the human started from the page rather
+        than one the agent made (an upload action's label, ``uploads.py``),
+        and ``by`` to the login of the human who started it. Such a call is
+        always asked: no standing grant for ``tool_name`` answers it, since
+        the grant was given to the agent and the card is how the human sees
+        what leaves the page, and no "always allow" is offered or kept for
+        it. Both reach the card on the ``PermissionRequest``.
+
         Every branch below returns a ``Decision``, and the two checks
         before a request is ever created (already granted, no viewer to
         ask) run with no ``await`` between them and this method's entry, so
@@ -269,7 +285,11 @@ class PermissionBroker:
         """
         if self._shutdown:
             return Decision(allow=False, message=_deny_message(_DENY_SHUTDOWN_TEMPLATE))
-        if tool_name in self._granted_tools and tool_name not in self._never_remembered:
+        if (
+            action is None
+            and tool_name in self._granted_tools
+            and tool_name not in self._never_remembered
+        ):
             return Decision(allow=True, remember_tool=tool_name)
         if self._viewer_count == 0:
             return Decision(allow=False, message=self._no_viewer_message())
@@ -283,7 +303,11 @@ class PermissionBroker:
             input=input_data,
             # Absent (None) rather than True for an ordinary request, so the
             # wire shape of every request that can be remembered is unchanged.
-            rememberable=False if tool_name in self._never_remembered else None,
+            rememberable=(
+                False if action is not None or tool_name in self._never_remembered else None
+            ),
+            action=action,
+            by=by,
         )
         self._pending[request_id] = future
         self._open[request_id] = event
@@ -382,7 +406,10 @@ class PermissionBroker:
             )
         event = self._open.get(request_id)
         tool_name = event.tool if event is not None else ""
-        result, grant = _build_result(tool_name, decision, message, self._never_remembered)
+        never_remembered = self._never_remembered
+        if event is not None and event.action is not None:
+            never_remembered = never_remembered | {tool_name}
+        result, grant = _build_result(tool_name, decision, message, never_remembered)
         self._outcomes[request_id] = decision
         if by is not None:
             self._deciders[request_id] = by

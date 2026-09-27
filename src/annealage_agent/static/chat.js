@@ -46,7 +46,7 @@
 
 import { initAttention, notifyAttention } from "./attention.js";
 import { store } from "./store.js";
-import { uploadImage } from "./uploads.js";
+import { startUploadAction, uploadDocument, uploadImage } from "./uploads.js";
 import { toast } from "./ui.js";
 import { appUrl } from "./url.js";
 import { whoami, withToken } from "./ws.js";
@@ -61,15 +61,42 @@ import { whoami, withToken } from "./ws.js";
 // and named either way, so that is not a reason to refuse it here.
 const ACCEPTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp"];
 const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+// A PDF, taken only when the app offers an upload action for one (the
+// hello's `upload_actions`), up to `files.MAX_DOCUMENT_BYTES`.
+const MAX_DOCUMENT_BYTES = 30 * 1024 * 1024;
 
-function localAttachmentRefusal(file) {
+function isPdf(file) {
+  return file.type === "application/pdf" || /\.pdf$/i.test(file.name || "");
+}
+
+function localAttachmentRefusal(file, pdfTaken) {
+  if (isPdf(file) && pdfTaken) {
+    return file.size > MAX_DOCUMENT_BYTES
+      ? file.name + " is larger than the 30 MB document limit" : null;
+  }
   if (!ACCEPTED_IMAGE_TYPES.includes(file.type)) {
-    return file.name + ": only PNG, JPEG or WEBP images can be attached";
+    return file.name + (pdfTaken
+      ? ": only PNG, JPEG or WEBP images, or a PDF, can be attached"
+      : ": only PNG, JPEG or WEBP images can be attached");
   }
   if (file.size > MAX_ATTACHMENT_BYTES) {
     return file.name + " is larger than the 8 MB upload limit";
   }
   return null;
+}
+
+// How an upload action ended, as its row in the conversation says it.
+const ACTION_OUTCOME = Object.freeze({
+  done: "sent",
+  failed: "failed",
+  denied: "not sent",
+});
+
+// `n` bytes for a person, as the server's `uploads.size_text` says them.
+function sizeText(n) {
+  if (n < 1024) return n + " bytes";
+  if (n < 1024 * 1024) return Math.round(n / 1024) + " KB";
+  return (n / (1024 * 1024)).toFixed(1) + " MB";
 }
 
 // What a card shows while its decision is in flight, keyed by the decision
@@ -470,7 +497,8 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
   }
 
   function renderAttachStrip(chat) {
-    const keys = chat.attachments.map((a) => "att:" + a.id);
+    const keys = chat.attachments.map((a) => "att:" + a.id)
+      .concat(chat.documents.map((d) => "doc:" + d.id));
     chatAttachStripEl.hidden = keys.length === 0;
     chat.attachments.forEach((att) => {
       const key = "att:" + att.id;
@@ -482,10 +510,96 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
       }
       updateAttachChip(rec, att);
     });
+    chat.documents.forEach((doc) => {
+      const key = "doc:" + doc.id;
+      let rec = attachEls.get(key);
+      if (!rec) {
+        rec = buildDocumentChip();
+        attachEls.set(key, rec);
+        chatAttachStripEl.appendChild(rec.chip);
+      }
+      updateDocumentChip(rec, doc);
+    });
     for (const [key, rec] of attachEls) {
       if (!keys.includes(key)) {
         rec.chip.remove();
         attachEls.delete(key);
+      }
+    }
+  }
+
+  // A PDF uploaded for the app's upload actions: its name and size, a button
+  // per action (the server puts the call in front of the human as a card),
+  // and what happened. It is never part of the message.
+  function buildDocumentChip() {
+    const chip = document.createElement("div");
+    chip.className = "attachchip docchip";
+    const nameEl = document.createElement("span");
+    nameEl.className = "docname";
+    const statusEl = document.createElement("span");
+    statusEl.className = "docstatus";
+    const actionsEl = document.createElement("span");
+    actionsEl.className = "docactions";
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "attachremove";
+    removeBtn.textContent = "×";
+    removeBtn.setAttribute("aria-label", "Remove document");
+    chip.append(nameEl, statusEl, actionsEl, removeBtn);
+    return { chip, nameEl, statusEl, actionsEl, removeBtn, drawn: "" };
+  }
+
+  function updateDocumentChip(rec, doc) {
+    rec.chip.classList.toggle("error", doc.state === "error");
+    rec.nameEl.textContent = doc.name + (doc.bytes ? " (" + sizeText(doc.bytes) + ")" : "");
+    rec.statusEl.textContent = doc.state === "uploading" ? "Uploading…" : (doc.message || "");
+    const drawn = doc.state + ":" + doc.actions.map((a) => a.name).join(",");
+    if (rec.drawn !== drawn) {
+      rec.drawn = drawn;
+      rec.actionsEl.replaceChildren();
+      if (doc.state === "done" || doc.state === "sent") {
+        doc.actions.forEach((action) => {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.textContent = action.label;
+          btn.addEventListener("click", () => startUploadAction(doc.id, action.name));
+          rec.actionsEl.appendChild(btn);
+        });
+      }
+    }
+    rec.removeBtn.hidden = doc.state === "uploading";
+    rec.removeBtn.onclick = () => store.dropChatDocument(doc.id);
+  }
+
+  // How each upload action ended, as a row in the conversation, in the order
+  // they ended. id -> row.
+  const actionEls = new Map();
+
+  function renderActionResults(chat) {
+    chat.actionResults.forEach((result) => {
+      if (actionEls.has(result.id)) return;
+      const row = document.createElement("div");
+      row.className = "msg action";
+      row.dataset.outcome = result.outcome;
+      const head = document.createElement("div");
+      head.className = "actionhead";
+      head.textContent = (result.by || "You") + ": " + result.label + ", " + result.file
+        + " (" + sizeText(result.bytes) + ") to " + shortToolName(result.tool) + ": "
+        + (ACTION_OUTCOME[result.outcome] || result.outcome);
+      row.appendChild(head);
+      if (result.text) {
+        const body = document.createElement("pre");
+        body.className = "toolresult";
+        body.textContent = result.text;
+        row.appendChild(body);
+      }
+      actionEls.set(result.id, row);
+      chatLogEl.appendChild(row);
+    });
+    for (const [id, row] of actionEls) {
+      if (!chat.actionResults.some((r) => r.id === id)) {
+        row.remove();
+        actionEls.delete(id);
       }
     }
   }
@@ -496,14 +610,27 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
   // upload never leaves the human wondering whether the drop or paste was
   // even noticed.
   function handleFile(file) {
-    const refusal = localAttachmentRefusal(file);
+    const pdfTaken = acceptsPdf();
+    const refusal = localAttachmentRefusal(file, pdfTaken);
     if (refusal) {
       toast(refusal, false);
       return;
     }
     // Not awaited: several files dropped at once each get their chip and their
     // request straight away, and each lands in the slot it reserved here.
-    uploadImage(file, "upload");
+    if (pdfTaken && isPdf(file)) uploadDocument(file);
+    else uploadImage(file, "upload");
+  }
+
+  function acceptsPdf() {
+    return store.getState().chat.uploadActions.some((a) => a.accepts === "application/pdf");
+  }
+
+  // The picker offers a PDF only while some upload action takes one; the
+  // page's own `accept` is what it offers otherwise.
+  const baseAccept = chatFileInput.getAttribute("accept") || ACCEPTED_IMAGE_TYPES.join(",");
+  function renderFileAccept() {
+    chatFileInput.setAttribute("accept", acceptsPdf() ? baseAccept + ",application/pdf" : baseAccept);
   }
 
   chatAttachBtn.addEventListener("click", () => chatFileInput.click());
@@ -675,9 +802,17 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
 
     const toolEl = document.createElement("div");
     toolEl.className = "ptool";
+    // For a call the human started from the page (an upload action): says so,
+    // since it is their own file leaving, not the agent's call.
+    const originEl = document.createElement("div");
+    originEl.className = "porigin";
+    originEl.hidden = !req.origin;
+    if (req.origin) {
+      originEl.textContent = req.origin.action + ", started from this page by "
+        + (req.origin.by || "the holder of this page's link");
+    }
     const inputEl = document.createElement("pre");
     inputEl.className = "toolinput";
-
     const actions = document.createElement("div");
     actions.className = "pactions";
     const allowBtn = document.createElement("button");
@@ -689,7 +824,9 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     allowAlwaysBtn.textContent = "Always allow (this project)";
     const reasonEl = document.createElement("textarea");
     reasonEl.className = "preason";
-    reasonEl.placeholder = "Reason (sent to the agent if you deny)";
+    // The agent hears a denied call's reason; a declined action of the
+    // human's own is not sent, and the agent is told nothing of it.
+    reasonEl.placeholder = req.origin ? "Reason (optional, kept here)" : "Reason (sent to the agent if you deny)";
     reasonEl.rows = 1;
     const denyBtn = document.createElement("button");
     denyBtn.type = "button";
@@ -724,6 +861,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     const statusEl = document.createElement("div");
     statusEl.className = "pstatus";
 
+    card.appendChild(originEl);
     card.appendChild(toolEl);
     card.appendChild(inputEl);
     card.appendChild(actions);
@@ -936,6 +1074,8 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     renderTurns(chat);
     renderPending(chat);
     renderAgentStatus(chat);
+    renderActionResults(chat);
+    renderFileAccept();
     renderUsage(chat);
     renderModel(chat);
     renderBanner(chat);
@@ -1083,6 +1223,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
       store.setChatAgentStatus(session.agent);
       store.setChatModel(session.model);
       store.setChatUsage(session.usage);
+      store.setChatUploadActions(session.upload_actions || []);
       // Why the agent is down, for a page opened after it went down: the
       // agent_error event that said so is history in this connection's
       // replay, which raises no banner.
@@ -1168,7 +1309,11 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
           event.input,
           event.suggestions,
           event.rememberable,
+          event.action ? { action: event.action, by: event.by || null } : null,
         );
+        break;
+      case "upload_action":
+        store.addChatActionResult(event);
         break;
       case "permission_resolved":
         if (!replayed) reportResolution(event);

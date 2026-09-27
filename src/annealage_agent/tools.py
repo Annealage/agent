@@ -372,6 +372,10 @@ class ToolServer:
     (``RemoteServer``s), and ``reconnect`` tries those again: ``serve`` does,
     on a timer and on the session's first turn (``app.py``), and hands a
     session that can take new tools mid-session the grown table.
+
+    ``remote_servers`` is every declared remote by name, reached or not, for
+    a call the human starts from the page (an upload action, ``uploads.py``),
+    which opens its own connection as a proxied call does.
     """
 
     def __init__(self, tools, *, grading, bus, paused_message, remote=()):
@@ -395,8 +399,10 @@ class ToolServer:
         self.server = create_sdk_mcp_server(
             self.name, version=installed.version, tools=list(self.tools)
         )
+        remote = tuple(remote)
         self.remotes = ()
         self.unreached = ()
+        self.remote_servers = {server.name: server for server in remote}
         self._bus = bus
         self._paused_message = paused_message
         if remote:
@@ -405,7 +411,7 @@ class ToolServer:
             from .remote import connect
 
             self.remotes, self.unreached = connect(
-                tuple(remote), product_server=self.name, bus=bus, paused_message=paused_message
+                remote, product_server=self.name, bus=bus, paused_message=paused_message
             )
 
     async def reconnect(self):
