@@ -1340,6 +1340,9 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
         break;
       case "session_reset":
         store.resetChatTurns();
+        // The old conversation's usage is not the new one's; the hello of a
+        // later connection says so too.
+        if (!replayed) store.setChatUsage(null);
         if (!replayed) store.setChatBanner("reset", event.reason);
         break;
       case "agent_error":

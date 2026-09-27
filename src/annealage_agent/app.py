@@ -54,6 +54,7 @@ from .session.base import (
     AgentModelChanged,
     AgentStatus,
     PermissionResolved,
+    SessionReset,
     TurnEnd,
     Usage,
 )
@@ -876,7 +877,9 @@ def _event_publisher(registry, event_log, session_info=None):
     says the agent is ready: a page opened while the agent is down learns
     why from the ``hello``, since it raises no banner from replayed history.
     The latest ``Usage`` is kept as ``session_info["usage"]`` for the same
-    reason: the page takes its usage from the ``hello`` and live events only.
+    reason: the page takes its usage from the ``hello`` and live events only;
+    a ``SessionReset`` clears it, since the new conversation has used nothing
+    the backend has reported yet.
 
     Every ``AgentError`` is also written to this process's stderr
     (``_journal_agent_error``), so a service's journal says why its agent is
@@ -902,6 +905,9 @@ def _event_publisher(registry, event_log, session_info=None):
                 session_info["agent_error"] = None
         if session_info is not None and isinstance(event, Usage):
             session_info["usage"] = event.snapshot()
+        if session_info is not None and isinstance(event, SessionReset):
+            # A new conversation: the old one's usage is not its.
+            session_info["usage"] = None
         seq = event_log.append(event)
         frame = protocol.build_event(seq, event.to_wire())
         asyncio.ensure_future(registry.broadcast(frame))

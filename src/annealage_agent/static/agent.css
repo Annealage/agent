@@ -37,7 +37,10 @@
 }
 /* The conversation's usage (chat.js), before the status: context fill and
    cost, every figure in its tooltip. */
-.chatusage { font-size: 11px; color: #9aa; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.chatusage {
+  font-size: 11px; color: #9aa; white-space: nowrap; font-variant-numeric: tabular-nums;
+  min-width: 0; overflow: hidden; text-overflow: ellipsis;
+}
 .chatusage[hidden] { display: none; }
 /* A PDF uploaded for an upload action (chat.js): a wider chip with its name,
    its state and a button per action, never part of the message. */

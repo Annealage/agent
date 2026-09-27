@@ -762,6 +762,43 @@ async def test_usage_after_a_result_is_the_cli_s_running_total_for_the_conversat
 
 
 @pytest.mark.asyncio
+async def test_after_a_compaction_the_context_fill_is_unknown_until_the_next_call():
+    """The last call's prompt says how full the context was before the CLI
+    compacted it, not after, so until a call reports again the fill is null
+    rather than stale."""
+    session, transport, recorder = await _started_session()
+    try:
+        session._turn = 1
+        transport.push(
+            {
+                "type": "assistant",
+                "session_id": "sdk-sess-1",
+                "message": {
+                    "model": "claude-haiku-4-5",
+                    "content": [{"type": "text", "text": "done"}],
+                    "usage": {"input_tokens": 150000, "output_tokens": 10},
+                },
+            }
+        )
+        transport.push(
+            {
+                "type": "system",
+                "subtype": "compact_boundary",
+                "session_id": "sdk-sess-1",
+                "compact_metadata": {"trigger": "auto", "pre_tokens": 150000},
+            }
+        )
+        transport.push(_result(0.5, {"claude-haiku-4-5": _model_usage(150000, 10, 0, 0)}))
+        assert isinstance(await recorder.next(), TurnEnd)
+        usage = await recorder.next()
+        assert isinstance(usage, Usage)
+        assert usage.context is None
+        assert usage.cost_usd == 0.5
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_a_tool_result_carrying_end_turn_interrupts_the_turn_once_the_cli_has_it():
     """``tools.ok(..., end_turn=True)`` reaches the session as
     ``end_turn_after_tool`` while the tool runs; the interrupt waits for the

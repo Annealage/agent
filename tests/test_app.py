@@ -347,7 +347,9 @@ async def test_the_hello_carries_the_conversation_s_usage_across_a_restart(serve
     the last ``usage`` event's figures, whatever else followed; and after a
     restart, the last one the log holds, never a sum of the log's turn ends,
     until the resumed backend reports afresh."""
-    from annealage_agent.session.base import TurnEnd, Usage
+    from annealage_agent import sessions
+    from annealage_agent.session.base import SessionReset, TurnEnd, Usage
+    from annealage_agent.session.events import EventLog
     from annealage_agent.session.fake import FakeSession
 
     app, session = _app_with_fake_session(served_dir)
@@ -377,6 +379,27 @@ async def test_the_hello_carries_the_conversation_s_usage_across_a_restart(serve
         app.agent_event_log.close()
 
     sid = session.session_id
+    reset_log = EventLog(str(sessions.events_path(served_dir, sid)))
+    reset_log.append(SessionReset(reason="the resume did not take"))
+    reset_log.close()
+    reset_app = create_toy_app(
+        served_dir,
+        token="tok",
+        session_id=sid,
+        build_session=lambda on_event, *, bus: FakeSession(on_event, session_id=sid),
+    )
+    try:
+        # A new conversation began after the last usage: that usage is not its.
+        assert (await _hello_of(reset_app))["session"]["usage"] is None
+        reset_app.agent_session.emit(Usage(cost_usd=0.1))
+        assert (await _hello_of(reset_app))["session"]["usage"]["cost_usd"] == 0.1
+        reset_app.agent_session.emit(SessionReset(reason="again"))
+        assert (await _hello_of(reset_app))["session"]["usage"] is None
+        # The log ends on the usage the restart below expects.
+        reset_app.agent_session.emit(Usage(**latest))
+    finally:
+        reset_app.agent_event_log.close()
+
     restarted = create_toy_app(
         served_dir,
         token="tok",

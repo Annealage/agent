@@ -150,6 +150,9 @@ chat.handleEvent({ kind: "usage", cost_usd: null,
 out.usageLive = { text: usageChip.textContent, title: usageChip.title };
 chat.handleHello({ id: "s", agent: "ready", usage: null });
 out.usageHiddenWhenUnknown = usageChip.hidden;
+chat.handleHello({ id: "s", agent: "ready", usage: { cost_usd: 1, tokens: {}, context: null } });
+chat.handleEvent({ kind: "session_reset", reason: "new" }, { replayed: false });
+out.usageHiddenAfterReset = usageChip.hidden;
 
 console.log(JSON.stringify(out));
 process.exit(0);
@@ -219,3 +222,6 @@ def test_the_header_shows_the_conversation_s_usage_from_the_hello_and_live_event
         "Tokens: 5 in, unknown out, unknown read from the cache, unknown written to it",
     }
     assert observed["usageHiddenWhenUnknown"] is True
+    assert observed["usageHiddenAfterReset"] is True, (
+        "a new conversation's usage is not the old one's"
+    )

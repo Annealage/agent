@@ -189,6 +189,9 @@ class EventLog:
                         key: event.get(key) for key in ("cost_usd", "tokens", "context")
                     }
                     continue
+                if kind == "session_reset":
+                    # A new conversation began after it: that usage is not its.
+                    self.last_usage = None
                 request_id = event.get("request_id")
                 if kind == "permission_request" and isinstance(request_id, str):
                     requests[request_id] = None

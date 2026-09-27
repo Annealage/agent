@@ -79,7 +79,11 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
-from claude_agent_sdk.types import PermissionRuleValue, ToolPermissionContext
+from claude_agent_sdk.types import (
+    ConversationResetMessage,
+    PermissionRuleValue,
+    ToolPermissionContext,
+)
 
 from .. import product
 from . import logfiles, secret_paths, turn_images, workspace_trust
@@ -774,6 +778,11 @@ class SdkSession:
             self._stop_reason = None
             self._emit(self._usage(message))
             return
+        if isinstance(message, ConversationResetMessage):
+            # The conversation was replaced: its context fill is unknown until
+            # the next call reports one.
+            self._last_call = None
+            return
         if isinstance(message, SystemMessage):
             self._handle_system(message)
             return
@@ -830,6 +839,10 @@ class SdkSession:
         """
         data = message.data or {}
         self._remember_sdk_session(data.get("session_id"))
+        if message.subtype == "compact_boundary":
+            # The context was compacted: the last call's prompt no longer says
+            # how full it is, so the fill is unknown until the next call.
+            self._last_call = None
         if message.subtype == "init" and self._resume:
             reported = data.get("session_id")
             if reported and reported != self._resume:
