@@ -17,14 +17,15 @@ asking them to approve what they just clicked teaches them to click cards
 without reading. The model asking for the same write has decided nothing on
 the human's behalf, so it asks.
 
-Refuses, in the order checked: an absent or wrong token, or ``t`` given more
-than once (the same ``ws.refusal()`` response ``/ws`` returns, so an
-unauthenticated caller cannot tell this route apart from any other); a
-disallowed ``Origin``, checked here as well as on ``/ws`` because this is the
-one route in the process that writes into the human's project and a POST
-carrying a raw body is a CORS simple request, so no preflight stands in front
-of it; an unknown query key, ``kind`` given twice, or ``kind`` outside its
-whitelist; a missing or zero Content-Length; a Content-Length over
+Refuses, in the order checked: a request the app's ``identity.BrowserAuth``
+refuses (a disallowed ``Origin``, checked here as well as on ``/ws`` because
+this is the one route in the process that writes into the human's project
+and a POST carrying a raw body is a CORS simple request, so no preflight
+stands in front of it; then neither an allowed tailnet login nor the browser
+token, or ``t`` given more than once), with the same ``ws.refusal()``
+response ``/ws`` returns, so an unauthenticated caller cannot tell this route
+apart from any other; an unknown query key, ``kind`` given twice, or ``kind``
+outside its whitelist; a missing or zero Content-Length; a Content-Length over
 ``files.MAX_IMAGE_BYTES``; a body whose bytes are not a PNG, JPEG or WEBP;
 and, once past every check above, whatever ``files.create_unique_image_file``
 itself refuses (an ``images/`` entry that cannot be written into, or every
@@ -60,7 +61,7 @@ from urllib.parse import unquote
 from .. import files, product, sessions
 from ..session import events
 from . import CHUNK_SIZE, file_response, read_json_body
-from .ws import _origin_is_allowed, _token_is_allowed, refusal
+from .ws import refusal
 
 
 class _Refused(Exception):
@@ -137,7 +138,7 @@ def _upload_kind(req):
 
     Only ``t`` and ``kind`` may appear, ``kind`` at most once and only from
     ``upload_kinds()``; anything else is refused without reading any of the
-    body. Called only once the token has already passed, so this whitelist
+    body. Called only once the request is authenticated, so this whitelist
     is never a way to probe the route unauthenticated.
     """
     keys = set(req.args.keys()) if hasattr(req.args, "keys") else set()
@@ -264,19 +265,17 @@ async def _file_or_same_404(target, ctype, method, request_key, expect_identity=
     return res
 
 
-def register_chat_routes(app, serve_dir, *, token, allowed_origins=()):
+def register_chat_routes(app, serve_dir, *, auth):
     """Register ``POST /upload``, ``GET /asset/<rel>`` and
-    ``POST /session/<sid>/export`` on ``app``."""
+    ``POST /session/<sid>/export`` on ``app``, the two POSTs gated by ``auth``
+    (``identity.BrowserAuth``)."""
     serve_dir = files.resolve_serve_dir(serve_dir)
 
     @app.post("/upload")
     async def upload(req):
-        # Token then Origin, the same order and the same opaque refusal /ws
-        # uses, so neither check tells an unauthenticated caller which one it
-        # failed.
-        if not _token_is_allowed(req, token):
-            return refusal()
-        if not _origin_is_allowed(req, allowed_origins):
+        # The same check and the same opaque refusal /ws uses, so nothing
+        # tells an unauthenticated caller which part of it failed.
+        if auth.authenticate(req) is None:
             return refusal()
 
         kind, error = _upload_kind(req)
@@ -384,9 +383,7 @@ def register_chat_routes(app, serve_dir, *, token, allowed_origins=()):
 
     @app.post("/session/<sid>/export")
     async def export_session(req, sid):
-        if not _token_is_allowed(req, token):
-            return refusal()
-        if not _origin_is_allowed(req, allowed_origins):
+        if auth.authenticate(req) is None:
             return refusal()
 
         loop = asyncio.get_running_loop()

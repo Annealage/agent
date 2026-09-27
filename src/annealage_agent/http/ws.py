@@ -4,9 +4,11 @@ A bug in this file is not a UI bug. ``/ws`` is the one route a browser tab
 turns into a live bidirectional channel, and from the milestone that lands an
 agent it carries turns into a Claude Code session with shell access in the
 human's project. A check that can be bypassed here is a remote-code-execution
-bug, so the three checks below are independent, each is commented with what it
-defends against and why the other two do not cover it, and all three run
-**before** the WebSocket handshake.
+bug, so the checks below are independent, each is commented with what it
+defends against and why the others do not cover it, and all of them run
+**before** the WebSocket handshake: the Host check (app.py's hook), then the
+app's ``BrowserAuth`` (``identity.py``: the Origin, then a tailnet login or
+the token).
 
 Refusing before the handshake, rather than upgrading and then closing with a
 code, is deliberate and load-bearing in two ways. It means no connection
@@ -106,8 +108,8 @@ def host_is_allowed(req, allowed_hosts):
 def register_ws(
     app,
     *,
+    auth,
     token,
-    allowed_origins,
     allowed_hosts,
     registry,
     event_log,
@@ -116,12 +118,14 @@ def register_ws(
 ):
     """Register ``/ws`` on ``app``.
 
-    ``token`` of ``None`` means no token was configured for this process, and
-    every ``/ws`` request is then refused. That is the safe reading rather
-    than an inconvenient one: a socket nobody can authenticate is a socket
-    that should not open, and the command-line entry point always generates a
-    token, so the only way to reach this state is a caller that built an app
-    without one.
+    ``auth`` is the app's ``identity.BrowserAuth``, the check every browser
+    route makes; the ``Human`` it returns for the upgrade is the connection's
+    (``conn.human``), and what the human does over it (a turn, a permission
+    decision, the pause switch) is recorded with their login. ``token`` is the
+    browser token the ``hello`` frame is checked against when the upgrade was
+    authenticated by it. With neither a token nor an identity every ``/ws``
+    request is refused. That is the safe reading rather than an inconvenient
+    one: a socket nobody can authenticate is a socket that should not open.
 
     ``holder`` is the app's ``AgentHolder`` (``app.py``), read as each
     connection opens and as each frame arrives rather than once here: its
@@ -138,11 +142,11 @@ def register_ws(
 
     @app.get("/ws")
     async def ws_route(req):
-        # Order is token, then Origin. Host is enforced for every route by
-        # app.py's before_request hook and so has already passed by here.
-        if not _token_is_allowed(req, token):
-            return refusal()
-        if not _origin_is_allowed(req, allowed_origins):
+        # Host is enforced for every route by app.py's before_request hook and
+        # so has already passed by here. The upgrade is not a plain read, so a
+        # tailnet login counts only with an Origin this server serves.
+        human = auth.authenticate(req)
+        if human is None:
             return refusal()
 
         ws = await websocket_upgrade(req)
@@ -189,9 +193,15 @@ def register_ws(
                     )
                 )
             )
-            if not await _greet(ws, event_log, token, session_info["id"]):
+            # The hello's token is checked only when the token opened the
+            # socket: a page signed in by its tailnet login may hold none.
+            hello = await _greet(
+                ws, event_log, token if human.login is None else None, session_info["id"]
+            )
+            if hello is None:
                 return Response.already_handled
-            conn = await registry.add(ws)
+            viewer = hello.get("viewer") or {}
+            conn = await registry.add(ws, tab_id=viewer.get("tab_id"), human=human)
             await _serve_connection(ws, conn, registry, event_log, token, holder)
         except WebSocketError:
             # The peer closed, or sent a frame microdot could not read. Not
@@ -254,9 +264,10 @@ def _origin_is_allowed(req, allowed_origins):
 
     An absent ``Origin`` is allowed, and the reason is specific: a browser
     always sends one on a WebSocket handshake, so absent means a non-browser
-    client, which still has to present the token. The threat this check exists
-    for is a page the human happens to visit opening a socket to this server,
-    and that page cannot suppress its own ``Origin``.
+    client, which still has to present the token. (A tailnet login needs an
+    ``Origin`` on the handshake; ``identity.BrowserAuth`` says why.) The threat
+    this check exists for is a page the human happens to visit opening a socket
+    to this server, and that page cannot suppress its own ``Origin``.
 
     This is not redundant with the token. **A WebSocket handshake is not
     subject to the same-origin policy**, so a malicious page can open this
@@ -278,11 +289,15 @@ def _origin_is_allowed(req, allowed_origins):
 async def _greet(ws, event_log, token, session_id=None):
     """Read the client's ``hello`` and answer it, before any writer exists.
 
-    Returns False if the connection was closed here, in which case the caller
-    must not register it. Nothing else is read: a client that sends some other
-    frame first is answered with a refusal and asked again, because ``hello``
-    is what carries the resync position and there is nothing useful to do
-    without it.
+    Returns the hello frame, or ``None`` if the connection was closed here, in
+    which case the caller must not register it. Nothing else is read: a client
+    that sends some other frame first is answered with a refusal and asked
+    again, because ``hello`` is what carries the resync position and there is
+    nothing useful to do without it.
+
+    ``token`` is what the hello's ``token`` must equal: the browser token, for
+    a socket the token opened. ``None`` checks nothing, for a socket a tailnet
+    login opened, whose page may hold no token at all.
 
     The answer is the history since the client's ``last_seq``: the ring's,
     and before that the event log's file, read off the event loop, which is
@@ -310,7 +325,7 @@ async def _greet(ws, event_log, token, session_id=None):
         if frame is None:
             continue
         if frame is _CLOSED:
-            return False
+            return None
         if frame["type"] != "hello":
             await ws.send(
                 json.dumps(
@@ -322,11 +337,11 @@ async def _greet(ws, event_log, token, session_id=None):
         # authenticated the connection. It costs one comparison, and a hello
         # whose token disagrees with the one that opened the socket is a
         # confused or hostile client either way.
-        if not _constant_time_equal(frame.get("token") or "", token or ""):
+        if token is not None and not _constant_time_equal(frame.get("token") or "", token):
             await protocol.close_with_code(
                 ws, protocol.CLOSE_VERSION_MISMATCH, "hello token does not match"
             )
-            return False
+            return None
         position = frame.get("last_seq")
         if frame.get("session_id") != session_id:
             position = None
@@ -335,7 +350,7 @@ async def _greet(ws, event_log, token, session_id=None):
             replay = await event_log.replay_async(position)
             position = replay.through
             if not replay.events and not replay.truncated:
-                return True
+                return frame
             for seq, event_wire in replay.events:
                 await ws.send(json.dumps(protocol.build_event(seq, event_wire)))
             if replay.truncated and not told:
@@ -470,7 +485,7 @@ async def _dispatch(ws, conn, registry, event_log, token, frame, session=None, b
         # monotonic stream a reconnecting client replays from, and scheduled
         # behind any broadcast a session has already scheduled, so it reaches
         # each page in seq order (see ViewerRegistry._broadcast_primary).
-        event = PauseChanged(paused=bus.paused)
+        event = PauseChanged(paused=bus.paused, by=_login(conn))
         seq = event_log.append(event)
         await asyncio.ensure_future(registry.broadcast(protocol.build_event(seq, event.to_wire())))
         return
@@ -504,7 +519,10 @@ async def _dispatch(ws, conn, registry, event_log, token, frame, session=None, b
                 await session.set_model(frame["model"])
             else:
                 await session.decide_permission(
-                    frame["request_id"], frame["decision"], frame.get("message", "")
+                    frame["request_id"],
+                    frame["decision"],
+                    frame.get("message", ""),
+                    by=_login(conn),
                 )
         except UnknownRequest:
             # Ordinary, not a failure: two tabs held one card and this is the
@@ -577,12 +595,18 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus):
         return
     turn = None
     if bus is not None:
-        blocks_to_send = bus.begin_turn(blocks)
+        blocks_to_send = bus.begin_turn(blocks, by=_login(conn))
         turn = bus.turn
         _publish(
             event_log,
             registry,
-            UserTurn(turn=turn, blocks=blocks, client_id=client_id, viewer=conn.tab_id),
+            UserTurn(
+                turn=turn,
+                blocks=blocks,
+                client_id=client_id,
+                viewer=conn.tab_id,
+                by=_login(conn),
+            ),
         )
     else:
         blocks_to_send = blocks
@@ -601,6 +625,13 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus):
                 )
             )
         )
+
+
+def _login(conn):
+    """The tailnet login of the human on ``conn``, what an event they caused
+    records as ``by``; ``None`` for the browser token's holder, whose identity
+    is unknown."""
+    return conn.human.login if conn.human is not None else None
 
 
 def _publish(event_log, registry, event):

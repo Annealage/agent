@@ -65,6 +65,7 @@ class StubEventLog:
 
 class _Conn:
     tab_id = "tab-1"
+    human = None
 
 
 def _bus():

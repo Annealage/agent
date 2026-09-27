@@ -359,7 +359,9 @@ class SdkSession:
         except Exception as exc:
             self._fail(exc, viewer=viewer)
 
-    async def decide_permission(self, request_id: str, decision: str, message: str = "") -> None:
+    async def decide_permission(
+        self, request_id: str, decision: str, message: str = "", by: Optional[str] = None
+    ) -> None:
         """Route a human's decision to the broker.
 
         ``UnknownRequest`` propagates deliberately. Two tabs can hold one card
@@ -372,7 +374,7 @@ class SdkSession:
         if self._broker is None:
             return
         try:
-            await self._broker.decide(request_id, decision, message)
+            await self._broker.decide(request_id, decision, message, by=by)
         except UnknownRequest:
             raise
         except Exception as exc:

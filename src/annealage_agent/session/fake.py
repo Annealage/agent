@@ -50,6 +50,9 @@ class FakeSession:
         # first and a scripting surface second.
         self.submitted_turns: List[Tuple[list, Optional[str]]] = []
         self.permission_decisions: List[Tuple[str, str, str]] = []
+        # Who made each decision above, in the same order: the login
+        # ``decide_permission`` was given as ``by``, or None.
+        self.permission_deciders: List[Optional[str]] = []
         self.decided_requests: Set[str] = set()
         self.interrupted = 0
         self.set_model_calls: List[str] = []
@@ -75,7 +78,9 @@ class FakeSession:
     async def submit_turn(self, blocks: list, viewer: Optional[str] = None) -> None:
         self.submitted_turns.append((blocks, viewer))
 
-    async def decide_permission(self, request_id: str, decision: str, message: str = "") -> None:
+    async def decide_permission(
+        self, request_id: str, decision: str, message: str = "", by: Optional[str] = None
+    ) -> None:
         """Record one decision, and raise ``UnknownRequest`` for a second one
         naming the same request.
 
@@ -89,6 +94,7 @@ class FakeSession:
             raise UnknownRequest("permission request %r was already decided" % (request_id,))
         self.decided_requests.add(request_id)
         self.permission_decisions.append((request_id, decision, message))
+        self.permission_deciders.append(by)
 
     async def interrupt(self) -> None:
         self.interrupted += 1

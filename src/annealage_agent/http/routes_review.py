@@ -13,11 +13,15 @@ Registers, whether or not the product keeps a review:
                          resolve it, when the capabilities say the page does
                          (``human_sets_status``)
 
-All three require the browser token and a permitted ``Origin``, and refuse with
-the same opaque response ``/ws`` returns, so none tells an unauthenticated
-caller which check it failed. The review is the human's words about their
-project, so it is not readable without the token either, unlike a product's
-own file routes (Mesh's ``/callouts``) whose contract predates this one.
+All three go through the app's ``identity.BrowserAuth`` (a permitted
+``Origin``, then a tailnet login or the browser token) and refuse with the same
+opaque response ``/ws`` returns, so none tells an unauthenticated caller which
+check it failed. The review is the human's words about their project, so it is
+not readable without them either, unlike a product's own file routes (Mesh's
+``/callouts``) whose contract predates this one. A human signed in by their
+tailnet login is recorded: the comment they add carries their login as
+``by``, and a status they set carries it as ``status_by``, for a store that
+keeps them (``JsonReviewStore``).
 
 A product with no review store still has the routes, answering 404: the
 route list is the agent layer's own, the same for every product, which is also
@@ -38,13 +42,13 @@ import functools
 from .. import product
 from ..review.model import HUMAN, OPEN, RESOLVED, ReviewError
 from . import read_json_body
-from .ws import _origin_is_allowed, _token_is_allowed, refusal
+from .ws import refusal
 
 
-def register_review_routes(app, *, store, token, allowed_origins=()):
+def register_review_routes(app, *, store, auth):
     """Register ``GET`` and ``POST /review`` and ``POST /review/<id>`` on
     ``app`` over ``store`` (a ``ReviewStore``, or ``None`` when the product
-    keeps no review)."""
+    keeps no review), each gated by ``auth`` (``identity.BrowserAuth``)."""
 
     def _no_review():
         return {
@@ -54,9 +58,7 @@ def register_review_routes(app, *, store, token, allowed_origins=()):
 
     @app.get("/review")
     async def get_review(req):
-        if not _token_is_allowed(req, token):
-            return refusal()
-        if not _origin_is_allowed(req, allowed_origins):
+        if auth.authenticate(req) is None:
             return refusal()
         if store is None:
             return _no_review()
@@ -77,9 +79,8 @@ def register_review_routes(app, *, store, token, allowed_origins=()):
 
     @app.post("/review")
     async def add_review_comment(req):
-        if not _token_is_allowed(req, token):
-            return refusal()
-        if not _origin_is_allowed(req, allowed_origins):
+        human = auth.authenticate(req)
+        if human is None:
             return refusal()
         if store is None:
             return _no_review()
@@ -108,7 +109,9 @@ def register_review_routes(app, *, store, token, allowed_origins=()):
         try:
             written = await loop.run_in_executor(
                 None,
-                functools.partial(store.add_comment, anchor=anchor, text=text, author=HUMAN),
+                functools.partial(
+                    store.add_comment, anchor=anchor, text=text, author=HUMAN, by=human.login
+                ),
             )
         except ReviewError as exc:
             return {"ok": False, "error": str(exc)}, 400
@@ -116,9 +119,8 @@ def register_review_routes(app, *, store, token, allowed_origins=()):
 
     @app.post("/review/<int:comment_id>")
     async def set_review_status(req, comment_id):
-        if not _token_is_allowed(req, token):
-            return refusal()
-        if not _origin_is_allowed(req, allowed_origins):
+        human = auth.authenticate(req)
+        if human is None:
             return refusal()
         if store is None:
             return _no_review()
@@ -135,9 +137,9 @@ def register_review_routes(app, *, store, token, allowed_origins=()):
             return {"ok": False, "error": 'body must be {"status": "open" or "resolved"}'}, 400
         status = data["status"]
         if status == OPEN:
-            change = functools.partial(store.reopen_comment, comment_id)
+            change = functools.partial(store.reopen_comment, comment_id, by=human.login)
         elif status == RESOLVED:
-            change = functools.partial(store.resolve_comment, comment_id)
+            change = functools.partial(store.resolve_comment, comment_id, by=human.login)
         else:
             return {"ok": False, "error": 'status must be "open" or "resolved"'}, 400
         loop = asyncio.get_running_loop()

@@ -37,13 +37,14 @@ from microdot import Microdot, Request
 from . import net, product, protocol, sessions
 from . import settings as settings_module
 from .http.routes_chat import register_chat_routes
-from .http.routes_login import LoginNonces, register_login_routes
+from .http.routes_login import LoginNonces, register_login_routes, register_whoami_route
 from .http.routes_logs import register_log_routes
 from .http.routes_mcp import register_mcp_routes
 from .http.routes_review import register_review_routes
 from .http.routes_settings import register_settings_routes
 from .http.static import register_agent_static_routes
 from .http.ws import host_is_allowed, ping_forever, refusal, register_ws
+from .identity import BrowserAuth, check_bind
 from .review.watcher import ReviewWatcher
 from .session import secret_paths
 from .session.base import (
@@ -193,6 +194,7 @@ def create_app(
     url_prefix="",
     resume_session=None,
     idle_timeout=None,
+    identity=None,
 ):
     """Build a Microdot app serving ``serve_dir``, routes registered, not started.
 
@@ -222,16 +224,29 @@ def create_app(
     checked here and handed to the session through ``bus.write_protected``;
     ``None`` takes the product's.
 
-    ``token`` is the browser token: the only credential ``/ws``, the chat
-    routes, ``/settings`` and every product route that asks for one accept.
-    ``None`` means no token was configured, and ``/ws`` then refuses every
-    request. ``agent_token`` is the separate per-run agent token, the only
-    credential ``/mcp`` accepts; ``None`` means ``/mcp`` refuses every
-    request. The two are kept apart because the agent token is handed to a
+    ``token`` is the browser token: with an allowed tailnet login
+    (``identity``, below), the only credential ``/ws``, the chat routes,
+    ``/settings`` and every product route that asks for one accept. ``None``
+    means no token was configured, and with no identity either ``/ws`` then
+    refuses every request. ``agent_token`` is the separate per-run agent
+    token, the only credential ``/mcp`` accepts (no identity header opens
+    it); ``None`` means ``/mcp`` refuses every request. The two are kept
+    apart because the agent token is handed to a
     process beside the agent's own shell (the Codex stdio bridge) and the
     browser token authorises permission decisions, so a run whose two tokens
     are equal is refused here rather than built. ``net.load_token`` keeps a
     browser token in a file for a service whose link must survive restarts.
+
+    ``identity`` is an ``identity.TailscaleIdentity``, the tailnet logins
+    allowed to act as the human when the server sits behind ``tailscale
+    serve``, beside the token (``None``: the token alone). An app with one
+    must be bound to loopback, and is refused otherwise: serve's identity
+    headers are trustworthy only on a port nothing but serve and this host
+    can reach. ``app.agent_auth`` is the app's one ``identity.BrowserAuth``,
+    the check every browser route of the agent layer makes, and the one a
+    product's own routes should make (``app.agent_auth.authenticate(req)``,
+    a ``Human`` or ``None`` to refuse); it is set before ``register_routes``
+    is called.
 
     ``session_id`` is the id the CLI resolved for this run (fresh or resumed,
     per plan section 3.4), or None for viewer-only; it is reported in the
@@ -312,8 +327,10 @@ def create_app(
         write_protected = tuple(write_protected)
     csp_value = content_security_policy(page_html)
     bind = net.bind_from_address(host)
+    check_bind(identity, bind)
     allowed_origins = net.allowed_origins(bind, port, extra_origins)
     allowed_hosts = net.allowed_hosts(bind, port, extra_hosts)
+    auth = BrowserAuth(token, identity, allowed_origins=allowed_origins)
     installed = product.current()
     server_header = installed.server_header
     if (session_id is not None or external_agents) and installed.build_tools is None:
@@ -324,6 +341,7 @@ def create_app(
 
     app = Microdot()
     app.agent_url_prefix = url_prefix
+    app.agent_auth = auth
     install_host_check(app, allowed_hosts)
 
     if settings is None:
@@ -332,22 +350,22 @@ def create_app(
 
     if register_routes is not None:
         register_routes(app, allowed_origins)
-    register_chat_routes(app, serve_dir, token=token, allowed_origins=allowed_origins)
+    register_chat_routes(app, serve_dir, auth=auth)
     register_agent_static_routes(app)
     app.agent_login = login if login is not None else LoginNonces()
     register_login_routes(app, token=token, nonces=app.agent_login, allowed_origins=allowed_origins)
+    register_whoami_route(app, auth=auth)
     register_settings_routes(
         app,
         serve_dir,
-        token=token,
-        allowed_origins=allowed_origins,
+        auth=auth,
         settings=settings,
         session_id=session_id,
         bind=bind.address,
         port=port,
         mounted=bool(url_prefix),
     )
-    register_review_routes(app, store=review_store, token=token, allowed_origins=allowed_origins)
+    register_review_routes(app, store=review_store, auth=auth)
 
     # The registry reports presence before the holder exists to take it (the
     # holder is built from the registry); the name is bound by the time a
@@ -563,14 +581,12 @@ def create_app(
 
     # Listed from whatever session is live; a viewer-only run still answers,
     # with nothing to list.
-    register_log_routes(
-        app, current_session=lambda: holder.session, token=token, allowed_origins=allowed_origins
-    )
+    register_log_routes(app, current_session=lambda: holder.session, auth=auth)
 
     register_ws(
         app,
+        auth=auth,
         token=token,
-        allowed_origins=allowed_origins,
         allowed_hosts=allowed_hosts,
         registry=registry,
         event_log=event_log,
@@ -1307,7 +1323,14 @@ async def serve(app, host, port, on_ready=None, background=()):
     ``SHUTDOWN_DRAIN_TIMEOUT`` for in-flight requests to finish; past that
     bound it returns anyway, since microdot has no way to cut an in-flight
     request off short of dropping the connection.
+
+    An app built with an identity (``create_app(identity=...)``) is refused
+    here too (``ValueError``) when ``host`` is not loopback: this is the
+    address actually bound, and ``create_app``'s ``host`` only decided its
+    allowlists.
     """
+    auth = getattr(app, "agent_auth", None)
+    check_bind(getattr(auth, "identity", None), net.bind_from_address(host))
     server = await app.start_server(host=host, port=port, start_serving=False)
     await server.start_serving()
     try:

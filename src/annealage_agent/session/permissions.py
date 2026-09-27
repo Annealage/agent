@@ -24,7 +24,8 @@ than inventing a second one:
   rules never reach it at all).
 - Whatever dispatches an inbound ``permission`` frame (``ws.py`` via
   ``AgentSession.decide_permission``) calls ``decide`` with the frame's
-  ``request_id``, ``decision`` and ``message``.
+  ``request_id``, ``decision`` and ``message``, and ``by``, the login of the
+  human who sent it when they were signed in by one.
 - Whatever tracks connection count (the same wiring that calls
   ``ViewerRegistry.add``/``remove``) calls ``viewer_connected`` and
   ``viewer_disconnected`` on the same transitions, so ``ask`` knows whether
@@ -213,6 +214,11 @@ class PermissionBroker:
         # ``PermissionResolved`` can be emitted exactly once per request
         # without each of the six resolution paths remembering to.
         self._outcomes: Dict[str, str] = {}
+        # Who decided each request a human decided: the login ``decide`` was
+        # given, read by the same ``finally`` into ``PermissionResolved.by``.
+        # Only a human's decision has an entry; a timeout, the last viewer
+        # leaving or shutdown has nobody to name.
+        self._deciders: Dict[str, str] = {}
         # Serialises the disk write inside _remember: two allow_always
         # decisions racing on the executor could otherwise complete out of
         # order and leave the file holding a smaller set than memory,
@@ -317,11 +323,12 @@ class PermissionBroker:
             self._pending.pop(request_id, None)
             self._open.pop(request_id, None)
             outcome = self._outcomes.pop(request_id, OUTCOME_SHUTDOWN)
+            by = self._deciders.pop(request_id, None)
             # After the pops, so a viewer that reconnects on the strength of
             # this event and asks for what is still outstanding cannot be told
             # about the request this event just closed.
             try:
-                self._on_event(PermissionResolved(request_id=request_id, outcome=outcome))
+                self._on_event(PermissionResolved(request_id=request_id, outcome=outcome, by=by))
             except Exception as exc:
                 # The tool call has already been answered by this point, so a
                 # failure to announce that costs a card left on screen until
@@ -333,10 +340,15 @@ class PermissionBroker:
 
     # -- resolving a request ------------------------------------------------
 
-    async def decide(self, request_id: str, decision: str, message: str = "") -> None:
+    async def decide(
+        self, request_id: str, decision: str, message: str = "", by: Optional[str] = None
+    ) -> None:
         """Resolve one outstanding request. Called for an inbound
         ``permission`` frame (plan section 3.3), dispatched here via
-        ``AgentSession.decide_permission``.
+        ``AgentSession.decide_permission``. ``by`` is the deciding human's
+        login, which the ``PermissionResolved`` this produces records; ``None``
+        when it is not known (the browser token's holder, or the session
+        denying on the human's behalf as a turn is interrupted).
 
         Raises ``UnknownRequest`` if ``request_id`` names nothing pending;
         see that exception's docstring for the four ways that happens.
@@ -372,6 +384,8 @@ class PermissionBroker:
         tool_name = event.tool if event is not None else ""
         result, grant = _build_result(tool_name, decision, message, self._never_remembered)
         self._outcomes[request_id] = decision
+        if by is not None:
+            self._deciders[request_id] = by
         future.set_result(result)
         if grant is not None:
             await self._remember(grant)

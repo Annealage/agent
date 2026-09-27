@@ -40,9 +40,10 @@ from microdot import Microdot, Response
 
 from . import app as agent_app
 from . import net, product
-from .http.routes_login import LoginNonces, register_login_routes
+from .http.routes_login import LoginNonces, register_login_routes, register_whoami_route
 from .http.static import register_agent_static_routes
-from .http.ws import _origin_is_allowed, _token_is_allowed, refusal
+from .http.ws import refusal
+from .identity import BrowserAuth, check_bind
 
 #: An app id: one path segment, used literally in a URL and in a route. No
 #: ``.``: microdot puts a route's static text into its regex unescaped, so an
@@ -63,7 +64,12 @@ class FrontDoor:
     ``page_html`` is the product's front page, served at ``/``, whose inline
     scripts the Content-Security-Policy hashes as ``create_app``'s does.
     ``token`` is the browser token every mounted app was built with, which
-    ``GET /apps`` requires too, and ``agent_token`` their agent token.
+    ``GET /apps`` accepts too, and ``agent_token`` their agent token.
+    ``identity`` is the ``identity.TailscaleIdentity`` every mounted app was
+    built with (``None``: none), refused with a bind that is not loopback as
+    ``create_app`` refuses it. ``self.app.agent_auth`` is the front door's
+    ``identity.BrowserAuth``, set before ``register_routes`` is called, for
+    the product's own routes on it.
     ``host``, ``port``, ``extra_origins`` and ``extra_hosts`` are the bind
     and the names a proxy fronts it under, exactly as each app was given
     them. ``login`` is the ``LoginNonces`` every app shares (``front.login``;
@@ -71,8 +77,8 @@ class FrontDoor:
     root. ``register_routes(app, allowed_origins)`` registers the product's
     own routes on the front door (a "new workspace" form's POST, say).
 
-    Routes of its own: ``GET /`` (the page), ``GET /apps?t=<browser token>``
-    (``apps()`` as JSON, for the page to poll), ``POST /login``,
+    Routes of its own: ``GET /`` (the page), ``GET /apps`` (``apps()`` as
+    JSON, for the page to poll), ``GET /whoami``, ``POST /login``,
     ``/agent/static/`` (the agent layer's front end, for the page), and
     ``/p/<id>``, which redirects to ``/p/<id>/`` so the page's relative URLs
     resolve under its app.
@@ -90,6 +96,7 @@ class FrontDoor:
         extra_hosts=(),
         login=None,
         register_routes=None,
+        identity=None,
     ):
         if agent_token is not None and agent_token == token:
             raise ValueError("the agent token must differ from the browser token")
@@ -98,9 +105,13 @@ class FrontDoor:
         self.host = host
         self.port = port
         self.login = login if login is not None else LoginNonces()
+        self.identity = identity
         bind = net.bind_from_address(host)
+        check_bind(identity, bind)
         allowed_origins = net.allowed_origins(bind, port, extra_origins)
+        auth = BrowserAuth(token, identity, allowed_origins=allowed_origins)
         self.app = Microdot()
+        self.app.agent_auth = auth
         self._apps = {}
         self._background = {}
         self._starts = {}
@@ -117,9 +128,7 @@ class FrontDoor:
 
         @self.app.get("/apps")
         async def list_apps(req):
-            if not _token_is_allowed(req, token):
-                return refusal()
-            if not _origin_is_allowed(req, allowed_origins):
+            if auth.authenticate(req) is None:
                 return refusal()
             return self.apps(), 200
 
@@ -127,6 +136,7 @@ class FrontDoor:
         register_login_routes(
             self.app, token=token, nonces=self.login, allowed_origins=allowed_origins
         )
+        register_whoami_route(self.app, auth=auth)
         agent_app.install_response_handlers(
             self.app,
             agent_app.content_security_policy(page_html),
@@ -138,8 +148,10 @@ class FrontDoor:
         """Serve ``app`` under ``/p/<app_id>/``; call on the event loop.
 
         ``app`` must have been built with ``url_prefix=mount_prefix(app_id)``
-        (every address it gives out assumes it) and ``login=self.login`` (a
-        nonce the front door issues must open it). ``background`` is the
+        (every address it gives out assumes it), ``login=self.login`` (a
+        nonce the front door issues must open it) and ``identity=`` the front
+        door's (a login the front page signs in must be the one the app takes).
+        ``background`` is the
         product's own long-running coroutine functions for this app, started
         with it (``app.agent_start``). An id already mounted is refused: there
         is no unmounting, microdot copies an app's routes in when it is
@@ -162,6 +174,11 @@ class FrontDoor:
             raise ValueError(
                 "the app for %r must be built with login=front.login, so the front "
                 "door's nonces open it" % app_id
+            )
+        if getattr(getattr(app, "agent_auth", None), "identity", None) is not self.identity:
+            raise ValueError(
+                "the app for %r must be built with the front door's identity, so the "
+                "logins that sign in to the front page are the ones it takes" % app_id
             )
         self.app.mount(app, prefix, local=True)
 

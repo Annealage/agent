@@ -269,7 +269,20 @@ def _check_hello(frame: dict) -> Optional[str]:
         return "hello.session_id must be a string of at most 128 characters, or absent"
     viewer = frame.get("viewer")
     if viewer is not None:
-        return object_error(viewer, {"tab_id", "w", "h"}, {"tab_id"}, "hello.viewer")
+        error = object_error(viewer, {"tab_id", "w", "h"}, {"tab_id"}, "hello.viewer")
+        if error:
+            return error
+        # The tab id goes into the event log with every turn the tab sends
+        # (``UserTurn.viewer``), so it is held to what a page makes one of.
+        tab_id = viewer["tab_id"]
+        if not (isinstance(tab_id, str) and 0 < len(tab_id) <= 128):
+            return "hello.viewer.tab_id must be a string of 1 to 128 characters"
+    # ``token`` is optional: a page signed in by its tailnet login may hold
+    # none (``http/ws.py``'s ``_greet`` checks it when the token opened the
+    # socket, and only then).
+    token = frame.get("token")
+    if token is not None and not isinstance(token, str):
+        return "hello.token must be a string or absent"
     return None
 
 
@@ -370,7 +383,7 @@ class FrameSpec:
 # flat key shape already passed, for the shapes that need to look inside a
 # nested object or enumerate a value's allowed contents.
 _INBOUND_SPECS = {
-    "hello": FrameSpec({"token", "last_seq", "viewer", "session_id"}, {"token"}, _check_hello),
+    "hello": FrameSpec({"token", "last_seq", "viewer", "session_id"}, set(), _check_hello),
     "turn": FrameSpec({"blocks", "client_id"}, {"blocks"}, _check_turn),
     "permission": FrameSpec(
         {"request_id", "decision", "message"}, {"request_id", "decision"}, _check_permission

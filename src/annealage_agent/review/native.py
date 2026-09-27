@@ -22,8 +22,13 @@ The file format, version 2::
 Per comment: ``id`` (an integer, unique in the file), ``anchor`` (an object
 in the product's anchor space), ``text``, ``author`` (``"human"`` or
 ``"model"``) and ``status`` (``"open"`` or ``"resolved"``) are always present;
-``ref`` (what is at the anchor) and ``resolution`` (how a resolved comment was
-addressed) only when set. Any other key on a comment is the product's own
+``ref`` (what is at the anchor), ``resolution`` (how a resolved comment was
+addressed), ``by`` (the tailnet login of the human who wrote a human comment)
+and ``status_by`` (the login of the human who last resolved or reopened it
+from the page) only when set. ``by`` and ``status_by`` are only ever a
+signed-in human's: a comment written or a status set through the browser
+token, or by the model, carries neither, and the model setting a status
+clears ``status_by``. Any other key on a comment is the product's
 (``Comment.extra``) and is kept as written; so is any other top-level key.
 
 **The anchor is nested, not flattened into the comment.** Loom's version 1
@@ -90,7 +95,17 @@ DEFAULT_MAX_OPEN_CALLOUTS = 50
 
 # The keys a comment record's own fields occupy; anything else on a record is
 # the product's (``Comment.extra``).
-_RECORD_KEYS = ("id", "anchor", "ref", "text", "author", "status", "resolution")
+_RECORD_KEYS = (
+    "id",
+    "anchor",
+    "ref",
+    "text",
+    "author",
+    "by",
+    "status",
+    "resolution",
+    "status_by",
+)
 
 
 class JsonReviewStore(ReviewStore):
@@ -221,12 +236,13 @@ class JsonReviewStore(ReviewStore):
                 return index
         raise ReviewError("there is no comment #%s in %s" % (comment_id, self.path.name))
 
-    def add_comment(self, *, anchor, text, author, ref=None, extra=None):
+    def add_comment(self, *, anchor, text, author, ref=None, extra=None, by=None):
         anchor = self.anchor_space.validate(anchor)
         if not isinstance(text, str) or not text.strip():
             raise ReviewError("a comment needs text saying what it is about")
         if author not in AUTHORS:
             raise ReviewError("author must be one of %s" % ", ".join(AUTHORS))
+        _check_login(by)
         extra = dict(extra or {})
         clashing = sorted(set(extra) & set(_RECORD_KEYS))
         if clashing:
@@ -246,25 +262,27 @@ class JsonReviewStore(ReviewStore):
                         "delete the ones that have been answered before adding more" % open_own
                     )
             comment = _comment(
-                next_id, anchor, text.strip(), author, ref or None, OPEN, None, extra
+                next_id, anchor, text.strip(), author, ref or None, OPEN, None, extra, by=by
             )
             comments.append(comment)
             path = self._save(document, next_id + 1, comments)
         self._changed()
         return Written(comment, _count(comments, author), path)
 
-    def resolve_comment(self, comment_id, resolution=None):
+    def resolve_comment(self, comment_id, resolution=None, by=None):
         if isinstance(resolution, str):
             resolution = resolution.strip() or None
-        return self._set_status(comment_id, RESOLVED, resolution)
+        return self._set_status(comment_id, RESOLVED, resolution, by)
 
-    def reopen_comment(self, comment_id):
-        return self._set_status(comment_id, OPEN, None)
+    def reopen_comment(self, comment_id, by=None):
+        return self._set_status(comment_id, OPEN, None, by)
 
-    def _set_status(self, comment_id, status, resolution):
+    def _set_status(self, comment_id, status, resolution, by):
         """``comment_id`` with ``status``, and ``resolution`` when one is
-        given (the one it has otherwise); nothing is written when the status
-        is already that."""
+        given (the one it has otherwise), set by ``by`` (``status_by``, which
+        ``None`` clears); nothing is written when the status is already
+        that."""
+        _check_login(by)
         with file_lock(self.path):
             document, next_id, comments = self._load()
             index = self._index(comments, comment_id)
@@ -280,6 +298,8 @@ class JsonReviewStore(ReviewStore):
                 status,
                 resolution if resolution is not None else comment.resolution,
                 comment.extra,
+                by=comment.by,
+                status_by=by,
             )
             comments[index] = comment
             path = self._save(document, next_id, comments)
@@ -320,7 +340,14 @@ def _count(comments, author):
     return sum(1 for c in comments if c.author == author)
 
 
-def _comment(comment_id, anchor, text, author, ref, status, resolution, extra):
+def _check_login(by):
+    if by is not None and not (isinstance(by, str) and by):
+        raise ReviewError("by must be a human's login, or absent")
+
+
+def _comment(
+    comment_id, anchor, text, author, ref, status, resolution, extra, by=None, status_by=None
+):
     """A ``Comment`` together with its native record, keys in the documented
     order and the product's extra keys after them."""
     record = {"id": comment_id, "anchor": dict(anchor)}
@@ -328,9 +355,13 @@ def _comment(comment_id, anchor, text, author, ref, status, resolution, extra):
         record["ref"] = ref
     record["text"] = text
     record["author"] = author
+    if by is not None:
+        record["by"] = by
     record["status"] = status
     if resolution is not None:
         record["resolution"] = resolution
+    if status_by is not None:
+        record["status_by"] = status_by
     record.update(extra)
     return Comment(
         id=comment_id,
@@ -340,6 +371,8 @@ def _comment(comment_id, anchor, text, author, ref, status, resolution, extra):
         ref=ref,
         status=status,
         resolution=resolution,
+        by=by,
+        status_by=status_by,
         extra=dict(extra),
         record=record,
     )
@@ -369,12 +402,16 @@ def _comment_from_record(record, name):
         raise ReviewError("%s: status must be one of %s" % (label, ", ".join(STATUSES)))
     ref = record.get("ref")
     resolution = record.get("resolution")
-    if (ref is not None and not isinstance(ref, str)) or (
-        resolution is not None and not isinstance(resolution, str)
-    ):
+    by = record.get("by")
+    status_by = record.get("status_by")
+    if any(value is not None and not isinstance(value, str) for value in (ref, resolution)):
         raise ReviewError("%s: ref and resolution must be strings when present" % label)
+    if any(value is not None and not isinstance(value, str) for value in (by, status_by)):
+        raise ReviewError("%s: by and status_by must be logins when present" % label)
     extra = {k: v for k, v in record.items() if k not in _RECORD_KEYS}
-    comment = _comment(comment_id, anchor, text, author, ref, status, resolution, extra)
+    comment = _comment(
+        comment_id, anchor, text, author, ref, status, resolution, extra, by, status_by
+    )
     # The record as read, not as this store would have written it: the two
     # differ only in key order, and a presenter shows the file's.
     return dataclasses.replace(comment, record=dict(record))

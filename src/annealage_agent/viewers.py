@@ -100,14 +100,19 @@ class CallError(Exception):
 class _Connection:
     """One browser tab's registration: its socket, its outbound queue, and
     the writer task draining that queue. Not part of this module's public
-    API; ``add`` returns instances of this class as opaque handles."""
+    API; ``add`` returns instances of this class as opaque handles.
 
-    __slots__ = ("id", "ws", "tab_id", "queue", "writer_task", "removed")
+    ``tab_id`` is the id the tab gave in its ``hello``; ``human`` is the
+    ``identity.Human`` that opened the socket, whose login is what the events
+    they cause over it record."""
 
-    def __init__(self, conn_id: int, ws, tab_id: Optional[str], queue_maxsize: int):
+    __slots__ = ("id", "ws", "tab_id", "human", "queue", "writer_task", "removed")
+
+    def __init__(self, conn_id: int, ws, tab_id: Optional[str], human, queue_maxsize: int):
         self.id = conn_id
         self.ws = ws
         self.tab_id = tab_id
+        self.human = human
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=queue_maxsize)
         self.writer_task: Optional[asyncio.Task] = None
         self.removed = False
@@ -174,7 +179,7 @@ class ViewerRegistry:
 
     # -- connection lifecycle -------------------------------------------------
 
-    async def add(self, ws, tab_id: Optional[str] = None) -> _Connection:
+    async def add(self, ws, tab_id: Optional[str] = None, human=None) -> _Connection:
         """Register a freshly upgraded connection and start its writer task.
 
         Becomes primary immediately: connecting is, by definition, the
@@ -182,7 +187,7 @@ class ViewerRegistry:
         Returns the handle ``http/ws.py`` must pass to every other method
         for this socket, and must eventually pass to ``remove``.
         """
-        conn = _Connection(self._next_conn_id, ws, tab_id, self._queue_maxsize)
+        conn = _Connection(self._next_conn_id, ws, tab_id, human, self._queue_maxsize)
         self._next_conn_id += 1
         self._connections[conn.id] = conn
         conn.writer_task = asyncio.ensure_future(self._run_writer(conn))
@@ -775,6 +780,8 @@ class ViewerBus:
         self._turn = int(turn)
         self._turn_at_open = self._turn
         self._notes: list = []
+        # The login of the human who sent the turn now starting (begin_turn).
+        self.turn_by: Optional[str] = None
         self._turn_start_callbacks: list = []
         self.end_turn_handler: Optional[Any] = None
         # None: no app set it, so the session takes the product's patterns.
@@ -816,15 +823,19 @@ class ViewerBus:
         """Run ``callback(turn)`` (synchronous) each time a human turn is
         accepted, with the new turn number, before that turn's notes are
         taken: a note the callback queues goes with this very turn. A
-        callback that raises is logged and never stops the turn."""
+        callback that raises is logged and never stops the turn. ``turn_by``
+        already names who sent it when the callback runs."""
         self._turn_start_callbacks.append(callback)
 
-    def begin_turn(self, blocks: list) -> list:
+    def begin_turn(self, blocks: list, by: Optional[str] = None) -> list:
         """Count one human turn, run the ``on_turn_start`` callbacks, and
         return ``blocks`` with every queued note in front of them, as one text
         block of its own marked as coming from the product rather than the
         human. Clears the queue. ``http/ws.py`` calls it only once the turn is
-        going to a ready session.
+        going to a ready session, with ``by``, the sender's tailnet login
+        (``None`` for the browser token's holder), which is ``turn_by`` from
+        then until the next turn: what a product attributes the turn's
+        consequences to (``UserTurn.by`` is the same login, logged just after).
 
         A note can carry text the product did not write (a remote MCP
         server's own instructions, ``app.retry_remotes``), and a backend may
@@ -832,6 +843,7 @@ class ViewerBus:
         strings are neutralised inside the notes: nothing in a note can end
         the note early and have what follows read as the human's."""
         self._turn += 1
+        self.turn_by = by
         self.first_turn.set()
         for callback in list(self._turn_start_callbacks):
             try:

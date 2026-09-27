@@ -51,6 +51,12 @@ class Comment:
     pin on a schematic). ``status`` and ``resolution`` are ``None`` in a store
     that keeps no status.
 
+    ``by`` is the tailnet login of the human who wrote a human comment, and
+    ``status_by`` the login of the human who last set its status from the page
+    (``identity.Human.login``); both are ``None`` when the store keeps neither,
+    when the human was the browser token's holder, whose identity is unknown,
+    and (``status_by``) when the model set the status last.
+
     ``extra`` carries the product's own fields the model does not interpret
     (Mesh's face ``label``), so they survive a round trip through a store.
     ``record`` is the comment exactly as its store's file holds it, which is
@@ -67,6 +73,8 @@ class Comment:
     ref: Optional[str] = None
     status: Optional[str] = None
     resolution: Optional[str] = None
+    by: Optional[str] = None
+    status_by: Optional[str] = None
     extra: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     record: Optional[Mapping[str, Any]] = dataclasses.field(default=None, compare=False, repr=False)
 
@@ -82,10 +90,14 @@ class Comment:
             data["ref"] = self.ref
         data["text"] = self.text
         data["author"] = self.author
+        if self.by is not None:
+            data["by"] = self.by
         if self.status is not None:
             data["status"] = self.status
         if self.resolution is not None:
             data["resolution"] = self.resolution
+        if self.status_by is not None:
+            data["status_by"] = self.status_by
         if self.extra:
             data["extra"] = dict(self.extra)
         return data
@@ -244,29 +256,33 @@ class ReviewStore:
         """The comment ``comment_id``, or ``ReviewError`` saying it is absent."""
         raise ReviewError("this review store cannot look a comment up by id")
 
-    def add_comment(self, *, anchor, text, author, ref=None, extra=None):
+    def add_comment(self, *, anchor, text, author, ref=None, extra=None, by=None):
         """Add a comment and return ``Written``. The anchor is validated by
         ``anchor_space``; ``ref`` defaults to ``anchor_space.ref_at(anchor)``;
-        a model's callout past ``max_open_model_callouts`` is refused."""
+        a model's callout past ``max_open_model_callouts`` is refused. ``by``
+        is the writing human's login (``Comment.by``), for a store that keeps
+        it."""
         raise NotImplementedError
 
-    def resolve_comment(self, comment_id, resolution=None):
+    def resolve_comment(self, comment_id, resolution=None, by=None):
         """Mark ``comment_id`` resolved with ``resolution`` (the note on what
         was changed) and return ``Written``. Resolving a resolved comment
         changes nothing. Whether the human must approve is the caller's
-        policy (``review.tools``), not the store's."""
+        policy (``review.tools``), not the store's. ``by`` is the login of the
+        human resolving it from the page (``Comment.status_by``), ``None``
+        for the model or an unknown human."""
         raise ReviewError(
             "this review keeps no status, so comments cannot be resolved; say what "
             "you changed instead"
         )
 
-    def reopen_comment(self, comment_id):
+    def reopen_comment(self, comment_id, by=None):
         """Mark ``comment_id`` open again and return ``Written``. The human's
         operation (``POST /review/<id>``), never a tool's: it says a resolved
         comment was not addressed after all. A resolution already recorded is
         kept, so the model reading the list can tell a comment reopened after
         it resolved it from one never resolved. Reopening an open comment
-        changes nothing."""
+        changes nothing. ``by`` is as for ``resolve_comment``."""
         raise ReviewError("this review keeps no status, so comments cannot be reopened")
 
     def delete_callout(self, comment_id):

@@ -1,4 +1,5 @@
-"""``POST /login``: trade a single-use login nonce for the browser token.
+"""``POST /login``: trade a single-use login nonce for the browser token; and
+``GET /whoami``: who the page is signed in as.
 
 The browser a run opens automatically is launched with a URL on a command line
 (``webbrowser.open`` runs ``xdg-open``, or the browser itself, with the URL as
@@ -24,13 +25,15 @@ line.
 
 This route accepts nothing but an outstanding nonce. It does not accept the
 browser token (a caller holding it has no need of this route) and never the
-agent token.
+agent token. A human signed in by their tailnet login (``identity.py``) has
+no use for it either: every route takes their login as it is.
 """
 
 import hmac
 import secrets
 import time
 
+from .. import identity
 from . import read_json_body
 from .ws import _origin_is_allowed, refusal
 
@@ -99,3 +102,19 @@ def register_login_routes(app, *, token, nonces, allowed_origins=()):
         if not token or not nonces.redeem(nonce):
             return refusal()
         return {"ok": True, "token": token}, 200
+
+
+def register_whoami_route(app, *, auth):
+    """Register ``GET /whoami`` on ``app``: ``{"login", "name", "via"}`` for
+    the human ``auth`` (``identity.BrowserAuth``) authenticates, ``via`` being
+    ``"tailscale"`` for a tailnet login and ``"token"`` for the browser token's
+    holder (``login`` and ``name`` then ``null``), and the same refusal as
+    every other route for anyone else. The page asks once, to show who is
+    signed in."""
+
+    @app.get("/whoami")
+    async def whoami(req):
+        human = auth.authenticate(req)
+        if human is None:
+            return refusal()
+        return {"login": human.login, "name": human.name, "via": identity.via(human)}, 200

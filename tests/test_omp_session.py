@@ -1071,7 +1071,14 @@ async def test_a_turn_sent_while_omp_is_still_connecting_is_neither_prompted_nor
         sock = _Sock()
         frame = {"v": 1, "type": "turn", "blocks": _text(text), "client_id": client_id}
         await ws_module._dispatch(
-            sock, SimpleNamespace(tab_id="t"), _Registry(), log, "tok", frame, session, bus
+            sock,
+            SimpleNamespace(tab_id="t", human=None),
+            _Registry(),
+            log,
+            "tok",
+            frame,
+            session,
+            bus,
         )
         return sock.sent
 
@@ -1573,7 +1580,7 @@ async def test_a_resumed_session_s_next_turn_follows_the_last_one_in_its_history
         frame = {"v": 1, "type": "turn", "blocks": [{"type": "text", "text": "hello again"}]}
         await ws_module._dispatch(
             _Sock(),
-            SimpleNamespace(tab_id="t"),
+            SimpleNamespace(tab_id="t", human=None),
             _Unregistered(app.agent_registry),
             app.agent_event_log,
             "tok",
@@ -1623,7 +1630,7 @@ async def test_a_steer_is_logged_under_the_number_its_reply_arrives_under(tmp_pa
         frame = {"v": 1, "type": "turn", "blocks": [{"type": "text", "text": text}]}
         await ws_module._dispatch(
             _Sock(),
-            SimpleNamespace(tab_id="t"),
+            SimpleNamespace(tab_id="t", human=None),
             _Unregistered(app.agent_registry),
             app.agent_event_log,
             "tok",

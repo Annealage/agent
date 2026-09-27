@@ -151,6 +151,7 @@ async def test_the_page_s_frames_reach_the_external_session(served_dir):
 
     class Conn:
         tab_id = "tab-1"
+        human = None
 
     sock = Sock()
     await ws_module._dispatch(

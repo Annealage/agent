@@ -61,6 +61,7 @@ def create_toy_app(
     url_prefix="",
     resume_session=None,
     idle_timeout=None,
+    identity=None,
 ):
     """The toy product's app over ``serve_dir``: ``agent_app.create_app`` with
     the toy page, whose inline script the Content-Security-Policy hashes, and
@@ -85,6 +86,7 @@ def create_toy_app(
         url_prefix=url_prefix,
         resume_session=resume_session,
         idle_timeout=idle_timeout,
+        identity=identity,
     )
 
 

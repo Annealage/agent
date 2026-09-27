@@ -8,7 +8,8 @@ Registers, against one served directory:
                       keys out, and the diagnostics block
     PUT  /settings   validate a batch of changes and write each to its own layer
 
-Both require the token and a permitted ``Origin``, and refuse with the same
+Both go through the app's ``identity.BrowserAuth`` (a permitted ``Origin``,
+then a tailnet login or the browser token), and refuse with the same
 opaque response ``/ws`` returns, so neither tells an unauthenticated caller
 which check it failed. ``PUT`` is privilege-relevant beyond the obvious: it can
 change the bind address for the next run, so it validates and rejects rather
@@ -44,7 +45,7 @@ import sys
 from .. import diagnostics, product
 from .. import settings as settings_module
 from . import read_json_body
-from .ws import _origin_is_allowed, _token_is_allowed, refusal
+from .ws import refusal
 
 #: The settings a mounted app neither applies nor saves: the front door it is
 #: served under owns the process's one listening socket.
@@ -61,15 +62,15 @@ def register_settings_routes(
     app,
     serve_dir,
     *,
-    token,
-    allowed_origins=(),
+    auth,
     settings=None,
     session_id=None,
     bind=None,
     port=None,
     mounted=False,
 ):
-    """Register ``GET`` and ``PUT /settings`` on ``app``.
+    """Register ``GET`` and ``PUT /settings`` on ``app``, gated by ``auth``
+    (``identity.BrowserAuth``).
 
     ``settings`` is the ``settings.Resolved`` this run started with, and the
     flags that produced it travel on it, so a re-resolution here reports the
@@ -170,17 +171,13 @@ def register_settings_routes(
 
     @app.get("/settings")
     async def get_settings(req):
-        if not _token_is_allowed(req, token):
-            return refusal()
-        if not _origin_is_allowed(req, allowed_origins):
+        if auth.authenticate(req) is None:
             return refusal()
         return await _payload(), 200
 
     @app.put("/settings")
     async def put_settings(req):
-        if not _token_is_allowed(req, token):
-            return refusal()
-        if not _origin_is_allowed(req, allowed_origins):
+        if auth.authenticate(req) is None:
             return refusal()
 
         data, error = await read_json_body(req)

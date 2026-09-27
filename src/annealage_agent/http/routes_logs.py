@@ -9,11 +9,12 @@ Registers, for every product and whether or not a session exists:
                             the last ``logfiles.TAIL_BYTES`` of it, from a
                             whole line
 
-Both require the browser token and a permitted ``Origin``, and refuse with the
-same opaque response ``/ws`` returns. The browser token only: these logs hold
-the conversation, paths on this machine and whatever a provider said back, and
-the agent token is handed to processes beside the agent's own shell (the Codex
-stdio bridge), so it must not open them. No agent tool reads them either.
+Both go through the app's ``identity.BrowserAuth`` (a permitted ``Origin``,
+then a tailnet login or the browser token) and refuse with the same opaque
+response ``/ws`` returns. Never the agent token: these logs hold the
+conversation, paths on this machine and whatever a provider said back, and
+the agent token is handed to processes beside the agent's own shell (the
+Codex stdio bridge), so it must not open them. No agent tool reads them either.
 
 Nothing in a request names a file. ``name`` is looked up, exactly, among the
 names in the list the session gives now, asked for again on every request, and
@@ -31,14 +32,15 @@ import sys
 from urllib.parse import unquote
 
 from ..session import logfiles
-from .ws import _origin_is_allowed, _token_is_allowed, refusal
+from .ws import refusal
 
 
-def register_log_routes(app, *, current_session, token, allowed_origins=()):
+def register_log_routes(app, *, current_session, auth):
     """Register ``GET /agent/logs`` and ``GET /agent/logs/<name>`` on ``app``
     over the session ``current_session()`` returns when a request arrives (an
     ``AgentSession``, or ``None`` for a run without one, or an app whose
-    session its idle timer closed)."""
+    session its idle timer closed), gated by ``auth``
+    (``identity.BrowserAuth``)."""
 
     async def _entries():
         # backend_logs looks at files, so it runs off the loop; it must not
@@ -56,9 +58,7 @@ def register_log_routes(app, *, current_session, token, allowed_origins=()):
 
     @app.get("/agent/logs")
     async def list_logs(req):
-        if not _token_is_allowed(req, token):
-            return refusal()
-        if not _origin_is_allowed(req, allowed_origins):
+        if auth.authenticate(req) is None:
             return refusal()
         entries = await _entries()
         return {
@@ -69,9 +69,7 @@ def register_log_routes(app, *, current_session, token, allowed_origins=()):
 
     @app.get("/agent/logs/<path:name>")
     async def show_log(req, name):
-        if not _token_is_allowed(req, token):
-            return refusal()
-        if not _origin_is_allowed(req, allowed_origins):
+        if auth.authenticate(req) is None:
             return refusal()
         # microdot hands the segment over still percent-encoded.
         name = unquote(name)

@@ -53,6 +53,7 @@ class StubRegistry:
 
 class _Conn:
     tab_id = "tab-1"
+    human = None
 
 
 async def _turn(session, bus, text, *, log=None, registry=None, client_id=None):
@@ -274,7 +275,7 @@ async def test_a_restart_brings_back_the_whole_conversation_in_order(tmp_path, l
     if last_seq is not None:
         hello["last_seq"] = last_seq
     sock = GreetingSocket(hello)
-    assert await ws_module._greet(sock, restarted, "tok") is True
+    assert await ws_module._greet(sock, restarted, "tok") == hello
 
     assert [frame["type"] for frame in sock.sent] == ["event"] * 3
     assert [frame["seq"] for frame in sock.sent] == [1, 4, 5]
@@ -306,6 +307,6 @@ async def test_a_position_counts_only_in_the_session_it_was_taken_in(
     if hello_session is not None:
         hello["session_id"] = hello_session
     sock = GreetingSocket(hello)
-    assert await ws_module._greet(sock, log, "tok", "sess-a") is True
+    assert await ws_module._greet(sock, log, "tok", "sess-a") == hello
     assert [frame["seq"] for frame in sock.sent] == expected_seqs
     log.close()

@@ -113,11 +113,16 @@ class AgentEvent:
     ``viewer`` is the forward seam plan section 3.3 asks for: the
     originating tab id when a later, collaborative mode traces an event
     back to the browser tab that caused it, and unset (``None``) when the
-    server originated the event on its own, which is every event this
-    milestone produces. It is the only place identity of any kind attaches
-    to an event, matching the decision that multi-viewer here is one
-    person's several devices, not several people: nothing else about an
-    event ever carries authorship.
+    server originated the event on its own.
+
+    ``by``, on the three events a human causes directly (``UserTurn``,
+    ``PermissionResolved`` for a decision, ``PauseChanged``), is that human's
+    tailnet login (``identity.Human.login``), and unset for the browser
+    token's holder, whose identity is unknown. Every allowed login is the whole
+    human (no per-user permissions), so it records who, never what they may
+    do. Both are optional and dropped from the wire when unset, so a log
+    written before either existed replays unchanged and a page that knows
+    neither parses every event.
 
     Every subclass is a frozen dataclass, immutable once built: an event
     already appended to an ``EventLog`` and already sitting in another
@@ -209,13 +214,15 @@ class PermissionResolved(AgentEvent):
     ``allow``, ``allow_always`` or ``deny``, or one of the resolutions nobody
     clicked, ``timeout``, ``no_viewer`` and ``shutdown``. A pane that submitted
     a decision and sees a different outcome can then say so, rather than
-    silently showing the human's deny as if it had taken effect.
+    silently showing the human's deny as if it had taken effect. ``by`` is the
+    login of the human who decided, when one did and was signed in by it.
     """
 
     kind: ClassVar[str] = "permission_resolved"
     request_id: str
     outcome: str
     viewer: Optional[str] = None
+    by: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -248,12 +255,14 @@ class PauseChanged(AgentEvent):
     already paused invites a click that changes nothing.
 
     The current value also travels in the ``hello`` frame, since a tab that
-    connects later has no event to learn it from.
+    connects later has no event to learn it from. ``by`` is the login of the
+    human who moved it, when they were signed in by one.
     """
 
     kind: ClassVar[str] = "pause_changed"
     paused: bool = False
     viewer: Optional[str] = None
+    by: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -382,7 +391,8 @@ class UserTurn(AgentEvent):
 
     ``blocks`` are the human's, never the product's notes ``begin_turn`` puts
     in front of them, and an image is its ``image_path`` block, a path under
-    the served directory: the pixels stay in the file, out of the log.
+    the served directory: the pixels stay in the file, out of the log. ``by``
+    is the sender's login, when they were signed in by one.
     """
 
     kind: ClassVar[str] = "user_turn"
@@ -390,6 +400,7 @@ class UserTurn(AgentEvent):
     blocks: list
     client_id: Optional[str] = None
     viewer: Optional[str] = None
+    by: Optional[str] = None
 
 
 #: Every event kind the agent layer emits itself. A product's own event
@@ -540,8 +551,12 @@ class AgentSession(Protocol):
         (it is not required to)."""
         ...
 
-    async def decide_permission(self, request_id: str, decision: str, message: str = "") -> None:
-        """Handle an inbound ``permission`` frame."""
+    async def decide_permission(
+        self, request_id: str, decision: str, message: str = "", by: Optional[str] = None
+    ) -> None:
+        """Handle an inbound ``permission`` frame. ``by`` is the deciding
+        human's login (``None`` when it is not known), which the
+        ``PermissionResolved`` it produces records."""
         ...
 
     async def interrupt(self) -> None:

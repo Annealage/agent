@@ -59,8 +59,10 @@ class ExternalAgentSession:
             "this run has no embedded agent; an agent in another process works through /mcp instead"
         )
 
-    async def decide_permission(self, request_id: str, decision: str, message: str = "") -> None:
-        await self._broker.decide(request_id, decision, message)
+    async def decide_permission(
+        self, request_id: str, decision: str, message: str = "", by: Optional[str] = None
+    ) -> None:
+        await self._broker.decide(request_id, decision, message, by=by)
 
     async def interrupt(self) -> None:
         # Nothing of this process's is running a turn, so there is nothing to

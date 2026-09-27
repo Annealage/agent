@@ -46,6 +46,7 @@ class StubRegistry:
 
 class _Conn:
     tab_id = "tab-1"
+    human = None
 
 
 def _frame(request_id="pr_1", decision="deny", message="not that file"):
@@ -100,7 +101,7 @@ async def test_the_refusal_names_the_cause_rather_than_a_generic_failure():
 
 async def test_a_session_that_actually_breaks_still_gets_the_generic_answer(capsys):
     class _BrokenSession(FakeSession):
-        async def decide_permission(self, request_id, decision, message=""):
+        async def decide_permission(self, request_id, decision, message="", by=None):
             raise RuntimeError("broker exploded")
 
     sent = await _dispatch(_BrokenSession(lambda event: None), _frame())

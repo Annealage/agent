@@ -528,7 +528,9 @@ class OmpSession:
         await self._run_blocking(self._client.set_custom_tools, self._build_host_tools())
         return True
 
-    async def decide_permission(self, request_id: str, decision: str, message: str = "") -> None:
+    async def decide_permission(
+        self, request_id: str, decision: str, message: str = "", by: Optional[str] = None
+    ) -> None:
         """Route a human's decision to the broker. Identical to
         ``SdkSession.decide_permission``/``CodexSession.decide_permission``;
         see either docstring for why ``UnknownRequest`` propagates
@@ -536,7 +538,7 @@ class OmpSession:
         if self._broker is None:
             return
         try:
-            await self._broker.decide(request_id, decision, message)
+            await self._broker.decide(request_id, decision, message, by=by)
         except UnknownRequest:
             raise
         except Exception as exc:

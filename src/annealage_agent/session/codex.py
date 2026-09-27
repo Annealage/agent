@@ -341,14 +341,16 @@ class CodexSession:
         future = self._loop.run_in_executor(self._drain_executor, self._drain_turn, turn_id, viewer)
         future.add_done_callback(self._on_drain_future_done)
 
-    async def decide_permission(self, request_id: str, decision: str, message: str = "") -> None:
+    async def decide_permission(
+        self, request_id: str, decision: str, message: str = "", by: Optional[str] = None
+    ) -> None:
         """Route a human's decision to the broker. Identical to
         ``SdkSession.decide_permission``; see its docstring for why
         ``UnknownRequest`` propagates deliberately."""
         if self._broker is None:
             return
         try:
-            await self._broker.decide(request_id, decision, message)
+            await self._broker.decide(request_id, decision, message, by=by)
         except UnknownRequest:
             raise
         except Exception as exc:
