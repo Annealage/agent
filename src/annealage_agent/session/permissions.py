@@ -61,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import re
+import secrets
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple, Union
@@ -199,6 +200,10 @@ class PermissionBroker:
         self._no_viewer_timer = None
         self._shutdown = False
         self._next_id = 1
+        # Every request id this broker gives out carries this, so a new
+        # broker (the app resumed after an idle close, or restarted) never
+        # reissues an id a page still shows a card for.
+        self._id_prefix = "pr_%s_" % secrets.token_hex(4)
         # One future per outstanding request, keyed by the id ``ask``
         # allocates; cleaned up in ``ask``'s own ``finally`` regardless of
         # how the request ends, mirroring viewers.py's ``call``.
@@ -294,7 +299,7 @@ class PermissionBroker:
         if self._viewer_count == 0:
             return Decision(allow=False, message=self._no_viewer_message())
 
-        request_id = "pr_%d" % self._next_id
+        request_id = "%s%d" % (self._id_prefix, self._next_id)
         self._next_id += 1
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         event = PermissionRequest(

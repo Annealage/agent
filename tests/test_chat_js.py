@@ -80,7 +80,8 @@ const { initChat } = await import(pathToFileURL(dir + "/chat.js").href);
 const { store } = await import(pathToFileURL(dir + "/store.js").href);
 
 const sent = [];
-const chat = initChat({ send: (frame) => { sent.push(frame); return true; } });
+let online = true;
+const chat = initChat({ send: (frame) => { if (!online) return false; sent.push(frame); return true; } });
 const input = el("chatInput");
 const sendMessage = (text) => { input.value = text; el("chatSend").listeners.click[0](); };
 const out = {};
@@ -165,6 +166,21 @@ chat.handleEvent({ kind: "upload_action", id: "ua_1", upload: "u-1", label: "Sub
 const endedDoc = store.getState().chat.documents.find((d) => d.id === docId);
 out.documentAfterAction = { state: endedDoc.state, message: endedDoc.message };
 
+// Permission cards across connections.
+const pendingOf = () => store.getState().chat.pending.map((p) => [p.request_id, p.submitted || null]);
+const allowOn = (index) => el("chatPending").children[index].children[3].children[0].listeners.click[0]();
+chat.handleEvent({ kind: "permission_request", request_id: "pr_a_1", tool: "t", input: {} }, { replayed: false });
+online = false;
+allowOn(0);
+out.cardWhileOffline = { pending: pendingOf(), toast: el("toast").textContent };
+online = true;
+allowOn(0);
+out.cardSent = pendingOf();
+chat.handleHello({ id: "s", agent: "ready" });
+out.cardAfterReconnect = pendingOf();
+chat.handleHello({ id: "another", agent: "ready" });
+out.cardsAfterNewSession = pendingOf();
+
 console.log(JSON.stringify(out));
 process.exit(0);
 """
@@ -243,3 +259,17 @@ def test_a_document_s_chip_says_how_its_action_ended(observed):
         "state": "ended",
         "message": "Submit to Datum: sent",
     }
+
+
+def test_a_card_whose_decision_could_not_be_sent_stays_answerable(observed):
+    assert observed["cardWhileOffline"]["pending"] == [["pr_a_1", None]]
+    assert "Not sent" in observed["cardWhileOffline"]["toast"]
+    assert observed["cardSent"] == [["pr_a_1", "allow"]]
+
+
+def test_a_new_connection_reconciles_the_cards_shown(observed):
+    # The same conversation: the card may be answered again (the replay
+    # retires it if the decision did land).
+    assert observed["cardAfterReconnect"] == [["pr_a_1", None]]
+    # Another conversation: its cards are not this one's.
+    assert observed["cardsAfterNewSession"] == []

@@ -842,7 +842,12 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     // actually applied.
     function decide(decision) {
       const message = decision === "deny" ? reasonEl.value : "";
-      send({ type: "permission", request_id: req.request_id, decision, message });
+      // A frame that never left (the connection is down) decided nothing, so
+      // the card stays answerable rather than claiming a decision is on its way.
+      if (!send({ type: "permission", request_id: req.request_id, decision, message })) {
+        toast("Not sent: the connection to the server is down. Try again once it is back.", false);
+        return;
+      }
       store.markChatPermissionSubmitted(req.request_id, decision);
     }
     allowBtn.addEventListener("click", () => decide("allow"));
@@ -1244,7 +1249,15 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     // restarted into a new conversation): the turns on screen belong to
     // another conversation, and this one's history arrives in the replay.
     const nextSessionId = session && session.id ? session.id : null;
-    if (sessionId !== null && nextSessionId !== sessionId) store.resetChatTurns();
+    if (sessionId !== null && nextSessionId !== sessionId) {
+      store.resetChatTurns();
+      // Another conversation's cards: nobody is waiting on them any more.
+      store.clearChatPending();
+    }
+    // A decision sent over the connection that dropped may never have
+    // arrived. A card it did decide is retired by the replay that follows;
+    // one still open can be answered again.
+    store.clearChatPermissionSubmitted();
     // Held for the Export button, which needs the id of the session it is
     // writing out. Viewer-only runs report "viewer-only" here and have no
     // conversation to export, which the button reflects by staying disabled.

@@ -606,3 +606,22 @@ async def test_a_request_arriving_with_no_viewer_is_still_denied_immediately():
     _assert_deny(result)
     assert "no browser viewer is connected" in result.message
     assert "open the toy viewer" in result.message
+
+
+async def test_a_new_broker_never_reissues_a_request_id_a_page_may_still_show():
+    """A page keeps its cards by request id across a reconnect; a broker
+    built after an idle close or a restart that numbered from the same start
+    would give its first request the id of a stale card, which the page would
+    fold into that card."""
+    ids = []
+    for _ in range(2):
+        events = []
+        broker = PermissionBroker(events.append, timeout=5.0)
+        broker.viewer_connected()
+        asked = asyncio.ensure_future(broker.ask("Write", {}, None))
+        await asyncio.sleep(0)
+        (request,) = [e for e in events if isinstance(e, PermissionRequest)]
+        ids.append(request.request_id)
+        await broker.decide(request.request_id, "deny")
+        await asked
+    assert ids[0] != ids[1]

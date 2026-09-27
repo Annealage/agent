@@ -468,6 +468,24 @@ function addChatPermissionRequest(
 // because it is the server's `permission_resolved` that says a request is over,
 // and only that event distinguishes a decision that took effect from one
 // another view had already answered.
+// Every card answerable again (a new connection: see chat.js's handleHello).
+function clearChatPermissionSubmitted() {
+  commit(() => {
+    const chat = state.chat;
+    if (!chat.pending.some((p) => p.submitted)) return;
+    const pending = Object.freeze(chat.pending.map(
+      (p) => (p.submitted ? Object.freeze({ ...p, submitted: null }) : p)));
+    state = { ...state, chat: Object.freeze({ ...chat, pending }) };
+  }, ["chat"]);
+}
+
+// No card at all (another conversation's were showing).
+function clearChatPending() {
+  commit(() => {
+    state = { ...state, chat: Object.freeze({ ...state.chat, pending: Object.freeze([]) }) };
+  }, ["chat"]);
+}
+
 function markChatPermissionSubmitted(requestId, decision) {
   commit(() => {
     const chat = state.chat;
@@ -696,6 +714,8 @@ export const store = Object.freeze({
   dropChatUserTurn,
   addChatPermissionRequest,
   markChatPermissionSubmitted,
+  clearChatPermissionSubmitted,
+  clearChatPending,
   removeChatPermissionRequest,
   setChatAgentStatus,
   setChatModel,
