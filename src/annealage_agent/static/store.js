@@ -52,7 +52,7 @@
  *                 from a server restart, and the fallback runs under this
  *                 state too.
  *   chat          {turns, pendingUser, pending, agentStatus, model, banner,
- *                  attachments}
+ *                  attachments, usage}
  *                 the whole chat pane's state.
  *                 `turns` is one record per turn number, `{turn, user,
  *                 text, tools, stopReason, costUsd, complete}`, built up
@@ -96,6 +96,12 @@
  *                 `set_model` frame actually took effect as: the LLM
  *                 backend's active model, read and written only by the chat
  *                 pane.
+ *                 `usage` is the conversation's usage so far, as the hello
+ *                 frame's `session.usage` and each live `usage` event carry
+ *                 it: `{cost_usd, tokens: {input, output, cache_read,
+ *                 cache_write}, context: {used_tokens, window_tokens} |
+ *                 null}`, any figure null where the backend does not say,
+ *                 or null before it has said anything.
  *                 `attachments` is one entry per image attached to the
  *                 message being composed, in the order they were attached,
  *                 whatever state each is in: `[{id, kind, state, path, url,
@@ -140,6 +146,7 @@ let state = Object.freeze({
     model: null,
     banner: null,
     attachments: Object.freeze([]),
+    usage: null,
   }),
 });
 
@@ -490,6 +497,12 @@ function setChatModel(model) {
   }, ["chat"]);
 }
 
+function setChatUsage(usage) {
+  commit(() => {
+    state = { ...state, chat: Object.freeze({ ...state.chat, usage: usage || null }) };
+  }, ["chat"]);
+}
+
 function setChatBanner(kind, text, detail = null) {
   commit(() => {
     const banner = Object.freeze({ kind, text, detail: detail || null });
@@ -602,6 +615,7 @@ export const store = Object.freeze({
   removeChatPermissionRequest,
   setChatAgentStatus,
   setChatModel,
+  setChatUsage,
   setChatBanner,
   clearChatBanner,
   resetChatTurns,

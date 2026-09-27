@@ -134,6 +134,12 @@ class EventLog:
         #: before anyone answered, which ``app.create_app`` closes, so a page
         #: replaying the history is not shown a card nobody can answer.
         self.unresolved_requests: tuple = ()
+        #: The figures of the file's last ``usage`` event (``Usage.snapshot``'s
+        #: shape), or ``None``: what the conversation had used when the last
+        #: process stopped, which the ``hello`` reports until the backend
+        #: reports afresh. Every ``usage`` event is the whole conversation's,
+        #: so the last one is the answer, with nothing summed.
+        self.last_usage: Optional[dict] = None
         #: Called with each appended event's wire dict, after it is recorded:
         #: every event a page sees passes through here, whichever of the
         #: app's publishers sent it, so this is where the app's status
@@ -178,6 +184,11 @@ class EventLog:
                 if not isinstance(event, dict):
                     continue
                 kind = event.get("kind")
+                if kind == "usage":
+                    self.last_usage = {
+                        key: event.get(key) for key in ("cost_usd", "tokens", "context")
+                    }
+                    continue
                 request_id = event.get("request_id")
                 if kind == "permission_request" and isinstance(request_id, str):
                     requests[request_id] = None
@@ -395,8 +406,8 @@ TRANSCRIPT_INCLUDE = ("text", "full")
 # transcript at any level: review_changed, a product's own events (Mesh's
 # models_changed), pause_changed and viewer_primary describe the browser's
 # view of a running server, not the conversation, and agent_status,
-# session_reset and agent_error describe the session's own lifecycle rather
-# than anything said or done within it.
+# session_reset, agent_error and usage describe the session's own lifecycle
+# and bookkeeping rather than anything said or done within it.
 _KIND_MIN_INCLUDE = {
     "user_turn": "text",
     "text_delta": "text",

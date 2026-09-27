@@ -190,6 +190,7 @@ def register_ws(
                         agent_error=(
                             session_info.get("agent_error") if agent != AGENT_READY else None
                         ),
+                        usage=session_info.get("usage"),
                     )
                 )
             )

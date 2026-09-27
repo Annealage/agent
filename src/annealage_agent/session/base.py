@@ -244,6 +244,62 @@ class TurnEnd(AgentEvent):
     tokens: Optional[dict] = None
 
 
+#: The token counts a ``Usage`` reports.
+USAGE_TOKEN_KEYS = ("input", "output", "cache_read", "cache_write")
+
+
+@dataclasses.dataclass(frozen=True)
+class Usage(AgentEvent):
+    """What the conversation has used so far, as the backend reports it:
+    emitted after every ``TurnEnd`` and, by a backend that knows it before
+    any turn (omp, on a resumed conversation), once it starts.
+
+    Every figure is the whole conversation's, a resumed one included where
+    the backend carries it across (omp reads it from the conversation file,
+    and the Claude CLI restores it with the conversation), and none is ever
+    a sum this layer made: a page summing ``turn_end`` events would be
+    wrong as soon as its replay was cut short. ``cost_usd`` is in US
+    dollars; ``tokens`` has the four ``USAGE_TOKEN_KEYS``, ``input`` being
+    the input tokens not read from the cache; ``context`` is how full the
+    model's context window is, ``{"used_tokens", "window_tokens"}``, or
+    ``None``. Anything the backend does not say is ``None``, never 0, and
+    unlike other events every field is on the wire, null when unknown.
+    """
+
+    kind: ClassVar[str] = "usage"
+    cost_usd: Optional[float] = None
+    tokens: Optional[dict] = None
+    context: Optional[dict] = None
+    viewer: Optional[str] = None
+
+    def to_wire(self) -> dict:
+        data = {"kind": self.kind, **self.snapshot()}
+        if self.viewer is not None:
+            data["viewer"] = self.viewer
+        return data
+
+    def snapshot(self) -> dict:
+        """The figures alone, as the ``hello`` frame's ``session.usage``
+        carries them."""
+        tokens = self.tokens or {}
+        return {
+            "cost_usd": self.cost_usd,
+            "tokens": {key: tokens.get(key) for key in USAGE_TOKEN_KEYS},
+            "context": dict(self.context) if self.context is not None else None,
+        }
+
+
+def context_figures(used_tokens, window_tokens) -> Optional[dict]:
+    """``Usage.context`` from a backend's two numbers: ``None`` unless it
+    gave both, and a window of at least one token, since a fill without
+    either is not a figure anyone can read."""
+    if not isinstance(used_tokens, int) or not isinstance(window_tokens, int):
+        return None
+    if window_tokens <= 0:
+        return None
+    return {"used_tokens": used_tokens, "window_tokens": window_tokens}
+
+
 @dataclasses.dataclass(frozen=True)
 class PauseChanged(AgentEvent):
     """The human's pause switch moved, so the product tools that change the view or
@@ -415,6 +471,7 @@ GENERIC_EVENTS = (
     PermissionRequest,
     PermissionResolved,
     TurnEnd,
+    Usage,
     PauseChanged,
     ViewerPrimary,
     AgentStatus,

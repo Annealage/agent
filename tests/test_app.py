@@ -341,6 +341,54 @@ async def test_a_page_opened_while_the_agent_is_down_is_told_why(served_dir):
     assert up["session"]["agent_error"] is None
 
 
+async def test_the_hello_carries_the_conversation_s_usage_across_a_restart(served_dir):
+    """A page shows usage from the hello and live events only, so the hello
+    must carry the latest: before the backend has said anything, null; then
+    the last ``usage`` event's figures, whatever else followed; and after a
+    restart, the last one the log holds, never a sum of the log's turn ends,
+    until the resumed backend reports afresh."""
+    from annealage_agent.session.base import TurnEnd, Usage
+    from annealage_agent.session.fake import FakeSession
+
+    app, session = _app_with_fake_session(served_dir)
+    try:
+        assert (await _hello_of(app))["session"]["usage"] is None
+        session.emit(TurnEnd(turn=1, stop_reason="end", cost_usd=0.5))
+        session.emit(Usage(cost_usd=0.5, tokens={"input": 100, "output": 20}))
+        session.emit(TurnEnd(turn=2, stop_reason="end", cost_usd=0.3))
+        session.emit(
+            Usage(
+                cost_usd=0.75,
+                tokens={"input": 150, "output": 30, "cache_read": 900, "cache_write": 40},
+                context={"used_tokens": 1200, "window_tokens": 200000},
+            )
+        )
+        # A turn end with no usage after it (the backend could not say): the
+        # hello keeps the last usage it was told, and the turn ends' costs
+        # (0.8 in all) are never summed.
+        session.emit(TurnEnd(turn=3, stop_reason="interrupted", cost_usd=0.0))
+        latest = {
+            "cost_usd": 0.75,
+            "tokens": {"input": 150, "output": 30, "cache_read": 900, "cache_write": 40},
+            "context": {"used_tokens": 1200, "window_tokens": 200000},
+        }
+        assert (await _hello_of(app))["session"]["usage"] == latest
+    finally:
+        app.agent_event_log.close()
+
+    sid = session.session_id
+    restarted = create_toy_app(
+        served_dir,
+        token="tok",
+        session_id=sid,
+        build_session=lambda on_event, *, bus: FakeSession(on_event, session_id=sid),
+    )
+    try:
+        assert (await _hello_of(restarted))["session"]["usage"] == latest
+    finally:
+        restarted.agent_event_log.close()
+
+
 async def test_a_human_turn_the_last_process_never_answered_is_closed_on_resume(served_dir):
     """The process died after logging the human's message and before the
     agent said anything. The resumed app closes that turn, so the page does

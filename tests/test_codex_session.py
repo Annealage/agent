@@ -43,6 +43,9 @@ from openai_codex.generated.v2_all import (
     ItemStartedNotification,
     SandboxMode,
     ThreadItem,
+    ThreadTokenUsage,
+    ThreadTokenUsageUpdatedNotification,
+    TokenUsageBreakdown,
     Turn,
     TurnCompletedNotification,
     TurnStatus,
@@ -60,6 +63,7 @@ from annealage_agent.session.base import (
     PermissionResolved,
     ToolUse,
     TurnEnd,
+    Usage,
 )
 from annealage_agent.session.codex import CodexSession
 from annealage_agent.session.permissions import PermissionBroker
@@ -634,6 +638,58 @@ async def test_text_delta_becomes_one_text_delta_event():
 
         fake.push_turn_completed(turn_id)
         await recorder.next()
+    finally:
+        await session.close()
+
+
+def _token_usage_update(turn_id, total, last_total, window):
+    def breakdown(input, cached, output, total_tokens):
+        return TokenUsageBreakdown(
+            input_tokens=input,
+            cached_input_tokens=cached,
+            output_tokens=output,
+            reasoning_output_tokens=0,
+            total_tokens=total_tokens,
+        )
+
+    return Notification(
+        method="thread/tokenUsage/updated",
+        payload=ThreadTokenUsageUpdatedNotification(
+            thread_id="thread-1",
+            turn_id=turn_id,
+            token_usage=ThreadTokenUsage(
+                total=breakdown(*total),
+                last=breakdown(0, 0, 0, last_total),
+                model_context_window=window,
+            ),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_usage_at_a_turn_end_is_the_thread_s_running_token_totals_with_no_cost():
+    """Codex reports tokens but no dollars, so the cost is unknown (null,
+    not 0); its input count includes the cached input, which ``Usage`` keeps
+    apart; the latest update of the turn wins, and the last call's tokens
+    against the model's window is the context's fill."""
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn([{"type": "text", "text": "hi"}])
+        turn_id = fake.turn_start_calls[0].turn_id
+        fake.push_notification(turn_id, _token_usage_update(turn_id, (500, 0, 20, 520), 520, None))
+        fake.push_notification(
+            turn_id, _token_usage_update(turn_id, (9000, 6000, 700, 9700), 5200, 258400)
+        )
+        fake.push_turn_completed(turn_id)
+        assert isinstance(await recorder.next(), TurnEnd)
+        usage = await recorder.next()
+        assert isinstance(usage, Usage)
+        assert usage.to_wire() == {
+            "kind": "usage",
+            "cost_usd": None,
+            "tokens": {"input": 3000, "output": 700, "cache_read": 6000, "cache_write": 0},
+            "context": {"used_tokens": 5200, "window_tokens": 258400},
+        }
     finally:
         await session.close()
 

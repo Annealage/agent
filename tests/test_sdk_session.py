@@ -48,6 +48,7 @@ from annealage_agent.session.base import (
     ToolResult,
     ToolUse,
     TurnEnd,
+    Usage,
 )
 from annealage_agent.session.permissions import Decision
 from annealage_agent.session.sdk import SandboxStatus, SdkSession
@@ -644,6 +645,118 @@ async def test_result_message_becomes_turn_end_with_its_cost():
         assert end.turn == 1
         assert end.stop_reason == "end_turn"
         assert end.cost_usd == 0.031
+    finally:
+        await session.close()
+
+
+def _result(total_cost_usd, model_usage=None):
+    message = {
+        "type": "result",
+        "subtype": "success",
+        "duration_ms": 1200,
+        "duration_api_ms": 900,
+        "is_error": False,
+        "num_turns": 1,
+        "session_id": "sdk-sess-1",
+        "stop_reason": "end_turn",
+        "total_cost_usd": total_cost_usd,
+    }
+    if model_usage is not None:
+        message["modelUsage"] = model_usage
+    return message
+
+
+def _model_usage(input, output, cache_read, cache_write, window=200000):
+    return {
+        "inputTokens": input,
+        "outputTokens": output,
+        "cacheReadInputTokens": cache_read,
+        "cacheCreationInputTokens": cache_write,
+        "webSearchRequests": 0,
+        "costUSD": 0.0,
+        "contextWindow": window,
+        "maxOutputTokens": 32000,
+    }
+
+
+@pytest.mark.asyncio
+async def test_usage_after_a_result_is_the_cli_s_running_total_for_the_conversation():
+    """The CLI's result carries running totals for the conversation, which
+    it restores on a resume (checked against the bundled CLI: a resumed
+    process's first result carried the earlier turns' cost and tokens), so
+    ``Usage`` is those totals as they stand, never a sum of results; the
+    context's fill is the last main call's prompt against its model's
+    window, and a subagent's call is not the main conversation's."""
+    session, transport, recorder = await _started_session(resume="prior-sdk-session-id")
+    try:
+        session._turn = 1
+        transport.push(
+            {
+                "type": "assistant",
+                "session_id": "sdk-sess-1",
+                "message": {
+                    "model": "claude-haiku-4-5-20251001",
+                    "content": [{"type": "text", "text": "done"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "cache_read_input_tokens": 14564,
+                        "cache_creation_input_tokens": 90,
+                        "output_tokens": 34,
+                    },
+                },
+            }
+        )
+        transport.push(
+            {
+                "type": "assistant",
+                "session_id": "sdk-sess-1",
+                "parent_tool_use_id": "tu_task",
+                "message": {
+                    "model": "claude-haiku-4-5-20251001",
+                    "content": [{"type": "text", "text": "a subagent"}],
+                    "usage": {"input_tokens": 3, "output_tokens": 1},
+                },
+            }
+        )
+        transport.push(
+            _result(
+                0.0339,
+                {
+                    "claude-haiku-4-5": _model_usage(30, 113, 29218, 14733),
+                    "claude-haiku-4-5-20251001": _model_usage(898, 13, 0, 0),
+                },
+            )
+        )
+        assert isinstance(await recorder.next(), TurnEnd)
+        usage = await recorder.next()
+        assert isinstance(usage, Usage)
+        assert usage.to_wire() == {
+            "kind": "usage",
+            "cost_usd": 0.0339,
+            "tokens": {"input": 928, "output": 126, "cache_read": 29218, "cache_write": 14733},
+            "context": {"used_tokens": 14664, "window_tokens": 200000},
+        }
+
+        # The next result's totals replace these; they are not added to them.
+        session._turn = 2
+        transport.push(_result(0.0351, {"claude-haiku-4-5": _model_usage(40, 150, 43900, 14800)}))
+        assert isinstance(await recorder.next(), TurnEnd)
+        usage = await recorder.next()
+        assert usage.cost_usd == 0.0351
+        assert usage.tokens["cache_read"] == 43900
+
+        # A CLI that reports neither says nothing it does not know: null, not 0.
+        session._turn = 3
+        transport.push(_result(None))
+        assert isinstance(await recorder.next(), TurnEnd)
+        usage = (await recorder.next()).to_wire()
+        assert usage["cost_usd"] is None
+        assert usage["tokens"] == {
+            "input": None,
+            "output": None,
+            "cache_read": None,
+            "cache_write": None,
+        }
     finally:
         await session.close()
 

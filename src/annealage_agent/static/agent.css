@@ -35,6 +35,10 @@
   font-size: 11px; color: #9aa; white-space: nowrap; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; max-width: 14em;
 }
+/* The conversation's usage (chat.js), before the status: context fill and
+   cost, every figure in its tooltip. */
+.chatusage { font-size: 11px; color: #9aa; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.chatusage[hidden] { display: none; }
 
 .chathint { flex: none; padding: 0 14px 8px; color: #778; font-size: 11px; }
 

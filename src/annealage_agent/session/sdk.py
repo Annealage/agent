@@ -97,6 +97,8 @@ from .base import (
     ToolUse,
     TurnEnd,
     UnknownRequest,
+    Usage,
+    context_figures,
     turn_not_sent,
 )
 from .permissions import Decision
@@ -252,6 +254,9 @@ class SdkSession:
         # model interrupts the turn, and that turn ends as ended_by_tool.
         self._end_turn_pending = False
         self._stop_reason = None
+        # The model and prompt size (tokens) of the last main-conversation API
+        # call, which is how full the context window is (``_usage``).
+        self._last_call: Optional[Tuple[str, int]] = None
         self._stderr_lines = []
         # Predicted now so the banner, printed once at startup, is right on a
         # machine that plainly cannot sandbox. Corrected by the child if it
@@ -716,6 +721,10 @@ class SdkSession:
             return
         if isinstance(message, AssistantMessage):
             self._remember_sdk_session(getattr(message, "session_id", None))
+            if message.parent_tool_use_id is None:
+                prompt = _prompt_tokens(message.usage)
+                if prompt is not None:
+                    self._last_call = (message.model, prompt)
             for block in message.content or []:
                 if isinstance(block, ToolUseBlock):
                     self._emit(
@@ -763,10 +772,35 @@ class SdkSession:
                 )
             )
             self._stop_reason = None
+            self._emit(self._usage(message))
             return
         if isinstance(message, SystemMessage):
             self._handle_system(message)
             return
+
+    def _usage(self, message: ResultMessage) -> Usage:
+        """``Usage`` from a result: the CLI's running totals for the
+        conversation (``total_cost_usd``, and ``modelUsage`` summed over the
+        models it used), which it restores on a resume, so they cover the
+        turns before it too; and the context window's fill, the last main
+        call's prompt against its model's window."""
+        models = [m for m in (message.model_usage or {}).values() if isinstance(m, dict)]
+        tokens = None
+        if models:
+            tokens = {
+                key: _sum_counts(models, field)
+                for key, field in (
+                    ("input", "inputTokens"),
+                    ("output", "outputTokens"),
+                    ("cache_read", "cacheReadInputTokens"),
+                    ("cache_write", "cacheCreationInputTokens"),
+                )
+            }
+        context = None
+        if self._last_call is not None:
+            model, prompt = self._last_call
+            context = context_figures(prompt, _context_window(message.model_usage, model))
+        return Usage(cost_usd=message.total_cost_usd, tokens=tokens, context=context)
 
     def _handle_stream_event(self, message: StreamEvent) -> None:
         """Turn one raw API stream event into a ``TextDelta``, or ignore it.
@@ -991,6 +1025,48 @@ def _content_to_text(content: Any) -> str:
             text = getattr(block, "text", None)
             parts.append(text if text is not None else "[non-text content]")
     return "".join(parts)
+
+
+def _count(value) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _prompt_tokens(usage) -> Optional[int]:
+    """How many tokens an API call's prompt held (the API's ``usage``: the
+    uncached input, what the cache supplied and what it wrote), or None when
+    the call reported no usage."""
+    if not isinstance(usage, dict):
+        return None
+    counts = [
+        _count(usage.get(key))
+        for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+    ]
+    if counts[0] is None:
+        return None
+    return sum(c for c in counts if c is not None)
+
+
+def _sum_counts(models: list, field: str) -> Optional[int]:
+    """``field`` summed over ``models`` (``modelUsage``'s entries), or None
+    when none of them reports it."""
+    counts = [c for c in (_count(m.get(field)) for m in models) if c is not None]
+    return sum(counts) if counts else None
+
+
+def _context_window(model_usage, model: str) -> Optional[int]:
+    """``model``'s context window as ``modelUsage`` reports it. The CLI keys
+    that by the name it priced the calls under, which can be ``model``
+    without its date suffix (``claude-haiku-4-5`` for
+    ``claude-haiku-4-5-20251001``), so a key ``model`` starts with counts."""
+    if not isinstance(model_usage, dict) or not model:
+        return None
+    entry = model_usage.get(model)
+    if entry is None:
+        entry = next(
+            (v for k, v in model_usage.items() if isinstance(k, str) and model.startswith(k)),
+            None,
+        )
+    return _count(entry.get("contextWindow")) if isinstance(entry, dict) else None
 
 
 def _remediation_for(exc: BaseException) -> str:

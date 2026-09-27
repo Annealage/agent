@@ -44,6 +44,7 @@ class El {
   appendChild(child) { this.children.push(child); return child; }
   append(...kids) { this.children.push(...kids); }
   remove() {}
+  before(...nodes) { (this.inserted ||= []).push(...nodes); }
   setAttribute() {}
   getAttribute() { return null; }
   focus() {}
@@ -133,6 +134,23 @@ out.afterReplayEnds = input.value;
 out.lostToast = el("toast").textContent;
 out.pending = store.getState().chat.pendingUser.length;
 
+// Usage, before the agent status: from the hello, then from live events only.
+const usageChip = el("agentStatus").inserted.find((n) => n.className === "chatusage");
+chat.handleHello({ id: "s", agent: "ready", usage: {
+  cost_usd: 0.4312,
+  tokens: { input: 1200, output: 300, cache_read: 45000, cache_write: 900 },
+  context: { used_tokens: 24500, window_tokens: 200000 },
+} });
+out.usageFromHello = { text: usageChip.textContent, title: usageChip.title, hidden: usageChip.hidden };
+chat.handleEvent({ kind: "usage", cost_usd: 0.01, tokens: {}, context: null }, { replayed: true });
+out.usageAfterReplay = usageChip.textContent;
+chat.handleEvent({ kind: "usage", cost_usd: null,
+                   tokens: { input: 5, output: null, cache_read: null, cache_write: null },
+                   context: { used_tokens: 150000, window_tokens: 200000 } }, { replayed: false });
+out.usageLive = { text: usageChip.textContent, title: usageChip.title };
+chat.handleHello({ id: "s", agent: "ready", usage: null });
+out.usageHiddenWhenUnknown = usageChip.hidden;
+
 console.log(JSON.stringify(out));
 process.exit(0);
 """
@@ -181,3 +199,23 @@ def test_a_message_lost_in_a_drop_comes_back_when_the_replay_ends(observed):
     assert observed["afterReplayEnds"] == "lost one"
     assert "never arrived; it is back in the box" in observed["lostToast"]
     assert observed["pending"] == 0
+
+
+def test_the_header_shows_the_conversation_s_usage_from_the_hello_and_live_events(observed):
+    assert observed["usageFromHello"] == {
+        "text": "12% context · $0.431",
+        "title": "Context window: 24,500 of 200,000 tokens (12%)\n"
+        "Cost so far: $0.4312\n"
+        "Tokens: 1,200 in, 300 out, 45,000 read from the cache, 900 written to it",
+        "hidden": False,
+    }
+    # A replayed usage event is older than the hello; each is the whole
+    # conversation's, so the live one replaces what was shown.
+    assert observed["usageAfterReplay"] == "12% context · $0.431"
+    assert observed["usageLive"] == {
+        "text": "75% context",
+        "title": "Context window: 150,000 of 200,000 tokens (75%)\n"
+        "Cost so far: unknown\n"
+        "Tokens: 5 in, unknown out, unknown read from the cache, unknown written to it",
+    }
+    assert observed["usageHiddenWhenUnknown"] is True

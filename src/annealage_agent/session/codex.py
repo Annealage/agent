@@ -93,6 +93,8 @@ from openai_codex.generated.v2_all import (
     SandboxMode,
     ThreadResumeParams,
     ThreadStartParams,
+    ThreadTokenUsage,
+    ThreadTokenUsageUpdatedNotification,
     TurnCompletedNotification,
 )
 from openai_codex.models import Notification
@@ -113,6 +115,8 @@ from .base import (
     ToolUse,
     TurnEnd,
     UnknownRequest,
+    Usage,
+    context_figures,
     turn_not_sent,
 )
 from .codex_mcp_stdio_bridge import AGENT_TOKEN_ENV
@@ -223,6 +227,9 @@ class CodexSession:
         # complete interrupts the turn, which then ends as ended_by_tool.
         self._end_turn_pending = False
         self._stop_reason: Optional[str] = None
+        # The thread's latest token usage (thread/tokenUsage/updated),
+        # reported as ``Usage`` at each turn's end.
+        self._token_usage: Optional[ThreadTokenUsage] = None
         # The client's own bounded stderr tail (see backend_logs), kept here
         # so it outlives a client that failed to start and was dropped.
         self._stderr_lines = None
@@ -816,9 +823,10 @@ class CodexSession:
 
         Only the kinds this file maps to something the chat pane renders are
         handled; every other notification kind (reasoning deltas, plan
-        updates, token-usage updates, ...) has no agent event to become and is
-        silently ignored, the same tolerance ``SdkSession._handle`` shows for
-        SDK message kinds it does not render.
+        updates, ...) has no agent event to become and is silently ignored,
+        the same tolerance ``SdkSession._handle`` shows for SDK message kinds
+        it does not render. A token-usage update is kept for the ``Usage``
+        the turn's end reports.
         """
         method = notification.method
         payload = notification.payload
@@ -836,6 +844,11 @@ class CodexSession:
             return
         if method == "turn/completed" and isinstance(payload, TurnCompletedNotification):
             self._handle_turn_completed(payload, viewer)
+            return
+        if method == "thread/tokenUsage/updated" and isinstance(
+            payload, ThreadTokenUsageUpdatedNotification
+        ):
+            self._token_usage = payload.token_usage
             return
         if method == "error" and isinstance(payload, ErrorNotification):
             self._emit(
@@ -920,6 +933,8 @@ class CodexSession:
         # way); 0.0 is an honest "not applicable" rather than a guess.
         stop_reason, self._stop_reason = self._stop_reason or turn.status.value, None
         self._emit(TurnEnd(turn=self._turn, stop_reason=stop_reason, cost_usd=0.0, viewer=viewer))
+        if self._token_usage is not None:
+            self._emit(_usage(self._token_usage, viewer))
 
     # -- failure ---------------------------------------------------------------
 
@@ -992,6 +1007,27 @@ def _to_codex_decision(decision: Decision) -> dict:
     if decision.remember_tool is not None:
         return {"decision": "acceptForSession"}
     return {"decision": "accept"}
+
+
+def _usage(token_usage: ThreadTokenUsage, viewer: Optional[str]) -> Usage:
+    """``Usage`` from Codex's token usage: the thread's running totals, no
+    cost (a subscription does not meter a turn in dollars), and the last
+    call's tokens against the model's window for the context's fill.
+    Codex counts cached input inside ``inputTokens``; ``Usage.tokens`` keeps
+    the cache apart, as the other backends do."""
+    total = token_usage.total
+    cache_write = total.cache_write_input_tokens
+    return Usage(
+        cost_usd=None,
+        tokens={
+            "input": max(0, total.input_tokens - total.cached_input_tokens),
+            "output": total.output_tokens,
+            "cache_read": total.cached_input_tokens,
+            "cache_write": cache_write if isinstance(cache_write, int) else None,
+        },
+        context=context_figures(token_usage.last.total_tokens, token_usage.model_context_window),
+        viewer=viewer,
+    )
 
 
 def _unwrap(value):

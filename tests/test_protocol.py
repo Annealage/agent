@@ -146,6 +146,8 @@ def test_build_hello_round_trips():
             # Present and false unless the backend steers (omp), so the page
             # labels Send as Send.
             "steers": False,
+            # Present and null until the backend has reported any usage.
+            "usage": None,
         },
         "protocol": PROTOCOL_VERSION,
     }

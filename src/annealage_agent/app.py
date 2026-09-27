@@ -55,6 +55,7 @@ from .session.base import (
     AgentStatus,
     PermissionResolved,
     TurnEnd,
+    Usage,
 )
 from .session.events import EventLog
 from .session.permissions import OUTCOME_SHUTDOWN
@@ -521,6 +522,10 @@ def create_app(
         # written back here is what makes it stay one that is current).
         "model": settings.get("model"),
         "steers": False,
+        # The conversation's usage so far (``Usage.snapshot``), for the
+        # hello: the last the log recorded until the backend reports afresh,
+        # then kept live by ``_event_publisher``.
+        "usage": event_log.last_usage,
     }
     app.agent_registry = registry
     app.agent_event_log = event_log
@@ -815,6 +820,8 @@ def _event_publisher(registry, event_log, session_info=None):
     ``session_info["agent_error"]``, and dropped once an ``AgentStatus``
     says the agent is ready: a page opened while the agent is down learns
     why from the ``hello``, since it raises no banner from replayed history.
+    The latest ``Usage`` is kept as ``session_info["usage"]`` for the same
+    reason: the page takes its usage from the ``hello`` and live events only.
 
     Every ``AgentError`` is also written to this process's stderr
     (``_journal_agent_error``), so a service's journal says why its agent is
@@ -838,6 +845,8 @@ def _event_publisher(registry, event_log, session_info=None):
         if session_info is not None and isinstance(event, AgentStatus):
             if event.status == AGENT_READY:
                 session_info["agent_error"] = None
+        if session_info is not None and isinstance(event, Usage):
+            session_info["usage"] = event.snapshot()
         seq = event_log.append(event)
         frame = protocol.build_event(seq, event.to_wire())
         asyncio.ensure_future(registry.broadcast(frame))

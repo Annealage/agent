@@ -51,6 +51,7 @@ from annealage_agent.session.base import (
     ToolResult,
     ToolUse,
     TurnEnd,
+    Usage,
 )
 from annealage_agent.session.omp import (
     OmpSession,
@@ -88,6 +89,9 @@ class FakeRpcClient:
         # The cumulative figures get_session_stats reports.
         self.cost = 0.0
         self.tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+        # get_state's contextUsage (omp_rpc's ContextUsage), None when omp
+        # reports none.
+        self.context_usage = None
 
     def start(self):
         self.started = True
@@ -97,7 +101,11 @@ class FakeRpcClient:
         self.stopped = True
 
     def get_state(self):
-        return SimpleNamespace(session_id=self.session_id, session_file=self.session_file)
+        return SimpleNamespace(
+            session_id=self.session_id,
+            session_file=self.session_file,
+            context_usage=self.context_usage,
+        )
 
     def get_session_stats(self):
         return SimpleNamespace(cost=self.cost, tokens=SimpleNamespace(**self.tokens))
@@ -1152,6 +1160,65 @@ async def test_a_turn_end_reports_that_turn_s_cost_and_tokens_from_the_session_s
         # This turn's share, not the session's running total.
         assert second.cost_usd == pytest.approx(0.15)
         assert second.tokens == {"input": 600, "output": 60, "cache_read": 900, "cache_write": 0}
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_usage_is_the_whole_conversation_s_from_the_start_of_a_resume_through_each_turn(
+    tmp_path, monkeypatch
+):
+    """omp's stats cover the conversation file, so a resumed conversation's
+    figures are reported as the session starts, before any turn, and after
+    each turn they are the running totals (the turn's own share is the
+    turn_end's), beside the context window's fill."""
+    conversation = tmp_path / "conversation.jsonl"
+    conversation.write_text("{}\n")
+    switch = FakeRpcClient.switch_session
+
+    def resume_with_history(self, session_path):
+        self.cost = 1.5
+        self.tokens = {"input": 9000, "output": 1200, "cache_read": 30000, "cache_write": 800}
+        self.context_usage = SimpleNamespace(tokens=41000, context_window=200000, percent=20.5)
+        return switch(self, session_path)
+
+    monkeypatch.setattr(FakeRpcClient, "switch_session", resume_with_history)
+    session, fake, recorder, broker = await _started_session(
+        session_dir=tmp_path / "omp", resume=str(conversation)
+    )
+    try:
+        (at_start,) = [e for e in recorder.all if isinstance(e, Usage)]
+        assert at_start.to_wire() == {
+            "kind": "usage",
+            "cost_usd": 1.5,
+            "tokens": {"input": 9000, "output": 1200, "cache_read": 30000, "cache_write": 800},
+            "context": {"used_tokens": 41000, "window_tokens": 200000},
+        }
+
+        await session.submit_turn(_text("one"))
+        fake.cost = 1.75
+        fake.tokens = {"input": 9600, "output": 1300, "cache_read": 71000, "cache_write": 900}
+        fake.context_usage = SimpleNamespace(tokens=42500, context_window=200000, percent=21.3)
+        fake.push_agent_end()
+        end = await _next_of(recorder, TurnEnd)
+        assert end.cost_usd == pytest.approx(0.25)
+        after = await recorder.next()
+        assert isinstance(after, Usage)
+        assert after.cost_usd == pytest.approx(1.75)
+        assert after.tokens == {
+            "input": 9600,
+            "output": 1300,
+            "cache_read": 71000,
+            "cache_write": 900,
+        }
+        assert after.context == {"used_tokens": 42500, "window_tokens": 200000}
+
+        # No context figure from omp: the fill is unknown, not empty.
+        await session.submit_turn(_text("two"))
+        fake.context_usage = None
+        fake.push_agent_end()
+        await _next_of(recorder, TurnEnd)
+        assert (await recorder.next()).to_wire()["context"] is None
     finally:
         await session.close()
 

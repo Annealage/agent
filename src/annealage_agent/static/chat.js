@@ -303,19 +303,73 @@ function bannerDetail(bannerEl) {
   return bannerEl.appendChild(details);
 }
 
-// Who is signed in, beside the agent status, for a page the server took by
-// its tailnet login (ws.js's `whoami`): their display name, with the login in
-// the tooltip. Built here rather than asked of the page's markup, so every
-// product's pane has it; nothing is shown for the holder of the link's token,
-// whose name nobody knows.
-async function showSignedIn(agentStatusEl) {
+// Who is signed in, at the head of the header's chips (before `firstChip`),
+// for a page the server took by its tailnet login (ws.js's `whoami`): their
+// display name, with the login in the tooltip. Built here rather than asked
+// of the page's markup, so every product's pane has it; nothing is shown for
+// the holder of the link's token, whose name nobody knows.
+async function showSignedIn(firstChip) {
   const who = await whoami();
   if (!who || who.via !== "tailscale") return;
   const chip = document.createElement("span");
   chip.className = "chatwho";
   chip.textContent = who.name || who.login;
   chip.title = "Signed in by tailnet login as " + who.login;
+  firstChip.before(chip);
+}
+
+// A whole number of tokens with thousands separators, or "unknown".
+function tokenCount(n) {
+  return typeof n === "number" ? Math.round(n).toLocaleString("en-AU") : "unknown";
+}
+
+function dollars(cost) {
+  return "$" + cost.toFixed(cost < 1 ? 3 : 2);
+}
+
+/**
+ * The conversation's usage (the hello's `session.usage`, or a live `usage`
+ * event's figures) as the header shows it: `text`, how full the context
+ * window is and what the conversation has cost, whichever the backend
+ * reports, and `title`, every figure with the unknown ones said to be so.
+ * `text` is "" when there is nothing to show.
+ */
+export function usageSummary(usage) {
+  if (!usage) return { text: "", title: "" };
+  const parts = [];
+  const title = [];
+  const context = usage.context;
+  if (context && context.window_tokens > 0) {
+    const percent = Math.round((100 * context.used_tokens) / context.window_tokens);
+    parts.push(percent + "% context");
+    title.push("Context window: " + tokenCount(context.used_tokens) + " of "
+      + tokenCount(context.window_tokens) + " tokens (" + percent + "%)");
+  } else {
+    title.push("Context window: unknown");
+  }
+  const cost = usage.cost_usd;
+  if (typeof cost === "number") {
+    parts.push(dollars(cost));
+    title.push("Cost so far: $" + cost.toFixed(4));
+  } else {
+    title.push("Cost so far: unknown");
+  }
+  const tokens = usage.tokens || {};
+  title.push("Tokens: " + tokenCount(tokens.input) + " in, " + tokenCount(tokens.output)
+    + " out, " + tokenCount(tokens.cache_read) + " read from the cache, "
+    + tokenCount(tokens.cache_write) + " written to it");
+  return { text: parts.join(" · "), title: title.join("\n") };
+}
+
+// The usage before the agent status. Built here rather than asked of the
+// page's markup, like the signed-in chip, so every product's pane has it;
+// hidden until the backend has reported a context fill or a cost.
+function usageChip(agentStatusEl) {
+  const chip = document.createElement("span");
+  chip.className = "chatusage";
+  chip.hidden = true;
   agentStatusEl.before(chip);
+  return chip;
 }
 
 /**
@@ -359,7 +413,8 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
   // `steers`, the omp backend), which is what the Send button then says.
   let steers = false;
   initAttention(root);
-  showSignedIn(agentStatusEl);
+  const usageEl = usageChip(agentStatusEl);
+  showSignedIn(usageEl);
 
   // turn number -> {row, textEl, toolsEl, metaEl, userEl, tools: Map<tool_use_id, {card, resultEl}>}
   const turnEls = new Map();
@@ -731,6 +786,13 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     agentStatusEl.dataset.state = chat.agentStatus;
   }
 
+  function renderUsage(chat) {
+    const { text, title } = usageSummary(chat.usage);
+    usageEl.hidden = !text;
+    usageEl.textContent = text;
+    usageEl.title = title;
+  }
+
   // Set to the requested model right before sending `set_model`, and
   // cleared by whichever of two frames answers it first: a matching
   // `agent_model_changed` (the switch took effect) or the next `refused`
@@ -874,6 +936,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     renderTurns(chat);
     renderPending(chat);
     renderAgentStatus(chat);
+    renderUsage(chat);
     renderModel(chat);
     renderBanner(chat);
     renderInterrupt(chat);
@@ -1019,6 +1082,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
       queuedModelRevert = false;
       store.setChatAgentStatus(session.agent);
       store.setChatModel(session.model);
+      store.setChatUsage(session.usage);
       // Why the agent is down, for a page opened after it went down: the
       // agent_error event that said so is history in this connection's
       // replay, which raises no banner.
@@ -1082,6 +1146,14 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
         break;
       case "turn_end":
         store.endChatTurn(event.turn, event.stop_reason, event.cost_usd, event.tokens || null);
+        break;
+      case "usage":
+        // The hello's `session.usage` is current as of this connection; a
+        // replayed one is older, and every one is the whole conversation's,
+        // so only a live one updates it.
+        if (!replayed) {
+          store.setChatUsage({ cost_usd: event.cost_usd, tokens: event.tokens, context: event.context });
+        }
         break;
       case "attention":
         if (!replayed) {

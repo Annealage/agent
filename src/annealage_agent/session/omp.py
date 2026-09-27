@@ -171,7 +171,10 @@ throwaway agent directory), the conversation file it reports
 (``get_state``'s ``sessionFile``) is recorded through ``on_session_file``,
 and ``resume`` names such a file to switch to at start (``switch_session``).
 Tokens and cost per turn are the difference between two
-``get_session_stats`` readings, one at each turn's end.
+``get_session_stats`` readings, one at each turn's end. The readings
+themselves, cumulative over the conversation file and so over a resume, are
+the ``Usage`` that follows each turn end (and one at start), beside the
+context window's fill from ``get_state``'s ``contextUsage``.
 
 ``omp_api_key``, when set, is never written into ``models.yml`` as a
 literal string: `omp`'s own ``apiKey`` resolution (`omp://providers.md`)
@@ -221,6 +224,8 @@ from .base import (
     ToolUse,
     TurnEnd,
     UnknownRequest,
+    Usage,
+    context_figures,
     turn_not_sent,
 )
 
@@ -719,6 +724,7 @@ class OmpSession:
             return
         if self._resume:
             await self._switch_to(self._resume)
+        state = None
         try:
             state = await self._run_blocking(self._client.get_state)
             self._remember_sdk_session(state.session_id)
@@ -728,6 +734,10 @@ class OmpSession:
             # the hello frame's session id and a later -c resuming it.
             sys.stderr.write("warning: could not read the omp session state: %r\n" % (exc,))
         self._usage = await self._read_usage()
+        # A resumed conversation's figures are known before any turn; a new
+        # one has used nothing yet, which the first turn's end reports.
+        if self._usage is not None and any(self._usage.values()):
+            await self._emit_usage(self._usage, state)
         self._set_status(AGENT_READY)
 
     def _configuration_refusal(self) -> Optional[str]:
@@ -973,6 +983,7 @@ class OmpSession:
         if usage is not None:
             self._usage = usage
         self._emit(TurnEnd(turn=turn, stop_reason=stop_reason, cost_usd=cost, tokens=tokens))
+        await self._emit_usage(usage)
 
     async def _read_usage(self) -> Optional[dict]:
         """The session's cumulative cost and token counts so far
@@ -985,6 +996,30 @@ class OmpSession:
         usage = {key: int(getattr(stats.tokens, key)) for key in _TOKEN_KEYS}
         usage["cost"] = float(stats.cost)
         return usage
+
+    async def _emit_usage(self, usage: Optional[dict], state=None) -> None:
+        """``Usage`` from ``usage`` (``_read_usage``'s reading, cumulative
+        over the conversation file, so a resumed conversation's included)
+        and the context window's fill (``get_state``'s ``contextUsage``, from
+        ``state`` when the caller has just read it)."""
+        context = None
+        try:
+            if state is None:
+                state = await self._run_blocking(self._client.get_state)
+            figures = getattr(state, "context_usage", None)
+            if figures is not None:
+                context = context_figures(figures.tokens, figures.context_window)
+        except Exception as exc:
+            sys.stderr.write("warning: could not read the omp context usage: %r\n" % (exc,))
+        if usage is None and context is None:
+            return
+        self._emit(
+            Usage(
+                cost_usd=usage["cost"] if usage is not None else None,
+                tokens={key: usage[key] for key in _TOKEN_KEYS} if usage is not None else None,
+                context=context,
+            )
+        )
 
     def _on_protocol_error(self, error) -> None:
         """Runs on `omp_rpc`'s reader thread for an error response nothing

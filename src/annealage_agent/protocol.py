@@ -144,6 +144,7 @@ def build_hello(
     model: Optional[str] = None,
     steers: bool = False,
     agent_error: Optional[dict] = None,
+    usage: Optional[dict] = None,
 ) -> dict:
     """The greeting sent once, immediately after a successful upgrade.
 
@@ -176,6 +177,12 @@ def build_hello(
     agent is down, for a page opened after it went down. The page takes no
     banner from a replayed ``agent_error`` event, which may be an earlier
     process's, so the current one has to come from here.
+
+    ``usage`` is what the conversation has used so far, as the last
+    ``usage`` event said (``session.base.Usage.snapshot``: ``cost_usd``,
+    ``tokens``, ``context``), or None before the backend has said anything.
+    A page shows it from here and from live ``usage`` events, never from a
+    replayed one, which is older than this.
     """
     return {
         "v": PROTOCOL_VERSION,
@@ -190,6 +197,7 @@ def build_hello(
             "model": model,
             "paused": bool(paused),
             "steers": bool(steers),
+            "usage": usage,
         },
         "protocol": PROTOCOL_VERSION,
     }
