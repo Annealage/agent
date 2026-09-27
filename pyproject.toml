@@ -50,7 +50,9 @@ classifiers = [
 dependencies = [
     # The web framework every route here is written against (app.py, http/).
     "microdot>=2.6,<3",
-    "claude-agent-sdk>=0.2.136,<0.3",
+    # 0.2.160: session/sdk.py imports ConversationResetMessage, which older
+    # releases lack (Mesh's venv at 0.2.136 failed to import the session).
+    "claude-agent-sdk>=0.2.160,<0.3",
     # http/routes_mcp.py builds the /mcp endpoint's request and response
     # bodies from mcp.types (Tool/CallToolResult/ListToolsResult), and
     # session/codex_mcp_stdio_bridge.py's stdio side is built entirely on
