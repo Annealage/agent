@@ -564,7 +564,9 @@ class OmpSession:
         if self._client is None:
             return
         if self._broker is not None:
-            for request in list(self._broker.pending_requests()):
+            # The agent's own requests: a card the human raised from the page
+            # (an upload action) is not this turn's to deny.
+            for request in self._broker.pending_requests(agent_only=True):
                 try:
                     await self._broker.decide(request.request_id, "deny", "turn interrupted")
                 except UnknownRequest:

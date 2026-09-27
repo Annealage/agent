@@ -528,7 +528,7 @@ class PermissionBroker:
 
     # -- replay and shutdown -----------------------------------------------
 
-    def pending_requests(self) -> List[PermissionRequest]:
+    def pending_requests(self, agent_only: bool = False) -> List[PermissionRequest]:
         """Every ``permission_request`` still awaiting a decision, for a
         freshly connected or reconnected viewer.
 
@@ -543,8 +543,12 @@ class PermissionBroker:
         directly to the one new connection, or re-broadcast through
         ``on_event`` so every tab's log gains a fresh entry); this method
         only reports what is still open.
+
+        ``agent_only`` leaves out the calls the human started from the page
+        (``action`` set, ``uploads.py``): what interrupting the agent's turn
+        denies, since those are not the turn's.
         """
-        return list(self._open.values())
+        return [r for r in self._open.values() if not (agent_only and r.action is not None)]
 
     def shutdown(self) -> None:
         """Deny every outstanding request and make every future ``ask``

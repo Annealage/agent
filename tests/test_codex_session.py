@@ -616,6 +616,27 @@ async def test_interrupt_completes_while_a_command_execution_approval_is_pending
 
 
 @pytest.mark.asyncio
+async def test_interrupt_leaves_a_card_the_human_raised_from_the_page_open():
+    """An upload action's card is the human's own, not the turn's."""
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn([{"type": "text", "text": "go"}])
+        turn_id = fake.turn_start_calls[0].turn_id
+        human = asyncio.ensure_future(
+            broker.ask("mcp__datum__submit", {}, None, action="Submit to Datum")
+        )
+        request = await recorder.next()
+        assert isinstance(request, PermissionRequest)
+        await asyncio.wait_for(session.interrupt(), timeout=2.0)
+        assert [r.request_id for r in broker.pending_requests()] == [request.request_id]
+        await broker.decide(request.request_id, "allow")
+        assert (await human).allow
+        fake.push_turn_completed(turn_id, status=TurnStatus.interrupted)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_text_delta_becomes_one_text_delta_event():
     from annealage_agent.session.base import TextDelta
 

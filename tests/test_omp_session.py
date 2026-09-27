@@ -940,6 +940,24 @@ async def test_interrupt_denies_every_pending_request_before_aborting():
 
 
 @pytest.mark.asyncio
+async def test_interrupt_leaves_a_card_the_human_raised_from_the_page_open():
+    """An upload action's card is the human's, not the agent's turn's, so
+    stopping the agent must not decline the human's own submission."""
+    session, fake, recorder, broker = await _started_session()
+    try:
+        human = asyncio.ensure_future(
+            broker.ask("mcp__datum__submit", {}, None, action="Submit to Datum", by="andrew")
+        )
+        request = await _next_of(recorder, PermissionRequest)
+        await session.interrupt()
+        assert [r.request_id for r in broker.pending_requests()] == [request.request_id]
+        await broker.decide(request.request_id, "allow")
+        assert (await human).allow
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_set_model_calls_the_rpc_set_model_with_the_provider_and_model():
     """``RpcClient.set_model(provider, model_id)`` (``omp://rpc.md``'s
     ``{type: "set_model", provider, modelId}`` wire shape), run through the
