@@ -44,6 +44,7 @@
 import { store } from "./store.js";
 import { authToken } from "./ws.js";
 import { toast } from "./ui.js";
+import { appUrl } from "./url.js";
 
 // Which layer a value came from, in words a person can act on. The keys are
 // the layer names `settings.py` reports; the project file lives in the
@@ -81,7 +82,7 @@ async function fetchSettings() {
   const token = authToken();
   if (!token) return null;
   try {
-    const res = await fetch("/settings?t=" + encodeURIComponent(token));
+    const res = await fetch(appUrl("settings") + "?t=" + encodeURIComponent(token));
     if (!res.ok) return null;
     return await res.json();
   } catch (err) {
@@ -161,7 +162,13 @@ function fieldRow(name, entry, pending, product) {
   note.className = "setnote";
   const origin = originText(entry.from, product);
   const parts = [origin];
-  if (entry.effect === "restart") parts.push("takes effect next run");
+  if (entry.in_effect === false) {
+    // A value this app does not use at all (the bind of an app a front door
+    // serves): saying when it would take effect would be wrong.
+    parts.push("not in effect: " + entry.reason);
+  } else if (entry.effect === "restart") {
+    parts.push("takes effect next run");
+  }
   if (pending) {
     // The field above holds the saved value, so what the note has to supply is
     // the other half: what the running server is still using.
@@ -333,7 +340,7 @@ function logRow(entry) {
     // By name, not position: the list grows while the window is open (omp's
     // conversation file appears with the first message), so a position could
     // by now be a different log.
-    const payload = await fetchAgentLogs("/agent/logs/" + encodeURIComponent(entry.name));
+    const payload = await fetchAgentLogs(appUrl("agent/logs/" + encodeURIComponent(entry.name)));
     button.disabled = false;
     body = logBody(payload);
     row.appendChild(body);
@@ -351,7 +358,7 @@ function agentLogSection() {
   list.className = "lognote";
   list.textContent = "Looking for the agent's logs…";
   section.appendChild(list);
-  fetchAgentLogs("/agent/logs").then((payload) => {
+  fetchAgentLogs(appUrl("agent/logs")).then((payload) => {
     const logs = payload && payload.ok === true ? payload.logs : null;
     if (!logs) {
       list.textContent = "The agent's logs could not be listed.";
@@ -401,7 +408,7 @@ function collectChanges(root, payload) {
 
 async function saveChanges(changes) {
   const token = authToken();
-  const res = await fetch("/settings?t=" + encodeURIComponent(token), {
+  const res = await fetch(appUrl("settings") + "?t=" + encodeURIComponent(token), {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ changes }),

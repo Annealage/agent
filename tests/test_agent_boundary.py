@@ -32,12 +32,15 @@ tree, by a relative specifier that resolves inside it (never a product's
 ``/static/`` file, never ``three`` or any other bare specifier); loads no
 script any other way (a worker, ``importScripts``, a URL built from
 ``import.meta.url``); names no server path but the agent layer's own routes,
-so it cannot fetch a product route or a product module by URL; and neither a
-module nor the stylesheet uses a product's vocabulary (pins, callouts, the
-camera, the scene, ...) outside a comment. JavaScript has no parser in the
-standard library, so ``_lex_js`` is a small lexer that knows exactly enough of
-the language to tell a comment from a string, a template or a regular
-expression literal, which is all these checks need.
+so it cannot fetch a product route or a product module by URL, and names each
+of those relative to the page through ``url.js``'s ``appUrl`` (so a page
+mounted under a front door's ``/p/<id>/`` reaches its own app), never by an
+absolute path; and neither a module nor the stylesheet uses a product's
+vocabulary (pins, callouts, the camera, the scene, ...) outside a comment.
+JavaScript has no parser in the standard library, so ``_lex_js`` is a small
+lexer that knows exactly enough of the language to tell a comment from a
+string, a template or a regular expression literal, which is all these checks
+need.
 
 The last tests feed each checker regressions it must catch, so neither can
 pass by checking nothing.
@@ -415,6 +418,8 @@ _OTHER_LOADS_RE = re.compile(r"\b(?:Worker|SharedWorker|importScripts)\s*\(|\bim
 _DYNAMIC_IMPORT_RE = re.compile(r"\bimport\s*\(")
 _LITERAL_DYNAMIC_IMPORT_RE = re.compile(r"\bimport\s*\(\s*([\"'])([^\"']*)\1\s*\)")
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
+# A call of url.js's helper, not its definition; the route is its argument.
+_APP_URL_CALL_RE = re.compile(r"(\bfunction\s+)?(?<![\w$.])appUrl\s*\(\s*")
 _WORD_PART_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+")
 
 
@@ -456,6 +461,24 @@ def _names_an_agent_route(text):
     return False
 
 
+def _app_url_routes(code):
+    """``(route, computed)`` for each ``appUrl(...)`` call in ``code``: the
+    literal start of its argument (a template's text up to its first
+    ``${``), and whether that argument starts with anything but a literal,
+    which leaves nothing to check."""
+    found = []
+    for match in _APP_URL_CALL_RE.finditer(code):
+        if match.group(1):
+            continue
+        start = match.end()
+        if start >= len(code) or code[start] not in "'\"`":
+            found.append((None, True))
+            continue
+        literal = code[start + 1 : _end_of_quoted(code, start) - 1]
+        found.append((literal.split("${")[0] if code[start] == "`" else literal, False))
+    return found
+
+
 def js_violations(source, path):
     """Every boundary violation in the module ``source``, read as if it lived
     at ``path`` inside the agent static tree."""
@@ -464,8 +487,20 @@ def js_violations(source, path):
     if _OTHER_LOADS_RE.search(code):
         found.append("loads a script some way other than an import statement")
     for text in strings:
-        if text.startswith("/") and not _names_an_agent_route(text):
+        if not text.startswith("/"):
+            continue
+        if _names_an_agent_route(text):
+            found.append(
+                "names %r by an absolute path, which misses the app under a front door's "
+                "prefix; resolve it with appUrl" % text
+            )
+        else:
             found.append("names %r, which is not one of the agent layer's routes" % text)
+    for route, computed in _app_url_routes(code):
+        if computed:
+            found.append("names a route by a computed expression, which cannot be checked")
+        elif not _names_an_agent_route("/" + route):
+            found.append("names %r, which is not one of the agent layer's routes" % route)
     specifiers = [m.group(2) for m in _STATIC_IMPORT_RE.finditer(code)]
     specifiers += [m.group(2) for m in _LITERAL_DYNAMIC_IMPORT_RE.finditer(code)]
     if len(_DYNAMIC_IMPORT_RE.findall(code)) != len(_LITERAL_DYNAMIC_IMPORT_RE.findall(code)):
@@ -536,6 +571,15 @@ def test_front_end_stylesheet_uses_no_product_vocabulary(path):
         'fetch("/model/" + rel);\n',
         "fetch(`/callouts`);\n",
         'fetch("/wsx");\n',
+        # The same through the helper: a product route, a prefix that is not
+        # a whole segment, and a route nothing can check.
+        'fetch(appUrl("static/js/store.js"));\n',
+        "fetch(appUrl(`submit/${id}`));\n",
+        'fetch(appUrl("wsx"));\n',
+        "fetch(appUrl(route));\n",
+        # An agent route by an absolute path, which misses a mounted app.
+        'fetch("/ws?t=" + token);\n',
+        "fetch(`/session/${id}/export?t=${t}`);\n",
         # The product's words, in code and in a string, in every inflection.
         "store.setUpAxis(value);\n",
         'toast("Pin #" + id + " added");\n',
@@ -567,10 +611,12 @@ def test_the_front_end_checker_catches_a_regression(source):
         'const re = /`([^`]+)`/g;\nconst c = "ok"; // camera\n',
         "const half = total / 2; // pins / 2\n",
         "const t = `a ${`nested ${x}`} b`; // scene\n",
-        # The agent layer's own routes, and "ping", which a prefix match on
-        # "pin" would have caught.
-        'fetch("/ws?t=" + token); fetch("/agent/static/chat.js");\n',
-        "fetch(`/session/${id}/export?t=${t}`);\n",
+        # The agent layer's own routes, through the helper, and "ping", which
+        # a prefix match on "pin" would have caught.
+        'fetch(appUrl("ws") + "?t=" + token); fetch(appUrl("agent/static/chat.js"));\n',
+        "fetch(appUrl(`session/${id}/export`) + `?t=${t}`);\n",
+        'fetch(appUrl("agent/logs/" + encodeURIComponent(name)));\n',
+        "export function appUrl(route) {\n  return route;\n}\n",
         'if (frame.type === "ping") return;\n',
     ],
 )

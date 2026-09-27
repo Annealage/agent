@@ -23,6 +23,7 @@
  */
 
 import { store, MAX_CHAT_ATTACHMENTS } from "./store.js";
+import { appUrl } from "./url.js";
 import { authToken } from "./ws.js";
 import { toast } from "./ui.js";
 
@@ -49,7 +50,8 @@ export async function uploadImage(blob, kind) {
     toast(ATTACHMENT_LIMIT_MESSAGE, false);
     return null;
   }
-  const url = "/upload?t=" + encodeURIComponent(authToken()) + "&kind=" + encodeURIComponent(kind);
+  const url =
+    appUrl("upload") + "?t=" + encodeURIComponent(authToken()) + "&kind=" + encodeURIComponent(kind);
   let res;
   try {
     res = await fetch(url, { method: "POST", body: blob });

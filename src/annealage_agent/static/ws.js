@@ -58,6 +58,7 @@
 
 import { store } from "./store.js";
 import { showError, toast } from "./ui.js";
+import { appUrl } from "./url.js";
 
 // protocol.py's PROTOCOL_VERSION. Stamped on every frame `send` writes, so
 // no caller carries a version of its own that could fall behind this one.
@@ -139,7 +140,7 @@ async function extractToken() {
   const nonce = params.get("n");
   if (!nonce) return "";
   try {
-    const res = await fetch("/login", {
+    const res = await fetch(appUrl("login"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ nonce }),
@@ -184,7 +185,7 @@ function makeTabId() {
 const TAB_ID = makeTabId();
 
 function wsPath() {
-  return "/ws?t=" + encodeURIComponent(TOKEN);
+  return appUrl("ws") + "?t=" + encodeURIComponent(TOKEN);
 }
 
 function wsUrl() {

@@ -108,7 +108,8 @@
  *                 and monotonic: `path` cannot be, since an entry has no path
  *                 until its upload has already succeeded. `path` is the
  *                 "images/<name>" string a turn frame carries and `url` is
- *                 "/asset/<name>", what the chip's thumbnail and the
+ *                 "/asset/<name>" under the app's prefix (as the server
+ *                 answered it), what the chip's thumbnail and the
  *                 sent-message thumbnail both fetch; both are null until
  *                 `state` is 'done', as `message` is until it is 'error'.
  *                 An upload in flight is therefore visible as a state on the

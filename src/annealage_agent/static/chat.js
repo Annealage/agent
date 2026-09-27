@@ -48,6 +48,7 @@ import { initAttention, notifyAttention } from "./attention.js";
 import { store } from "./store.js";
 import { uploadImage } from "./uploads.js";
 import { toast } from "./ui.js";
+import { appUrl } from "./url.js";
 import { authToken } from "./ws.js";
 
 // The three image types the upload route accepts (files.py's
@@ -207,10 +208,10 @@ function blocksToText(blocks) {
 
 // An `image_path` block's `path` is "images/<name>" (protocol.py's block
 // shape, one directory component); the image itself is served one
-// component further in, at "/asset/<name>".
+// component further in, at "asset/<name>" under the page's app.
 function assetUrlForImagePath(path) {
   const name = path.startsWith("images/") ? path.slice("images/".length) : path;
-  return "/asset/" + name;
+  return appUrl("asset/" + name);
 }
 
 // The name this page gives one message it sends: the turn frame's
@@ -928,7 +929,8 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     renderExportButton();
     try {
       const res = await fetch(
-        `/session/${encodeURIComponent(sessionId)}/export?t=${encodeURIComponent(authToken())}`,
+        appUrl(`session/${encodeURIComponent(sessionId)}/export`) +
+          `?t=${encodeURIComponent(authToken())}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

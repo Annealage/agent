@@ -39,6 +39,7 @@
  * resolves the same way.
  */
 
+import { appUrl } from "./url.js";
 import { authToken } from "./ws.js";
 
 // How often the list is fetched while the socket is not live: the same period
@@ -46,7 +47,7 @@ import { authToken } from "./ws.js";
 const POLL_MS = 1500;
 
 function reviewUrl() {
-  return "/review?t=" + encodeURIComponent(authToken());
+  return appUrl("review") + "?t=" + encodeURIComponent(authToken());
 }
 
 export function initReview({ onChange = () => {}, onError = () => {}, pollMs = POLL_MS } = {}) {
@@ -138,7 +139,7 @@ export function initReview({ onChange = () => {}, onError = () => {}, pollMs = P
 
   function setStatus(id, status) {
     const url =
-      "/review/" + encodeURIComponent(id) + "?t=" + encodeURIComponent(authToken());
+      appUrl("review/" + encodeURIComponent(id)) + "?t=" + encodeURIComponent(authToken());
     return post(url, { status }, "the comment's status was not changed");
   }
 
