@@ -599,3 +599,47 @@ async def test_the_policy_allows_what_the_page_actually_needs(tmp_path):
 async def test_responses_carry_nosniff_header(client):
     res = await client.get("/")
     assert res.headers.get("X-Content-Type-Options") == "nosniff"
+
+
+def _body_routes(app, _allowed_origins):
+    from annealage_agent.http import read_json_body
+
+    @app.post("/buffered")
+    async def buffered(req):
+        return {"got": req.json}
+
+    @app.post("/form")
+    async def form(req):
+        return {"got": dict(req.form)}
+
+    @app.post("/streamed")
+    async def streamed(req):
+        data, error = await read_json_body(req)
+        return error if error is not None else {"got": data}
+
+
+async def test_a_route_reading_an_unbuffered_body_fails_loudly(tmp_path, capsys):
+    """No body is buffered, so ``req.json`` would silently be empty; it raises
+    instead (a 500, naming the way to read it), while ``read_json_body``
+    reads the same body."""
+    app = agent_app.create_app(
+        tmp_path, page_html=TOY_PAGE, port=DEFAULT_PORT, register_routes=_body_routes
+    )
+    client = make_test_client(app)
+    sent = {"headers": {"Content-Type": "application/json"}, "body": '{"a": 1}'}
+
+    res = await client.post("/buffered", **sent)
+    assert res.status_code == 500
+    assert "read_json_body" in capsys.readouterr().err
+    res = await client.post("/streamed", **sent)
+    assert res.status_code == 200 and res.json == {"got": {"a": 1}}
+    # A form would have parsed as empty, answered as if nothing was sent.
+    res = await client.post(
+        "/form",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        body="a=1",
+    )
+    assert res.status_code == 500
+    # A request with no body has nothing to lose: req.json answers as ever.
+    res = await client.post("/buffered")
+    assert res.status_code == 200 and res.json == {"got": None}

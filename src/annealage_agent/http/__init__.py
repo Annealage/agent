@@ -47,7 +47,8 @@ async def read_json_body(req, *, max_bytes=MAX_JSON_BODY, allow_empty=False):
 
     The body is read off ``req.stream`` rather than ``req.body`` because
     ``app.py`` sets ``Request.max_body_length`` to 0, so microdot buffers
-    nothing and ``req.body`` is always empty. The declared length is checked
+    nothing (``req.body``, ``req.json`` and ``req.form`` raise on a request
+    with a body: ``app.StreamedRequest``). The declared length is checked
     first and unconditionally: on a real connection ``req.stream`` is the raw
     client reader, and reading it with no declared length never returns.
 

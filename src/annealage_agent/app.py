@@ -111,6 +111,13 @@ _URL_PREFIX_RE = re.compile(r"(?:/[A-Za-z0-9_~-]+)*")
 # route that read the stream without that check would, on a real
 # connection with no declared length, read forever: req.stream is then the
 # raw client reader, and nothing ever makes such a read return.
+#
+# The price of 0 is that microdot's buffered accessors, req.body, req.json
+# and req.form, see an empty body on every request that has one: b"", a
+# JSON parse error, an empty form. A product route reading one would get
+# nothing and carry on. So on every app this module builds, a request with a
+# body is a StreamedRequest, whose three raise instead, naming
+# http.read_json_body (install_response_handlers).
 MAX_REQUEST_BODY = 8 * 1024 * 1024
 
 
@@ -123,6 +130,33 @@ def configure_request_limits():
     """
     Request.max_content_length = MAX_REQUEST_BODY
     Request.max_body_length = 0
+
+
+
+#: What a route reading a buffered body is told.
+_UNBUFFERED = (
+    "this request's body is not buffered (the agent layer sets "
+    "Request.max_body_length to 0), so req.%s would be empty: read it off "
+    "req.stream with annealage_agent.http.read_json_body"
+)
+
+
+class StreamedRequest(Request):
+    """A request whose body only ``req.stream`` holds: ``body``, ``json`` and
+    ``form`` raise ``RuntimeError`` rather than answer as if it were empty.
+    ``install_response_handlers`` makes every request with a body one."""
+
+    @property
+    def body(self):
+        raise RuntimeError(_UNBUFFERED % "body")
+
+    @property
+    def json(self):
+        raise RuntimeError(_UNBUFFERED % "json")
+
+    @property
+    def form(self):
+        raise RuntimeError(_UNBUFFERED % "form")
 
 
 def inline_script_hashes(html_path):
@@ -648,7 +682,9 @@ def install_host_check(app, allowed_hosts):
 def install_response_handlers(app, csp_value, server_header, *, front_door=False):
     """The JSON 413, the access log and the headers every response of ``app``
     carries: ``csp_value`` as its Content-Security-Policy, ``no-store``, the
-    ``Server`` header and the rest.
+    ``Server`` header and the rest; and, before every route, a request whose
+    body microdot did not buffer made a ``StreamedRequest``, so a route that
+    reads ``req.json`` fails loudly rather than getting nothing.
 
     ``front_door`` is for the parent app apps are mounted in
     (``frontdoor.FrontDoor``). A mounted app's own handlers run first on its
@@ -658,6 +694,13 @@ def install_response_handlers(app, csp_value, server_header, *, front_door=False
     is one line. Its 413 handler is the one that answers, even for a mounted
     route: microdot checks the body limit before it looks the route up.
     """
+
+    @app.before_request
+    async def _unbuffered_body(req):
+        # Every request with a body under max_body_length = 0; still exact if
+        # a process raised that limit and microdot buffered a small body.
+        if req.content_length > Request.max_body_length:
+            req.__class__ = StreamedRequest
 
     @app.errorhandler(413)
     async def _payload_too_large(req):

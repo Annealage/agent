@@ -317,6 +317,8 @@ A product describes itself with one `annealage_agent.product.Product`, installed
 
 `app.create_app` takes the product's page (`page_html`, whose inline scripts the Content-Security-Policy hashes at startup), a `register_routes(app, allowed_origins)` for its own routes, the two tokens, the session factory and, optionally, a `review_store` and `external_agents=True` (below). `app.serve` binds, starts the app once the socket is listening (`app.agent_start(background)`: the session, the product's background tasks and the package's own), and stops it on Ctrl-C (`app.agent_stop()`: tasks cancelled, session closed, pages told to go, then each of `app.agent_on_stop`, the product's own teardown, sync or async) before closing the listener.
 
+A product route reads a request body with `annealage_agent.http.read_json_body(req)`, which checks the declared length and reads the body off `req.stream`. The package buffers no body in memory (microdot's `Request.max_body_length` is 0, process-wide), so on any app it builds, a front door included, `req.body`, `req.json` and `req.form` raise `RuntimeError` on a request that has a body, rather than answer as if it were empty.
+
 For a service that runs persistently (behind `tailscale serve`, say), `create_app` also takes:
 
 - `token`: the browser token, given explicitly. `net.load_token(path)` keeps one in a 0600 file, creating it on first use, so a bookmarked link survives restarts; `net.generate_token()` is the per-run default.
