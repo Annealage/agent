@@ -195,6 +195,7 @@ def create_app(
     resume_session=None,
     idle_timeout=None,
     identity=None,
+    start_closed=False,
 ):
     """Build a Microdot app serving ``serve_dir``, routes registered, not started.
 
@@ -298,6 +299,16 @@ def create_app(
     a new one from ``resume_session`` (``AgentHolder``), switched to the model
     the human last chose if that is not the run's. Without both, the app never
     closes for being idle.
+
+    ``start_closed`` builds the app closed: it serves its page, but builds no
+    session (and so starts no backend process) until something needs one, as
+    an idle-closed app does: a page connecting, a turn, a call through
+    ``/mcp``. That first session is built from ``build_session``, the very
+    session a start would have started, on the model the run's settings
+    name; every later one, after an idle close, from ``resume_session``.
+    ``app.agent_status()`` reports ``AGENT_CLOSED`` until then. It is for a
+    front door serving many workspaces, most of them unopened at any one
+    time. A viewer-only app has no session to put off, and ignores it.
 
     Building an app blocks: the product's tool server connects to its remote
     MCP servers (up to ``remote.DISCOVERY_TIMEOUT`` each) and the event log is
@@ -549,12 +560,16 @@ def create_app(
     # A factory returning None is the ordinary viewer-only case, not a
     # failure: it leaves an app that serves the product's page with no agent
     # attached rather than one that could not be built.
-    session = _make_session(build_session)
-    holder.install(session)
+    if start_closed and tools is not None:
+        holder.close_at_start(build_session)
+        session = None
+    else:
+        session = _make_session(build_session)
+        holder.install(session)
     # A tool result's end_turn (tools.ok) reaches whichever session is live
     # then; a session that cannot stop a turn has nothing to call.
     bus.end_turn_handler = holder.end_turn
-    if session is not None:
+    if session is not None or holder.closed:
         # /mcp is mounted only when this app has a session, for the same
         # reason /ws answers a turn only then: a viewer-only app has no
         # tools and no broker to gate them, so there is nothing for this
@@ -566,6 +581,8 @@ def create_app(
         # while constructing PermissionBroker, and None only if a factory
         # never sets it, in which case register_mcp_routes fails closed on
         # every write-class call rather than gating with no broker at all.
+        # An app built closed serves it too, for the session to come.
+
         async def _current_broker():
             await holder.ensure()
             holder.note_activity()
@@ -895,7 +912,9 @@ class AgentHolder:
     denies. So an app idle past its ``idle_timeout`` closes its session and,
     when a page next connects (``/ws``), a turn arrives or an agent in another
     process calls ``/mcp``, builds a new one from ``resume_session`` instead
-    of restarting the old one (``ensure``). Nothing that needs the session
+    of restarting the old one (``ensure``). An app built closed
+    (``start_closed``) opens its first session the same way, from
+    ``build_session``. Nothing that needs the session
     keeps it: ``/ws``, ``/mcp`` and ``/mcp/<remote>``, ``/agent/logs``, the
     registry's presence listener, the bus's ``end_turn_handler`` and
     ``retry_remotes`` all read this object when they run. ``session`` is the
@@ -942,6 +961,8 @@ class AgentHolder:
         self._review_watcher = review_watcher
         self._make_session = make_session
         self._resume_session = resume_session
+        # What ``ensure`` builds the next session from (``close_at_start``).
+        self._reopen_with = resume_session
         self._idle_timeout = (
             float(idle_timeout) if idle_timeout is not None and resume_session is not None else None
         )
@@ -989,10 +1010,20 @@ class AgentHolder:
         self._session_info["agent"] = session.agent_status()
         self._session_info["steers"] = bool(getattr(session, "steers", False))
 
+    def close_at_start(self, factory):
+        """Leave the app closed from the start (``create_app``'s
+        ``start_closed``): no session until ``ensure`` builds one, from
+        ``factory`` (the app's ``build_session``) the first time and from
+        ``resume_session`` after that."""
+        self.closed = True
+        self._reopen_with = factory
+        self.install(None)
+
     async def ensure(self):
-        """The live session, after resuming one if the idle sweep closed the
-        last: a new session from ``resume_session``, started in the
-        background (the page learns when it is ready from its
+        """The live session, after opening one if the app is closed (by the
+        idle sweep, or built closed): a new session from ``resume_session``
+        (``close_at_start`` says which factory builds the first), started in
+        the background (the page learns when it is ready from its
         ``agent_status`` events, as it does at startup). A factory that
         raises leaves the app closed, reported, for the next caller to try
         again."""
@@ -1007,10 +1038,11 @@ class AgentHolder:
         # start on: every factory builds from the run's settings.
         wanted = self._session_info.get("model")
         try:
-            session = self._make_session(self._resume_session)
+            session = self._make_session(self._reopen_with)
         except Exception as exc:
-            sys.stderr.write("error: could not resume the agent session: %r\n" % (exc,))
+            sys.stderr.write("error: could not open the agent session: %r\n" % (exc,))
             return
+        self._reopen_with = self._resume_session
         self.closed = False
         self.install(session)
         if session is not None:
@@ -1101,7 +1133,9 @@ class AgentHolder:
         if self._started:
             raise RuntimeError("this app has already been started")
         self._started = True
-        if self.session is not None:
+        # A session opened already (an app built closed, reached by a request
+        # before this ran) was started when it was opened.
+        if self.session is not None and self._start_task is None:
             await self.session.start()
         # Started here rather than in create_app, because create_app is called
         # by tests that have no running loop to own a background task and no
@@ -1111,7 +1145,11 @@ class AgentHolder:
         tasks.append(asyncio.ensure_future(ping_forever(self._registry)))
         if self._review_watcher is not None:
             tasks.append(asyncio.ensure_future(self._review_watcher.run()))
-        if self.session is not None and self._tools is not None and self._tools.unreached:
+        if (
+            (self.session is not None or self.closed)
+            and self._tools is not None
+            and self._tools.unreached
+        ):
             tasks.append(asyncio.ensure_future(retry_remotes(self._tools, self.bus, self)))
         if self._idle_timeout is not None:
             tasks.append(asyncio.ensure_future(self._sweep_idle()))

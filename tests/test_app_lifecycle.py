@@ -248,6 +248,72 @@ async def test_a_cancelled_stop_still_closes_and_runs_the_teardown_hooks(served_
     assert built[0].closed == 1 and released == [1]
 
 
+async def test_an_app_built_closed_starts_no_session_until_a_page_opens_it(served_dir):
+    """A front door's many workspaces: nothing is built or started until a
+    page arrives; then the session a start would have built (the run's own,
+    not a resume), started once; after an idle close, a resumed one."""
+    built = []
+    app = _app(served_dir, built, start_closed=True)
+    assert built == [] and app.agent_status()["agent"] == agent_app.AGENT_CLOSED
+    await app.agent_start()
+    try:
+        await asyncio.sleep(IDLE * 2)
+        assert built == [] and app.agent_session is None
+        assert app.agent_status()["agent"] == agent_app.AGENT_CLOSED
+
+        client = make_test_client(app)
+        await client.get("/ws?t=%s" % BROWSER_TOKEN, headers=_ws_headers())
+        (first,) = built
+        assert first.resumed is False and app.agent_session is first
+        await _until(lambda: first.started == 1)
+        assert app.agent_status()["agent"] == AGENT_READY
+
+        await _until(lambda: app.agent_status()["agent"] == agent_app.AGENT_CLOSED)
+        await client.get("/ws?t=%s" % BROWSER_TOKEN, headers=_ws_headers())
+        assert [session.resumed for session in built] == [False, True]
+    finally:
+        await app.agent_stop()
+    assert [session.closed for session in built] == [1, 1]
+
+
+async def test_an_app_built_closed_opens_for_an_agent_calling_mcp(served_dir):
+    """/mcp is served before any session exists, and a write through it opens
+    one, whose broker asks the human."""
+    built = []
+    app = _app(served_dir, built, start_closed=True, idle_timeout=None)
+    await app.agent_start()
+    try:
+        # A page open (not through /ws, which would open the session itself)
+        # for the broker to ask.
+        await app.agent_registry.add(_Socket())
+        assert built == []
+        client = make_test_client(app)
+        call = asyncio.ensure_future(_mcp_call(client, "add_note", {"text": "hello"}))
+        await _until(lambda: _logged(app, "permission_request"))
+        (session,) = built
+        request_id = _logged(app, "permission_request")[-1]["request_id"]
+        await session.decide_permission(request_id, "allow")
+        assert not (await asyncio.wait_for(call, 5)).get("isError")
+        assert session.started == 1
+    finally:
+        await app.agent_stop()
+
+
+async def test_an_app_built_closed_and_opened_before_its_start_starts_its_session_once(
+    served_dir,
+):
+    built = []
+    app = _app(served_dir, built, start_closed=True)
+    await app.agent_holder.ensure()
+    await app.agent_start()
+    try:
+        await _until(lambda: built[0].started >= 1)
+        await asyncio.sleep(0.05)
+        assert built[0].started == 1
+    finally:
+        await app.agent_stop()
+
+
 async def test_the_status_follows_a_turn_a_permission_and_an_idle_close(served_dir):
     built = []
     app = _app(served_dir, built)

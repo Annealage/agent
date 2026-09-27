@@ -46,7 +46,7 @@ def _workspace(tmp_path, name, notes):
     return served
 
 
-def _app(front, app_id, served, port=DEFAULT_PORT, built=None):
+def _app(front, app_id, served, port=DEFAULT_PORT, built=None, start_closed=False):
     def build(on_event, *, bus):
         session = FakeSession(on_event)
         if built is not None:
@@ -64,6 +64,7 @@ def _app(front, app_id, served, port=DEFAULT_PORT, built=None):
         review_store=toy_review_store(served),
         login=front.login,
         url_prefix=mount_prefix(app_id),
+        start_closed=start_closed,
     )
 
 
@@ -314,6 +315,36 @@ async def test_serve_starts_every_app_and_stops_them_all(tmp_path, capsys):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("127.0.0.1", port))
+
+
+async def test_apps_mounted_closed_start_no_session_until_one_is_used(tmp_path):
+    """A front door over many workspaces: serving starts none of their
+    sessions; the one a call reaches opens, the others stay closed."""
+    port = _free_port()
+    front = _front(port)
+    built = []
+    for app_id in ("a", "b"):
+        front.mount(
+            app_id,
+            _app(front, app_id, _workspace(tmp_path, app_id, []), port, built, start_closed=True),
+        )
+    ready = asyncio.Event()
+    task = asyncio.ensure_future(front.serve(on_ready=ready.set))
+    try:
+        await asyncio.wait_for(ready.wait(), 5)
+        assert built == []
+        assert {s["agent"] for s in front.apps().values()} == {agent_app.AGENT_CLOSED}
+
+        client = TestClient(front.app, host="127.0.0.1:%d" % port)
+        assert await _call_tool(client, "/p/b", "list_notes") == {"notes": []}
+        (session,) = built
+        assert front.apps()["b"]["agent"] != agent_app.AGENT_CLOSED
+        assert front.apps()["a"]["agent"] == agent_app.AGENT_CLOSED
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+    assert session.closed == 1
 
 
 async def _until_logged(capsys, text):
