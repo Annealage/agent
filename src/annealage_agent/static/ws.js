@@ -4,12 +4,18 @@
  * drives the topbar connection indicator. Reconnection uses capped
  * exponential backoff and never stops on its own except for the two cases
  * that retrying cannot fix within this page load: a protocol-version
- * mismatch, and a confirmed token refusal.
+ * mismatch, and a confirmed refusal.
  *
  * This module is the only place the token is held; it lives in the
  * TOKEN module variable, never in localStorage or sessionStorage, because a
  * token that outlives the run it belongs to is a liability and a fresh one
  * is generated every server start anyway.
+ *
+ * A page with no token is not refused here: behind `tailscale serve` the
+ * server may know the human by their tailnet login, which the browser never
+ * sees, so the page connects anyway and the server decides. Every request then
+ * goes without `?t=` (`withToken`), and `whoami()` says who the server took
+ * the page to be.
  *
  * This module never writes the product's state and knows nothing about what
  * the product shows. What the product needs from the socket it hands in to
@@ -88,24 +94,15 @@ const REFUSED_MESSAGE =
   "tab was opened without the printed link, since a plain reload does not " +
   "keep the token). Reopen the URL printed in the terminal to get a " +
   "working one.";
+// The refusal of a page that holds no token, which the server has decided on
+// the human's tailnet login alone (or on nothing, off the tailnet).
+const SIGN_IN_MESSAGE =
+  "Sign in: this page needs your tailnet login to be allowed on this " +
+  "server, or the link with its token. Ask whoever runs it to add your " +
+  "login, or open the link printed in the terminal.";
 const MISMATCH_MESSAGE =
   "This page is running an older build than the server now speaks. " +
   "Reload the page to pick up the current one.";
-
-const CONN_LABEL = {
-  connecting: "Connecting…",
-  live: "Live",
-  polling: "Polling",
-  refused: "Reopen URL",
-};
-// The generic tooltips; a product names what "live" and "polling" mean for
-// it through `initWs`'s `connTitles`.
-const CONN_TITLE = {
-  connecting: "Connecting to the live update channel.",
-  live: "Live: updates arrive without a reload.",
-  polling: "Live updates are unavailable right now; falling back to polling.",
-  refused: REFUSED_MESSAGE,
-};
 
 /**
  * Reads and consumes the per-run token from location.hash: "#t=<token>"
@@ -125,8 +122,9 @@ const CONN_TITLE = {
  * left visible in the address bar survives a reload, a bookmark and a
  * screen share, all of which are wider exposure than the "never sent to a
  * server" property the fragment was chosen for in the first place. A nonce
- * the server refuses (spent or expired) leaves no token, which ends in the
- * same "refused" state as a stale link.
+ * the server refuses (spent or expired) leaves no token, and the page goes on
+ * as one opened without a link: the server takes it by its tailnet login, or
+ * refuses it.
  */
 async function extractToken() {
   const hash = location.hash;
@@ -157,6 +155,25 @@ async function extractToken() {
 // evaluates only once the token is known, whichever form it arrived in.
 const TOKEN = await extractToken();
 
+// What a refusal means depends on whether this page had a token to be
+// refused: a stale link, or a login this server does not take.
+const REFUSED = TOKEN ? REFUSED_MESSAGE : SIGN_IN_MESSAGE;
+
+const CONN_LABEL = {
+  connecting: "Connecting…",
+  live: "Live",
+  polling: "Polling",
+  refused: TOKEN ? "Reopen URL" : "Sign in",
+};
+// The generic tooltips; a product names what "live" and "polling" mean for
+// it through `initWs`'s `connTitles`.
+const CONN_TITLE = {
+  connecting: "Connecting to the live update channel.",
+  live: "Live: updates arrive without a reload.",
+  polling: "Live updates are unavailable right now; falling back to polling.",
+  refused: REFUSED,
+};
+
 /**
  * The per-run token, for the modules that authenticate a plain HTTP request
  * with it: an upload, the settings window, a transcript export, and any
@@ -164,10 +181,56 @@ const TOKEN = await extractToken();
  * second `extractToken()` call is what keeps this module the token's only
  * holder (see the header comment): the fragment is already stripped from
  * `location.hash` by the time any other module's top-level code runs, since
- * this module evaluates first.
+ * this module evaluates first. Empty when the page has none, which is not a
+ * refusal: the server may know the human by their tailnet login.
  */
 export function authToken() {
   return TOKEN;
+}
+
+/**
+ * `url` with the token added as `t`, or `url` unchanged when the page has
+ * none: a request carries `?t=` only when there is a token to send. Every
+ * route that asks for the token is named through this.
+ */
+export function withToken(url) {
+  if (!TOKEN) return url;
+  return url + (url.includes("?") ? "&" : "?") + "t=" + encodeURIComponent(TOKEN);
+}
+
+let whoamiAnswer = null;
+
+/**
+ * Who the server takes this page to be: `{login, name, via}`, `via` being
+ * "tailscale" for a tailnet login (with the login and the display name) or
+ * "token" for the holder of the link's token (login and name null); or null
+ * when it takes the page to be nobody, or could not be asked. Asked once, at
+ * `GET whoami`; a failure is not kept, so a later call asks again.
+ */
+export function whoami() {
+  if (!whoamiAnswer) {
+    whoamiAnswer = askWhoami().then((who) => {
+      if (!who) whoamiAnswer = null;
+      return who;
+    });
+  }
+  return whoamiAnswer;
+}
+
+async function askWhoami() {
+  try {
+    const res = await fetch(withToken(appUrl("whoami")), { cache: "no-store" });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data || (data.via !== "tailscale" && data.via !== "token")) return null;
+    return {
+      login: typeof data.login === "string" ? data.login : null,
+      name: typeof data.name === "string" ? data.name : null,
+      via: data.via,
+    };
+  } catch (err) {
+    return null;
+  }
 }
 
 function makeTabId() {
@@ -178,14 +241,14 @@ function makeTabId() {
   // covers an embedded WebView that stripped it. Uniqueness here only
   // needs to hold across the handful of tabs one person opens, not
   // cryptographic strength, since the tab id carries no authority: the
-  // token is what proves who is allowed to connect at all.
+  // token or the tailnet login is what proves who may connect at all.
   return "t" + Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
 const TAB_ID = makeTabId();
 
 function wsPath() {
-  return appUrl("ws") + "?t=" + encodeURIComponent(TOKEN);
+  return withToken(appUrl("ws"));
 }
 
 function wsUrl() {
@@ -319,10 +382,12 @@ export function initWs({
     const hello = {
       v: PROTOCOL_VERSION,
       type: "hello",
-      token: TOKEN,
       last_seq: lastSeq,
       viewer: { tab_id: TAB_ID, w: window.innerWidth, h: window.innerHeight },
     };
+    // Checked by the server when the token opened the socket; a page signed
+    // in by its tailnet login has none to send.
+    if (TOKEN) hello.token = TOKEN;
     if (seqSession !== null) hello.session_id = seqSession;
     send(hello);
   }
@@ -498,10 +563,10 @@ export function initWs({
       return;
     }
     if (wasOpened) {
-      // A drop after a successful handshake: the token, Origin and Host
-      // checks already passed once for this page, so there is nothing to
-      // diagnose, only a network blip, a laptop sleep or a server restart
-      // to wait out.
+      // A drop after a successful handshake: the Origin and Host checks and
+      // the token or login already passed once for this page, so there is
+      // nothing to diagnose, only a network blip, a laptop sleep or a server
+      // restart to wait out.
       //
       // The state has to stop saying "live" here, before scheduleRetry arms
       // the fallback timer, because that timer's own guard skips the switch
@@ -515,12 +580,13 @@ export function initWs({
       return;
     }
     // Never reached "open". Per the WebSocket platform contract this looks
-    // identical whether the cause was a wrong token, a rejected Origin or
-    // Host, or the server simply being unreachable: every browser reports
-    // a pre-handshake failure as the same reasonless abnormal closure, with
-    // no status code and no body exposed to script. probeRefusal tells
-    // a stale token apart from a transient outage by asking the same
-    // question over plain HTTP instead, where the status code is visible.
+    // identical whether the cause was a refused token or login, a rejected
+    // Origin or Host, or the server simply being unreachable: every browser
+    // reports a pre-handshake failure as the same reasonless abnormal
+    // closure, with no status code and no body exposed to script.
+    // probeRefusal tells a refusal apart from a transient outage by asking
+    // the same question over plain HTTP instead, where the status code is
+    // visible.
     probeRefusal();
   }
 
@@ -531,10 +597,10 @@ export function initWs({
       if (res.status === 403) {
         // Confirmed: this exact request, over a channel that does expose
         // its status, was refused before any upgrade was attempted. Per
-        // the auth design, 403 on /ws is emitted by the token, Origin and
-        // Host checks, which is the only way a request already reaching
+        // the auth design, 403 on /ws is emitted by the Origin, Host, token
+        // and login checks, which is the only way a request already reaching
         // this same origin fails here; further retries with the same
-        // fixed token would repeat forever, so the socket path is
+        // credentials would repeat forever, so the socket path is
         // abandoned for this page load and the fallback poll takes over
         // for good.
         //
@@ -542,13 +608,16 @@ export function initWs({
         // retry on purpose. A healthy server answers this same probe with
         // 400, because the probe is a plain GET carrying no upgrade headers
         // and the route reaches the handshake and rejects it there: that
-        // status means the token was accepted and the socket failure was
-        // transient, which is exactly the case worth retrying.
+        // status means the page was accepted and the socket failure was
+        // transient, which is exactly the case worth retrying. (A plain GET
+        // needs no Origin for a tailnet login, which is what lets the probe,
+        // which a browser sends without one, tell the two apart for a page
+        // with no token too.)
         stopped = true;
         clearTimeout(fallbackTimer);
         fallbackTimer = null;
         store.setConnection("refused");
-        showError(REFUSED_MESSAGE);
+        showError(REFUSED);
         onFallback();
         return;
       }

@@ -49,7 +49,7 @@ import { store } from "./store.js";
 import { uploadImage } from "./uploads.js";
 import { toast } from "./ui.js";
 import { appUrl } from "./url.js";
-import { authToken } from "./ws.js";
+import { whoami, withToken } from "./ws.js";
 
 // The three image types the upload route accepts (files.py's
 // `_IMAGE_NAME_RE`/`sniff_image`) and the same byte cap it enforces
@@ -303,6 +303,21 @@ function bannerDetail(bannerEl) {
   return bannerEl.appendChild(details);
 }
 
+// Who is signed in, beside the agent status, for a page the server took by
+// its tailnet login (ws.js's `whoami`): their display name, with the login in
+// the tooltip. Built here rather than asked of the page's markup, so every
+// product's pane has it; nothing is shown for the holder of the link's token,
+// whose name nobody knows.
+async function showSignedIn(agentStatusEl) {
+  const who = await whoami();
+  if (!who || who.via !== "tailscale") return;
+  const chip = document.createElement("span");
+  chip.className = "chatwho";
+  chip.textContent = who.name || who.login;
+  chip.title = "Signed in by tailnet login as " + who.login;
+  agentStatusEl.before(chip);
+}
+
 /**
  * Mounts the pane. `send` is ws.js's frame sender; `root` is where the pane's
  * elements are looked up (default: the document); `ids` overrides any of
@@ -344,6 +359,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
   // `steers`, the omp backend), which is what the Send button then says.
   let steers = false;
   initAttention(root);
+  showSignedIn(agentStatusEl);
 
   // turn number -> {row, textEl, toolsEl, metaEl, userEl, tools: Map<tool_use_id, {card, resultEl}>}
   const turnEls = new Map();
@@ -929,8 +945,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     renderExportButton();
     try {
       const res = await fetch(
-        appUrl(`session/${encodeURIComponent(sessionId)}/export`) +
-          `?t=${encodeURIComponent(authToken())}`,
+        withToken(appUrl(`session/${encodeURIComponent(sessionId)}/export`)),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

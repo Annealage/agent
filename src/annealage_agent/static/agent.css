@@ -29,6 +29,12 @@
 .agentstatus[data-state="ready"] { background: #1e3a24; border-color: #2f5c39; color: #9fe0a8; }
 .agentstatus[data-state="connecting"] { background: #3a2f1e; border-color: #5c4a2f; color: #e0c07f; }
 .agentstatus[data-state="unavailable"] { background: #3a1e1e; border-color: #5c2f2f; color: #e8a0a0; }
+/* Who is signed in (chat.js, for a page taken by its tailnet login), beside
+   the status: quieter than it, and cut short rather than pushing it off. */
+.chatwho {
+  font-size: 11px; color: #9aa; white-space: nowrap; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; max-width: 14em;
+}
 
 .chathint { flex: none; padding: 0 14px 8px; color: #778; font-size: 11px; }
 

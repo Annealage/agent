@@ -40,14 +40,14 @@
  */
 
 import { appUrl } from "./url.js";
-import { authToken } from "./ws.js";
+import { withToken } from "./ws.js";
 
 // How often the list is fetched while the socket is not live: the same period
 // a product's own fallback poll uses.
 const POLL_MS = 1500;
 
 function reviewUrl() {
-  return appUrl("review") + "?t=" + encodeURIComponent(authToken());
+  return withToken(appUrl("review"));
 }
 
 export function initReview({ onChange = () => {}, onError = () => {}, pollMs = POLL_MS } = {}) {
@@ -138,8 +138,7 @@ export function initReview({ onChange = () => {}, onError = () => {}, pollMs = P
   }
 
   function setStatus(id, status) {
-    const url =
-      appUrl("review/" + encodeURIComponent(id)) + "?t=" + encodeURIComponent(authToken());
+    const url = withToken(appUrl("review/" + encodeURIComponent(id)));
     return post(url, { status }, "the comment's status was not changed");
   }
 

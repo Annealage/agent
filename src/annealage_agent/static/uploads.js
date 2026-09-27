@@ -24,7 +24,7 @@
 
 import { store, MAX_CHAT_ATTACHMENTS } from "./store.js";
 import { appUrl } from "./url.js";
-import { authToken } from "./ws.js";
+import { withToken } from "./ws.js";
 import { toast } from "./ui.js";
 
 const UPLOAD_FAILED_MESSAGE = "The upload failed. Try again.";
@@ -50,8 +50,8 @@ export async function uploadImage(blob, kind) {
     toast(ATTACHMENT_LIMIT_MESSAGE, false);
     return null;
   }
-  const url =
-    appUrl("upload") + "?t=" + encodeURIComponent(authToken()) + "&kind=" + encodeURIComponent(kind);
+  const base = withToken(appUrl("upload"));
+  const url = base + (base.includes("?") ? "&" : "?") + "kind=" + encodeURIComponent(kind);
   let res;
   try {
     res = await fetch(url, { method: "POST", body: blob });
@@ -64,11 +64,11 @@ export async function uploadImage(blob, kind) {
   try {
     data = await res.json();
   } catch (err) {
-    // The token-refusal response is `text/plain` by design (it is the same
-    // response `/ws` gives an unauthenticated caller), so a missing or stale
-    // token lands here with no JSON to parse; every other failure this route
-    // defines answers JSON, which is what "not `data`" below is there to
-    // catch the one case that does not.
+    // The refusal response is `text/plain` by design (it is the same
+    // response `/ws` gives an unauthenticated caller), so a stale token or a
+    // login this server does not take lands here with no JSON to parse;
+    // every other failure this route defines answers JSON, which is what
+    // "not `data`" below is there to catch the one case that does not.
   }
   if (!res.ok || !data || !data.ok) {
     const message = (data && data.error) || UPLOAD_FAILED_MESSAGE;

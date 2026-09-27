@@ -42,7 +42,7 @@
  */
 
 import { store } from "./store.js";
-import { authToken } from "./ws.js";
+import { withToken } from "./ws.js";
 import { toast } from "./ui.js";
 import { appUrl } from "./url.js";
 
@@ -79,10 +79,8 @@ function choicesOf(entry) {
  * knowing what the saved preferences are, so this reports and carries on.
  */
 async function fetchSettings() {
-  const token = authToken();
-  if (!token) return null;
   try {
-    const res = await fetch(appUrl("settings") + "?t=" + encodeURIComponent(token));
+    const res = await fetch(withToken(appUrl("settings")));
     if (!res.ok) return null;
     return await res.json();
   } catch (err) {
@@ -240,10 +238,8 @@ function diagnosticsBlock(facts, product) {
  * lands here too.
  */
 async function fetchAgentLogs(path) {
-  const token = authToken();
-  if (!token) return null;
   try {
-    const res = await fetch(path + "?t=" + encodeURIComponent(token));
+    const res = await fetch(withToken(path));
     return await res.json();
   } catch (err) {
     return null;
@@ -407,8 +403,7 @@ function collectChanges(root, payload) {
 }
 
 async function saveChanges(changes) {
-  const token = authToken();
-  const res = await fetch(appUrl("settings") + "?t=" + encodeURIComponent(token), {
+  const res = await fetch(withToken(appUrl("settings")), {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ changes }),
