@@ -347,6 +347,46 @@ async def test_apps_mounted_closed_start_no_session_until_one_is_used(tmp_path):
     assert session.closed == 1
 
 
+async def test_what_a_before_stop_hook_mounts_is_stopped_and_a_later_mount_refused(
+    tmp_path, capsys
+):
+    """A product still building an app when the front door stops (built in a
+    thread, mounted after) finishes it in a ``before_stop`` hook, and the
+    front door stops it with the rest; one that fails does not keep the next
+    from running. Past that point a mount is refused, never served and never
+    stopped by the door."""
+    port = _free_port()
+    front = _front(port)
+    built, stopped = [], []
+
+    def failing():
+        raise RuntimeError("hook failed")
+
+    async def finish_building():
+        app = await asyncio.to_thread(
+            _app, front, "late", _workspace(tmp_path, "late", []), port, built
+        )
+        app.agent_on_stop.append(lambda: stopped.append("late"))
+        front.mount("late", app)
+
+    front.before_stop.extend([failing, finish_building])
+    ready = asyncio.Event()
+    task = asyncio.ensure_future(front.serve(on_ready=ready.set))
+    await asyncio.wait_for(ready.wait(), 5)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5)
+
+    assert stopped == ["late"] and built[0].closed == 1
+    assert "hook failed" in capsys.readouterr().err
+
+    after = _app(front, "after", _workspace(tmp_path, "after", []), port, built)
+    with pytest.raises(RuntimeError, match="shutting down"):
+        front.mount("after", after)
+    assert set(front.apps()) == {"late"}
+    await after.agent_stop()
+
+
 async def _until_logged(capsys, text):
     seen = ""
     for _ in range(200):

@@ -17,10 +17,13 @@ oversized body before it looks the route up.
 The front door starts every app it holds once it is listening (``serve``),
 and one mounted while it serves is started then (``mount``, or
 ``await front.start_app(id)`` to wait for that); each app's idle timeout,
-where it has one, runs on its own (``app.AgentHolder``); on the way out every
-app is stopped, then the server. Building an app blocks for as long as its
-remote MCP servers take to answer (up to ``remote.DISCOVERY_TIMEOUT``), so a
-product that adds one while others are served calls ``create_app`` through
+where it has one, runs on its own (``app.AgentHolder``); on the way out the
+product's ``before_stop`` hooks run (the place to finish mounting what it
+was still building), then every app is stopped, then the server. An app
+mounted after that is refused, for its builder to stop. Building an app
+blocks for as long as its remote MCP servers take to answer (up to
+``remote.DISCOVERY_TIMEOUT``), so a product that adds one while others are
+served calls ``create_app`` through
 ``asyncio.to_thread`` and then ``mount`` on the event loop.
 
 A product's page served under a prefix reaches the agent layer's modules
@@ -82,6 +85,12 @@ class FrontDoor:
     ``/agent/static/`` (the agent layer's front end, for the page), and
     ``/p/<id>``, which redirects to ``/p/<id>/`` so the page's relative URLs
     resolve under its app.
+
+    ``before_stop`` is a list of callables, sync or async, that ``serve``
+    calls with no arguments on its way out, in order, before it stops any
+    app: a product building apps in threads (``create_app`` blocks) waits
+    for them there and mounts them, and the front door stops them with the
+    rest. One that fails is reported and the rest still run.
     """
 
     def __init__(
@@ -116,6 +125,10 @@ class FrontDoor:
         self._background = {}
         self._starts = {}
         self._serving = False
+        # Set once the apps are being stopped: an app mounted later would
+        # never be stopped, so ``mount`` refuses it.
+        self._stopping = False
+        self.before_stop = []
         agent_app.install_host_check(self.app, net.allowed_hosts(bind, port, extra_hosts))
 
         if register_routes is not None:
@@ -156,8 +169,15 @@ class FrontDoor:
         with it (``app.agent_start``). An id already mounted is refused: there
         is no unmounting, microdot copies an app's routes in when it is
         mounted. Mounted while the front door serves, the app is started at
-        once, as a task; ``await start_app(app_id)`` waits for it.
+        once, as a task; ``await start_app(app_id)`` waits for it. Once the
+        front door has begun stopping its apps (``serve``, after the
+        ``before_stop`` hooks) a mount is refused with ``RuntimeError``, and
+        the app, never served, is its builder's to stop.
         """
+        if self._stopping:
+            raise RuntimeError(
+                "the front door is shutting down, so the app for %r is not mounted" % (app_id,)
+            )
         if not isinstance(app_id, str) or not _APP_ID_RE.fullmatch(app_id):
             raise ValueError(
                 "an app id is one path segment of letters, digits, '_' and '-': %r" % (app_id,)
@@ -218,11 +238,12 @@ class FrontDoor:
     async def serve(self, on_ready=None):
         """Serve every mounted app until interrupted, as ``app.serve`` serves
         one: listening before ``on_ready`` (a function or coroutine function)
-        is called and before any app is started; on the way out, every app
-        stopped (``app.agent_stop``, which runs its ``agent_on_stop``), then
-        the listener closed, draining for at most
-        ``app.SHUTDOWN_DRAIN_TIMEOUT``. The apps are stopped even when the
-        bind fails, so their own teardown (a workspace lock) still runs."""
+        is called and before any app is started; on the way out, the
+        ``before_stop`` hooks, then every app stopped (``app.agent_stop``,
+        which runs its ``agent_on_stop``), then the listener closed, draining
+        for at most ``app.SHUTDOWN_DRAIN_TIMEOUT``. The apps are stopped even
+        when the bind fails, so their own teardown (a workspace lock) still
+        runs."""
         server = None
         try:
             server = await self.app.start_server(
@@ -238,9 +259,30 @@ class FrontDoor:
             await asyncio.Event().wait()
         finally:
             self._serving = False
+            # A hook cancelled (a second interrupt) still leaves every app
+            # stopped: the cancellation is raised once they are.
+            cancelled = await self._run_before_stop()
+            self._stopping = True
             await self._stop_all()
             if server is not None:
                 await agent_app.close_server(server)
+            if cancelled is not None:
+                raise cancelled
+
+    async def _run_before_stop(self):
+        """Every ``before_stop`` hook, each one's failure reported and the
+        rest still run; returns the cancellation one of them met, if any."""
+        cancelled = None
+        for hook in list(self.before_stop):
+            try:
+                result = hook()
+                if inspect.isawaitable(result):
+                    await result
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+            except Exception as exc:
+                sys.stderr.write("warning: a front door stop hook failed: %r\n" % (exc,))
+        return cancelled
 
     async def _start_all(self):
         ids = list(self._apps)
