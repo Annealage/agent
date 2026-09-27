@@ -368,6 +368,88 @@ def test_listeners_hear_each_landed_write_and_not_a_refused_one(store, tmp_path)
     assert heard == ["change"] * 4
 
 
+def _moved_right(by):
+    def move(comment):
+        if comment.author != "human":
+            return None
+        return {**comment.anchor, "x": comment.anchor["x"] + by}
+
+    return move
+
+
+def test_update_anchors_moves_in_one_write_and_announces_it_once(store, tmp_path):
+    """Loom moves every pin that follows a part after a build: one write,
+    one announcement, whatever else is on the record kept, and the anchor
+    stored as the product gave it (not validated again, which would
+    re-derive what the product decided)."""
+    _add(store, author="human", anchor=FRONT_A, extra={"colour": "red"})
+    _add(store, author="model")
+    _add(store, author="human", anchor=BACK)
+    heard = []
+    store.add_listener(lambda: heard.append("change"))
+
+    moved = store.update_anchors(_moved_right(95))
+    assert [(c.id, c.anchor["x"]) for c in moved] == [(1, 105), (3, 115)]
+    assert heard == ["change"]
+    records = _document(tmp_path)["comments"]
+    assert [r["anchor"]["x"] for r in records] == [105, 20, 115]
+    assert records[0]["colour"] == "red" and records[0]["ref"] == "box-a"
+    assert store.get_comment(3).anchor == {"card": "back", "x": 115, "y": 30}
+
+    before = _file(tmp_path).read_bytes()
+    assert store.update_anchors(lambda c: c.anchor) == ()
+    assert store.update_anchors(lambda c: None) == ()
+    assert _file(tmp_path).read_bytes() == before
+    assert heard == ["change"], "a move that moved nothing is not a change"
+
+
+def test_update_anchors_that_fails_part_way_writes_nothing(store, tmp_path):
+    _add(store, author="human", anchor=FRONT_A)
+    _add(store, author="human", anchor=BACK)
+    before = _file(tmp_path).read_bytes()
+    heard = []
+    store.add_listener(lambda: heard.append("change"))
+
+    def move(comment):
+        if comment.id == 2:
+            raise RuntimeError("the product's move failed")
+        return {**comment.anchor, "x": 50}
+
+    with pytest.raises(RuntimeError):
+        store.update_anchors(move)
+    with pytest.raises(ReviewError, match="an anchor is an object"):
+        store.update_anchors(lambda c: "front" if c.id == 2 else {**c.anchor, "x": 50})
+    assert _file(tmp_path).read_bytes() == before
+    assert heard == []
+
+
+def test_a_comment_added_while_anchors_move_is_not_lost(store, tmp_path):
+    """The whole read-move-write holds the file's lock. Without it, a
+    comment the page adds while the product moves pins lands between the
+    read and the write, and the write replaces it."""
+    _add(store, author="human", anchor=FRONT_A)
+    adder = toy_review_store(tmp_path)
+    started = []
+
+    def move(comment):
+        thread = threading.Thread(
+            target=adder.add_comment,
+            kwargs={"anchor": BACK, "text": "meanwhile", "author": "human"},
+        )
+        thread.start()
+        started.append(thread)
+        thread.join(timeout=0.5)
+        return {**comment.anchor, "x": 60}
+
+    store.update_anchors(move)
+    started[0].join()
+    comments = store.list_comments().comments
+    assert [(c.id, c.text, c.anchor["x"]) for c in comments] == [
+        (1, "look here", 60),
+        (2, "meanwhile", 20),
+    ]
+
+
 def test_state_changes_with_the_bytes_and_says_whether_they_parse(store, tmp_path):
     assert store.state() == (None, True)
     _add(store)

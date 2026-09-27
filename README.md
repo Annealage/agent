@@ -398,6 +398,8 @@ The page loads the pane's modules through one import map entry, `"agent/": "/age
 
 `JsonReviewStore(path, anchor_space)` is the package's own store, one JSON file replaced atomically and never overwritten when it doesn't parse. A product with an existing file format keeps it behind a store of its own. `review.tools.review_tools(store, bus=bus)` gives the agent `list_comments`, `add_callout` and, where the store supports them, `resolve_comment` and `delete_callout`, graded by the product like its own tools with one exception: resolving one of the human's comments always asks the human, with the comment on the card, whatever the product graded it. With a store passed to `create_app`, the page gets `GET /review` (plus `POST` routes where the store takes the human's comments or status changes), and a watcher publishes `review_changed` whenever the store's files change, however they changed.
 
+The product can move comments itself: `store.update_anchors(move)` calls `move(comment)` for each comment, which returns its new anchor or `None` to leave it, and writes every move at once under the file's lock, announcing the change once. The anchors are stored as `move` gives them, not validated again. Loom uses it to keep a pin on the part it was placed on when a build moves the part. `JsonReviewStore` supports it (`Capabilities.can_update_anchors`); a store over a product's own format refuses it.
+
 ## An agent in another process
 
 An agent that isn't embedded (another Claude Code session, say) reaches the product's tools through the stdio MCP bridge:

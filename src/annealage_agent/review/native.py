@@ -69,6 +69,7 @@ import dataclasses
 import json
 import os
 from pathlib import Path
+from typing import Mapping
 
 from .. import files
 from .model import (
@@ -134,6 +135,7 @@ class JsonReviewStore(ReviewStore):
             human_adds_via_api=True,
             human_sets_status=True,
             max_open_model_callouts=max_open_model_callouts,
+            can_update_anchors=True,
         )
 
     # -- reading ---------------------------------------------------------------
@@ -326,6 +328,40 @@ class JsonReviewStore(ReviewStore):
             path = self._save(document, next_id, comments)
         self._changed()
         return Written(comment, _count(comments, MODEL), path)
+
+    def update_anchors(self, move):
+        """As ``ReviewStore.update_anchors``, all under the file's lock: a
+        comment added meanwhile waits for the move and is not lost, and
+        ``move`` must not call the store. ``move`` raising writes nothing.
+
+        The new anchor is stored as ``move`` gives it (an object, as the
+        format requires), not passed back through ``anchor_space.validate``:
+        it is the product's own move of an anchor its space already accepted,
+        and validating again would re-derive what the product decided (Loom's
+        pin keeps following the part it was placed on, even where another
+        part is now nearer)."""
+        moved = []
+        with file_lock(self.path):
+            document, next_id, comments = self._load()
+            for index, comment in enumerate(comments):
+                anchor = move(comment)
+                if anchor is None or anchor == comment.anchor:
+                    continue
+                if not isinstance(anchor, Mapping):
+                    raise ReviewError(
+                        "comment #%s: an anchor is an object, not %r" % (comment.id, anchor)
+                    )
+                anchor = dict(anchor)
+                comment = dataclasses.replace(
+                    comment, anchor=anchor, record={**comment.record, "anchor": anchor}
+                )
+                comments[index] = comment
+                moved.append(comment)
+            if moved:
+                self._save(document, next_id, comments)
+        if moved:
+            self._changed()
+        return tuple(moved)
 
     def state(self):
         try:

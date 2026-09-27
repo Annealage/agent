@@ -115,6 +115,7 @@ async def test_get_serves_every_comment_in_the_product_neutral_shape(served_dir)
             "human_adds_via_api": True,
             "human_sets_status": True,
             "max_open_model_callouts": 50,
+            "can_update_anchors": True,
         },
         "comments": [
             {

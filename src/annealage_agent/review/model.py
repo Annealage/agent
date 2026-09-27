@@ -124,6 +124,10 @@ class Capabilities:
     ``max_open_model_callouts``: how many open callouts the model may have at
     once, ``None`` for no limit. Every one is a marker the human has to read,
     so a model that pins a note per feature makes the page unusable.
+    ``can_update_anchors``: the product may move comments itself
+    (``update_anchors``), as Loom moves a pin with the part it was placed on
+    when a build moves the part. Neither a tool nor a route; the product's own
+    code is the only caller.
     """
 
     can_resolve: bool = False
@@ -131,6 +135,7 @@ class Capabilities:
     human_adds_via_api: bool = False
     human_sets_status: bool = False
     max_open_model_callouts: Optional[int] = None
+    can_update_anchors: bool = False
 
     def to_wire(self):
         return dataclasses.asdict(self)
@@ -290,6 +295,15 @@ class ReviewStore:
         ``Written`` with the deleted comment. A human's comment is never
         deleted here."""
         raise ReviewError("this review does not let callouts be deleted")
+
+    def update_anchors(self, move):
+        """Move any number of comments in one write, and return the comments
+        moved, as they now stand. ``move(comment)`` is called once per comment
+        and returns its new anchor, or ``None`` (or the anchor it has) to
+        leave it where it is. A store announces the change once, and only
+        when something moved. The product's operation, never a tool's or the
+        page's (``Capabilities.can_update_anchors``)."""
+        raise ReviewError("this review store cannot move comments")
 
     def state(self):
         """``(digest, settled)`` for what the store's files hold right now,
