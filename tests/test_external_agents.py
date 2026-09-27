@@ -16,6 +16,7 @@ import pytest
 from conftest import create_toy_app, make_test_client
 from toy_product import NOTES_FILE, toy_review_store
 
+from annealage_agent import settings as settings_module
 from annealage_agent.http import ws as ws_module
 from annealage_agent.session.base import AGENT_UNAVAILABLE
 from annealage_agent.session.external import ExternalAgentSession, NoEmbeddedAgent
@@ -99,6 +100,21 @@ async def test_a_write_grade_call_waits_for_the_page_s_answer(served_dir):
     res = await asyncio.wait_for(call, timeout=5.0)
     assert not json.loads(res.body)["result"].get("isError")
     assert _notes(served_dir) == ["first", "from outside"]
+
+
+async def test_a_card_the_human_leaves_expires_after_the_approval_timeout(served_dir):
+    app = _app(
+        served_dir,
+        external_agents=True,
+        settings=settings_module.resolve(served_dir, flags={"approval_timeout": 1}),
+    )
+    app.agent_session.on_viewer_presence(1)
+    res = await asyncio.wait_for(
+        _mcp(make_test_client(app), _call("add_note", {"text": "unanswered"})), timeout=5.0
+    )
+    result = json.loads(res.body)["result"]
+    assert result["isError"] and "within 1 seconds" in json.dumps(result)
+    assert _notes(served_dir) == ["first"]
 
 
 async def test_a_write_grade_call_with_no_page_open_is_refused_at_once(served_dir):

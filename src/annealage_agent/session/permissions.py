@@ -96,7 +96,9 @@ class Decision:
 # A human reviewing a running agent may be away from the keyboard for a
 # while without that meaning "no"; a session nobody is watching should
 # still not hold one tool call open forever. Five minutes is long enough
-# for the first and short enough for the second. Always injectable, per
+# for the first and short enough for the second, as a default: the user's
+# ``approval_timeout`` setting replaces it (a persistent service the human
+# checks in on sets an hour or more). Always injectable, per
 # the M5 brief: tests pass a small value, never sleep past a real one.
 DEFAULT_TIMEOUT = 300.0
 
@@ -111,8 +113,8 @@ DEFAULT_TIMEOUT = 300.0
 # A few seconds separates a reload from someone closing the laptop: long enough
 # that a page coming back finds its request still waiting, short enough that a
 # genuinely abandoned session is not held open on the chance somebody returns.
-# The five-minute timeout is what covers the case of a browser that never
-# returns at all.
+# The approval timeout is what covers the case of a browser that stays open
+# with nobody at it.
 DEFAULT_NO_VIEWER_GRACE = 8.0
 
 # Never persisted and never covered by an allow-always grant (plan section
@@ -222,6 +224,13 @@ class PermissionBroker:
         self._granted_tools: FrozenSet[str] = _load_grants(
             self._permissions_path, self._never_remembered
         )
+
+    @property
+    def timeout(self) -> float:
+        """Seconds a request waits for the human before it expires: the
+        longest a write-class tool call can be held by this broker, which a
+        backend with a per-tool timeout of its own (Codex) must outlast."""
+        return self._timeout
 
     # -- can_use_tool itself ----------------------------------------------
 
@@ -421,7 +430,7 @@ class PermissionBroker:
 
         When this drops the count to zero, every request still awaiting a
         decision is denied after ``no_viewer_grace`` seconds: waiting out the
-        rest of ``ask``'s five-minute timeout to learn that nobody is left to
+        rest of ``ask``'s timeout (``approval_timeout``) to learn that nobody is left to
         answer teaches the model nothing a prompt denial would not, the same
         reasoning ``viewers.py``'s own ``ViewerGone`` applies to a stalled tool
         call. This is what keeps a request from outliving every viewer that

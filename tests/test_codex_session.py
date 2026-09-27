@@ -726,9 +726,10 @@ def test_mcp_config_overrides_is_valid_toml_registering_the_stdio_proxy(tmp_path
         mcp_host="127.0.0.1",
         mcp_port=8765,
         mcp_token='tok "en\\x',
+        broker=PermissionBroker(lambda e: None, timeout=3600.0),
     )
     overrides = session._mcp_config_overrides()
-    assert len(overrides) == 4
+    assert len(overrides) == 5
     assert not any("tok" in entry for entry in overrides)
     parsed = tomllib.loads("\n".join(overrides))
     toy = parsed["mcp_servers"]["toy"]
@@ -746,6 +747,9 @@ def test_mcp_config_overrides_is_valid_toml_registering_the_stdio_proxy(tmp_path
         TOY.version,
     ]
     assert toy["env_vars"] == ["ANNEALAGE_AGENT_TOKEN"]
+    # Codex's own per-tool timeout (60 s by default) must outlast the
+    # approval card, or Codex fails a call the host still holds open.
+    assert toy["tool_timeout_sec"] > 3600
     # Forwarded to the bridge, and kept out of the shells Codex runs for the
     # model, which Codex does not do on its own for a *TOKEN* name.
     assert parsed["shell_environment_policy"]["exclude"] == ["ANNEALAGE_AGENT_TOKEN"]

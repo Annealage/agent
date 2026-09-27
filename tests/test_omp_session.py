@@ -1168,7 +1168,12 @@ def _omp_launch(tmp_path, recorder, *, resumed, base_url):
         serve_dir=tmp_path,
         session_id=sid,
         resumed=resumed,
-        settings={"model": None, "omp_base_url": base_url, "omp_api_key": None},
+        settings={
+            "model": None,
+            "omp_base_url": base_url,
+            "omp_api_key": None,
+            "approval_timeout": 300,
+        },
         mcp_host="127.0.0.1",
         mcp_port=8765,
         agent_token="agent-token",

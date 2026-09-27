@@ -73,16 +73,18 @@ from mcp.server import InitializationOptions, NotificationOptions, Server
 #: the ``env_vars`` forwarding to this bridge is unaffected by it.
 AGENT_TOKEN_ENV = "ANNEALAGE_AGENT_TOKEN"
 
-#: How long one forwarded call is given to reach the host process and come
-#: back. Generous: the host's own ``ViewerBus.CALL_TIMEOUT`` (10s) already bounds
-#: how long a viewer-facing tool call can take, a remote MCP server's tool
-#: (``remote.CALL_TIMEOUT``, 60s) how long a proxied one can, and a
-#: write-class call adds however long the human takes to answer an approval
-#: card (``PermissionBroker.DEFAULT_TIMEOUT``, five minutes) - this must clear
-#: the longest of those sums comfortably, since a timeout here reaches Codex as
-#: a failed tool call with no way to tell "the host is slow" from "the human
-#: has not answered yet".
-CALL_TIMEOUT = 370.0
+#: How long reaching the host process may take. Only the connection is
+#: bounded: once a call is in, the host bounds it itself (a viewer-facing
+#: tool by ``ViewerBus.CALL_TIMEOUT``, a remote MCP server's tool by
+#: ``remote.CALL_TIMEOUT``, and a write-class call by however long the human
+#: has to answer its approval card, the user's ``approval_timeout`` setting,
+#: which a persistent service sets to an hour or more). A read timeout here
+#: would have to outlast all of those, and one that didn't would reach Codex
+#: as a failed call while the card stayed live on the host, so a later Allow
+#: would run a write the model had already been told failed. Codex's own
+#: per-tool timeout is the other side of this, and ``CodexSession`` sets it
+#: (``tool_timeout_sec``) past the approval timeout for the same reason.
+CONNECT_TIMEOUT = 10.0
 
 
 class AuthorityError(RuntimeError):
@@ -169,7 +171,9 @@ def authority_url(host: str, port: int, path: str) -> httpx.URL:
 async def run(args: argparse.Namespace, token: str) -> None:
     url = authority_url(args.host, args.port, args.path).copy_merge_params({"t": token})
     try:
-        async with httpx.AsyncClient(timeout=CALL_TIMEOUT) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(None, connect=CONNECT_TIMEOUT)
+        ) as client:
             server = build_server(client, url, name=args.server_name, version=args.server_version)
             async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
                 await server.run(

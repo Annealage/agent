@@ -20,7 +20,7 @@ def _write(path, text):
 
 
 def test_setting_keys_and_keys_by_name_agree():
-    assert len(settings.SETTING_KEYS) == 11
+    assert len(settings.SETTING_KEYS) == 12
     assert set(settings.KEYS_BY_NAME) == {key.name for key in settings.SETTING_KEYS}
     assert all(settings.KEYS_BY_NAME[key.name] is key for key in settings.SETTING_KEYS)
 
@@ -134,6 +134,14 @@ def test_enum_key_rejects_a_value_outside_its_choices(tmp_path):
     _write(settings.user_settings_path(), 'units = "cm"\n')
     with pytest.raises(settings.SettingsError):
         settings.resolve(tmp_path)
+
+
+def test_an_approval_timeout_under_a_second_is_refused(tmp_path):
+    _write(settings.user_settings_path(), "approval_timeout = 0\n")
+    with pytest.raises(settings.SettingsError, match="approval_timeout"):
+        settings.resolve(tmp_path)
+    _write(settings.user_settings_path(), "approval_timeout = 1\n")
+    assert settings.resolve(tmp_path)["approval_timeout"] == 1
 
 
 def test_permission_mode_in_the_user_file_is_refused(tmp_path):
@@ -304,6 +312,7 @@ def test_emitter_round_trips_every_value_type_in_the_table(tmp_path):
             "host": "192.168.1.1",
             "port": 9999,
             "open_browser": False,
+            "approval_timeout": 3600,
             "units": "in",
             "tool_cards_collapsed": False,
             "model": "claude-opus-4",
@@ -326,6 +335,7 @@ def test_emitter_round_trips_every_value_type_in_the_table(tmp_path):
     assert not isinstance(user_mapping["port"], bool)
 
     assert user_mapping["open_browser"] is False
+    assert user_mapping["approval_timeout"] == 3600
     assert user_mapping["tool_cards_collapsed"] is False
     assert user_mapping["units"] == "in"
 

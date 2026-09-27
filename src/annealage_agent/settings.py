@@ -255,6 +255,22 @@ _AGENT_KEYS = (
         section=AGENT_SECTION,
     ),
     Key(
+        name="approval_timeout",
+        type_name="int",
+        default=300,
+        layers=(USER,),
+        effect="restart",
+        description=(
+            "Seconds an approval card waits for the human before the request "
+            "expires and the agent is told no. A persistent service the human "
+            "checks in on now and then wants this long, an hour or more; the "
+            "agent's turn stays open while it waits. User-scoped only, like host "
+            "and port."
+        ),
+        py_type=int,
+        section=AGENT_SECTION,
+    ),
+    Key(
         name="backend",
         type_name='"claude" or "codex" or "omp" or null',
         default=None,
@@ -489,6 +505,10 @@ def _check_value(key, value, *, layer, source):
         if isinstance(value, bool) or not isinstance(value, int):
             raise SettingsError(
                 "%s sets %r to %r, which is not an integer" % (source, key.name, value)
+            )
+        if key.name == "approval_timeout" and value < 1:
+            raise SettingsError(
+                "%s sets approval_timeout to %r; it must be at least 1 second" % (source, value)
             )
         return
     if not isinstance(value, str):

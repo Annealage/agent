@@ -146,7 +146,10 @@ async def test_get_lays_out_the_window_from_each_keys_own_section(make_client):
     payload = body_of(await make_client().get("/settings?t=%s" % TOKEN))
     assert payload["sections"] == [
         {"title": "Server", "keys": ["host", "port", "open_browser"]},
-        {"title": "Agent", "keys": ["model", "effort", "permission_mode", "backend"]},
+        {
+            "title": "Agent",
+            "keys": ["model", "effort", "permission_mode", "approval_timeout", "backend"],
+        },
         {"title": "Viewer", "keys": ["units", "tool_cards_collapsed"]},
     ]
     assert payload["settings"]["units"]["choices"] == ["mm", "in"]

@@ -92,6 +92,7 @@ def build_session(
         on_event,
         permissions_path=sessions.state_dir(serve_dir) / "permissions.toml",
         viewer_url=bus.url,
+        timeout=float(settings["approval_timeout"]),
         # The tools that ask the human themselves (tools.asks_the_human):
         # their requests are never remembered, and a grant for one of their
         # names already in permissions.toml is ignored. A bus with no tool

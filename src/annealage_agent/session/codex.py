@@ -97,7 +97,7 @@ from openai_codex.generated.v2_all import (
 )
 from openai_codex.models import Notification
 
-from .. import product
+from .. import product, remote
 from . import logfiles, turn_images
 from .base import (
     AGENT_CONNECTING,
@@ -116,7 +116,7 @@ from .base import (
     turn_not_sent,
 )
 from .codex_mcp_stdio_bridge import AGENT_TOKEN_ENV
-from .permissions import Decision, _toml_string
+from .permissions import DEFAULT_TIMEOUT, Decision, _toml_string
 
 # The tool name a commandExecution approval is reported under. Deliberately
 # the same string Claude's own Bash tool uses (session/permissions.py's
@@ -362,7 +362,7 @@ class CodexSession:
         # turn/interrupt's own response can only ever be routed by that
         # same thread. Waiting on turn_interrupt first, as this method used
         # to, hangs until the human separately answers the pending
-        # approval or the broker's own five-minute timeout expires.
+        # approval or the broker's own timeout (approval_timeout) expires.
         # Resolving the broker's pending future here unblocks the reader
         # thread instead, exactly as broker.shutdown() already does for
         # close() -- decide() rather than the private _deny_all_pending
@@ -537,6 +537,15 @@ class CodexSession:
             return ()
         installed = product.current()
 
+        # Codex fails an MCP tool call after its own per-tool timeout (60 s
+        # unless ``tool_timeout_sec`` says otherwise), and the host keeps
+        # waiting on the approval card regardless, so a later Allow would run
+        # a write the model was told failed. The longest a call can take here
+        # is the approval timeout plus a remote server's own call, so Codex
+        # waits that long and a little more.
+        approval = self._broker.timeout if self._broker is not None else DEFAULT_TIMEOUT
+        tool_timeout = float(approval + remote.CALL_TIMEOUT + 30.0)
+
         # No token here: this list becomes the app-server's own command line,
         # and so does anything in an ``env`` table, both readable through
         # ``ps``. The token travels in the app-server's environment instead
@@ -561,6 +570,7 @@ class CodexSession:
                 "%s.command=%s" % (key, _toml_string(sys.executable)),
                 "%s.args=[%s]" % (key, ", ".join(_toml_string(arg) for arg in proxy_args)),
                 "%s.env_vars=[%s]" % (key, _toml_string(AGENT_TOKEN_ENV)),
+                "%s.tool_timeout_sec=%r" % (key, tool_timeout),
             )
 
         overrides = bridge(installed.mcp_server_name, installed.distribution)

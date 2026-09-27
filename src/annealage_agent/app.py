@@ -444,6 +444,7 @@ def create_app(
             publish,
             permissions_path=sessions.state_dir(serve_dir) / "permissions.toml",
             viewer_url=bus.url,
+            timeout=float(settings["approval_timeout"]),
             never_remembered=tools.never_remembered,
         )
         session = app.agent_session = ExternalAgentSession(publish, bus.broker)

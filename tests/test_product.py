@@ -231,7 +231,10 @@ def test_a_product_key_is_laid_out_in_the_section_it_declares(swap_product):
     )
     assert settings.sections() == [
         {"title": "Server", "keys": ["host", "port", "open_browser"]},
-        {"title": "Agent", "keys": ["model", "effort", "permission_mode", "backend"]},
+        {
+            "title": "Agent",
+            "keys": ["model", "effort", "permission_mode", "approval_timeout", "backend"],
+        },
         {"title": "Sheet", "keys": ["sheet_zoom"]},
         {"title": "Viewer", "keys": ["grid", "tool_cards_collapsed"]},
     ]

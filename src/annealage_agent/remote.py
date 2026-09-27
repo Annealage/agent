@@ -87,7 +87,7 @@ from .tools import Grading, _wrap, fail
 DISCOVERY_TIMEOUT = 10.0
 
 #: How long one proxied call may take, connecting included. The Codex stdio
-#: bridge's own ``CALL_TIMEOUT`` allows for this after an approval card.
+#: bridge sets no read timeout of its own, so this is what bounds it.
 CALL_TIMEOUT = 60.0
 
 # A remote's name is its server namespace on every backend: a TOML bare key
