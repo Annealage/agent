@@ -37,6 +37,7 @@ import struct
 import pytest
 from microdot.websocket import WebSocket
 
+from annealage_agent.identity import Human
 from annealage_agent.protocol import CLOSE_OVERFLOW, build_call, build_event, build_ping
 from annealage_agent.session.base import PermissionRequest, TextDelta, ToolUse, TurnEnd
 from annealage_agent.viewers import (
@@ -746,3 +747,12 @@ async def test_a_primary_change_reaches_every_viewer_behind_events_already_publi
         frames = _queue_frames(conn)
         assert [f["event"]["kind"] for f in frames] == ["text_delta", "viewer_primary"]
         assert [f["seq"] for f in frames] == sorted(f["seq"] for f in frames)
+
+
+async def test_a_turn_s_sender_given_by_login_is_the_human_with_that_login():
+    bus = ViewerBus(ViewerRegistry(), url="http://127.0.0.1:1/")
+    assert (bus.turn_human, bus.turn_by) == (None, None)
+    bus.begin_turn([], by="sam@example.com")
+    assert (bus.turn_human, bus.turn_by) == (Human(login="sam@example.com"), "sam@example.com")
+    bus.begin_turn([])
+    assert (bus.turn_human, bus.turn_by) == (Human(), None)

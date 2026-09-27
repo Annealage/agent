@@ -780,8 +780,8 @@ class ViewerBus:
         self._turn = int(turn)
         self._turn_at_open = self._turn
         self._notes: list = []
-        # The login of the human who sent the turn now starting (begin_turn).
-        self.turn_by: Optional[str] = None
+        # Who sent the turn now starting (begin_turn): an ``identity.Human``.
+        self.turn_human: Optional[Any] = None
         self._turn_start_callbacks: list = []
         self.end_turn_handler: Optional[Any] = None
         # None: no app set it, so the session takes the product's patterns.
@@ -806,6 +806,13 @@ class ViewerBus:
         return self._turn
 
     @property
+    def turn_by(self) -> Optional[str]:
+        """The tailnet login of who sent the turn now starting
+        (``turn_human.login``): ``None`` for the browser token's holder, and
+        before the first turn."""
+        return self.turn_human.login if self.turn_human is not None else None
+
+    @property
     def turn_at_open(self) -> int:
         """``turn`` when this process opened the conversation: 0 for a new
         session, the history's last turn for a resumed one."""
@@ -823,19 +830,23 @@ class ViewerBus:
         """Run ``callback(turn)`` (synchronous) each time a human turn is
         accepted, with the new turn number, before that turn's notes are
         taken: a note the callback queues goes with this very turn. A
-        callback that raises is logged and never stops the turn. ``turn_by``
-        already names who sent it when the callback runs."""
+        callback that raises is logged and never stops the turn.
+        ``turn_human`` (and ``turn_by``, its login) already names who sent it
+        when the callback runs."""
         self._turn_start_callbacks.append(callback)
 
-    def begin_turn(self, blocks: list, by: Optional[str] = None) -> list:
+    def begin_turn(self, blocks: list, by: Optional[Any] = None) -> list:
         """Count one human turn, run the ``on_turn_start`` callbacks, and
         return ``blocks`` with every queued note in front of them, as one text
         block of its own marked as coming from the product rather than the
         human. Clears the queue. ``http/ws.py`` calls it only once the turn is
-        going to a ready session, with ``by``, the sender's tailnet login
-        (``None`` for the browser token's holder), which is ``turn_by`` from
-        then until the next turn: what a product attributes the turn's
-        consequences to (``UserTurn.by`` is the same login, logged just after).
+        going to a ready session, with ``by``, the sender's ``identity.Human``
+        (``Human()``, no login, for the browser token's holder), which is
+        ``turn_human`` from then until the next turn: what a product
+        attributes the turn's consequences to, by name (``turn_by`` is its
+        login, and ``UserTurn.by``, logged just after, the same login). ``by``
+        may be a login alone, taken as the ``Human`` with that login; ``None``
+        is the token's holder.
 
         A note can carry text the product did not write (a remote MCP
         server's own instructions, ``app.retry_remotes``), and a backend may
@@ -843,7 +854,13 @@ class ViewerBus:
         strings are neutralised inside the notes: nothing in a note can end
         the note early and have what follows read as the human's."""
         self._turn += 1
-        self.turn_by = by
+        if by is None or isinstance(by, str):
+            # Here, not at the top: identity imports http.ws, which imports
+            # this module.
+            from .identity import Human
+
+            by = Human(login=by)
+        self.turn_human = by
         self.first_turn.set()
         for callback in list(self._turn_start_callbacks):
             try:

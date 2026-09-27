@@ -595,7 +595,7 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus):
         return
     turn = None
     if bus is not None:
-        blocks_to_send = bus.begin_turn(blocks, by=_login(conn))
+        blocks_to_send = bus.begin_turn(blocks, by=conn.human)
         turn = bus.turn
         _publish(
             event_log,

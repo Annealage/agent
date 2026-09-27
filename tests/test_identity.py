@@ -26,7 +26,7 @@ from toy_product import NOTES_FILE, TOY_PAGE, toy_review_store
 from annealage_agent import app as agent_app
 from annealage_agent import protocol, sessions
 from annealage_agent.frontdoor import FrontDoor, mount_prefix
-from annealage_agent.identity import TailscaleIdentity, load_users
+from annealage_agent.identity import Human, TailscaleIdentity, load_users
 from annealage_agent.session.base import UserTurn
 from annealage_agent.session.events import EventLog
 from annealage_agent.session.fake import FakeSession
@@ -304,20 +304,24 @@ async def test_the_agent_token_never_opens_a_browser_route(served_dir):
 async def test_a_page_signed_in_by_login_needs_no_token_and_its_turn_is_theirs(served_dir):
     app = _agent_app(served_dir)
     # A product's turn-start work (Loom's sweep of outside changes) is the
-    # sender's too: it runs before the turn is logged, so it reads turn_by.
+    # sender's too: it runs before the turn is logged, so it reads the bus,
+    # which has the whole human, their name as serve gave it included.
     senders = []
-    app.agent_bus.on_turn_start(lambda turn: senders.append(app.agent_bus.turn_by))
+    bus = app.agent_bus
+    bus.on_turn_start(lambda turn: senders.append((bus.turn_by, bus.turn_human)))
     res, close_code = await _converse(
         app, [HELLO, _turn("add a cap")], headers={**SIGNED_IN, "Origin": ORIGIN}
     )
     assert res is Response.already_handled and close_code is None
     (turn,) = _logged(app, "user_turn")
     assert (turn["by"], turn["viewer"]) == (LOGIN, "tab-1")
-    assert senders == [LOGIN]
+    assert senders == [(LOGIN, Human(login=LOGIN, name="Andrew Leech"))]
 
 
 async def test_a_socket_the_token_opened_still_needs_the_token_in_its_hello(served_dir):
     app = _agent_app(served_dir)
+    senders = []
+    app.agent_bus.on_turn_start(lambda turn: senders.append(app.agent_bus.turn_human))
     res, close_code = await _converse(
         app, [HELLO, _turn("hi")], headers={"Origin": ORIGIN}, query="?t=%s" % TOKEN
     )
@@ -334,6 +338,7 @@ async def test_a_socket_the_token_opened_still_needs_the_token_in_its_hello(serv
     assert close_code is None
     (turn,) = _logged(app, "user_turn")
     assert "by" not in turn
+    assert senders == [Human()] and app.agent_bus.turn_by is None
 
 
 async def test_a_permission_decision_records_who_made_it(served_dir):
