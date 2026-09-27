@@ -16,7 +16,7 @@ the agent layer itself writes:
     images/*.png          created by ``create_image_file`` for a captured view
                           or an upload
     review/*.md,*.jsonl   created by ``create_review_file`` for a transcript
-    <state dir>/uploads/*.pdf
+    <user cache>/uploads/<workspace>/*.pdf
                           created by ``create_unique_document_file`` for a
                           document the human uploads for an upload action
 
@@ -168,10 +168,12 @@ def sniff_image(head):
     return None
 
 
-#: Where an uploaded document is kept, under the product's state directory
-#: rather than the served tree: it exists for an upload action to send
-#: somewhere (``uploads.py``), not as evidence in the project, so it is neither
-#: committed nor served back, and never executed or rendered here.
+#: The directory, under the user's cache directory for the product and one
+#: per workspace (``uploads.documents_dir``), where an uploaded document is
+#: kept: outside the served tree, which an agent's shell may write, since the
+#: card the human approves promises the bytes they uploaded. It exists for an
+#: upload action to send somewhere, not as evidence in the project, so it is
+#: neither committed nor served back, and never executed or rendered here.
 DOCUMENTS_DIRNAME = "uploads"
 
 #: Cap on one uploaded document. A datasheet runs to a few megabytes and a
@@ -613,23 +615,25 @@ def create_review_file(serve_dir, name):
 
 
 def create_unique_document_file(directory, stem):
-    """Create a fresh, server-named document under ``directory`` (the state
-    directory's ``DOCUMENTS_DIRNAME``) for writing: ``(fd, target)``, or None
-    when ``directory`` is not a real directory this process can create a file
-    in. Raises ``FileExistsError`` when every one of
-    ``UNIQUE_IMAGE_NAME_ATTEMPTS`` names is taken.
+    """Create a fresh, server-named document under ``directory`` (this
+    workspace's documents directory, ``uploads.documents_dir``) for writing:
+    ``(fd, target)``, or None when ``directory`` is not a real directory this
+    process can create a file in. Raises ``FileExistsError`` when every one
+    of ``UNIQUE_IMAGE_NAME_ATTEMPTS`` names is taken.
 
     ``stem`` is ``document_stem``'s, and the name
     ``<%Y%m%d-%H%M%S>-<8 hex chars>-<stem>.pdf``, which is the upload's id
-    (``_DOCUMENT_NAME_RE``). ``directory`` is created if absent and refused
-    if it is a symlink, and its identity is checked around the open, as
-    ``create_review_file`` checks ``review/``."""
+    (``_DOCUMENT_NAME_RE``). ``directory`` is created if absent, private to
+    this user (0700), and refused if it is a symlink, and its identity is
+    checked around the open, as ``create_review_file`` checks ``review/``."""
     directory = Path(directory)
     if directory.is_symlink():
         return None
     try:
-        directory.mkdir(parents=True, exist_ok=True)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         before = os.stat(directory, follow_symlinks=False)
+        if stat.S_ISDIR(before.st_mode) and stat.S_IMODE(before.st_mode) != 0o700:
+            os.chmod(directory, 0o700)
     except OSError:
         return None
     if not stat.S_ISDIR(before.st_mode):

@@ -19,8 +19,9 @@ one).
 **The flow.** The page's attach button takes a file an action accepts (only
 ``application/pdf`` today) and uploads it as a document (``POST
 /upload?kind=document``, ``http/routes_chat.py``), which the server sniffs by
-its bytes and keeps in the product's state directory, never serving it back
-(``files.create_unique_document_file``). The page shows the file with a
+its bytes and keeps outside the served tree, in the user's cache directory
+(``documents_dir``), never serving it back, and whose size and SHA-256 it
+notes (``Documents``). The page shows the file with a
 button per action, and a click posts ``POST /upload/action``. Only the
 browser can: the route takes the browser's credentials and ``Origin`` like
 every other browser POST, and the agent token opens no browser route. The
@@ -32,27 +33,33 @@ among them and its bytes shown only as a size, marked as the human's own
 action (``PermissionRequest.action`` and ``by``). No standing grant answers
 it and no "always allow" is kept for it.
 
-Approved, the file is read here and its bytes put in the call as
-``content_arg`` (base64), beside ``filename_arg``, so they never pass through
-the model or back through the page. The call goes to the remote on a
+Approved, the file is read here, checked against the digest taken at upload,
+and its bytes put in the call as ``content_arg`` (base64), beside
+``filename_arg``, so they never pass through the model or back through the
+page; a file that changed since is not sent. The call goes to the remote on a
 connection of its own (``remote.call``), not through the agent's proxy: the
 pause switch holds the agent's tools, not the human's own action. How it
 ended (``UploadActionEnded``) is published for the page's conversation, and,
 unless the human declined it, queued as a note for the agent's next turn
 (``ViewerBus.queue_note``), saying what the remote answered, so the agent
-can follow it up (poll a job, say).
+can follow it up (poll a job, say). However it ended, the document is then
+removed. Its card is the human's, not the agent's turn's, so interrupting
+the agent leaves it open (``PermissionBroker.pending_requests``).
 """
 
 import asyncio
 import base64
 import dataclasses
+import hashlib
+import os
 import re
 import secrets
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Tuple
 
-from . import files, product
+from . import files, product, sessions
 from .session.base import ACTION_DENIED, ACTION_DONE, ACTION_FAILED, UploadActionEnded
 
 #: The media types an upload action may accept: what ``/upload`` keeps as a
@@ -69,13 +76,15 @@ _NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
 class Upload:
     """A document the human uploaded: its ``id`` (the stored file's name,
     which the page sends back), ``name`` (the human's own file name, made
-    safe), size in ``bytes``, ``media_type`` and where it is kept."""
+    safe), size in ``bytes``, ``media_type``, where it is kept, and the
+    ``sha256`` of the bytes as they were uploaded."""
 
     id: str
     name: str
     bytes: int
     media_type: str
     path: Path
+    sha256: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,20 +163,97 @@ def check_upload_actions(actions, tools=None):
     return actions
 
 
-def find_upload(directory, upload_id):
-    """The ``Upload`` ``upload_id`` names in ``directory`` (the state
-    directory's documents), or None."""
-    found = files.open_document(directory, upload_id)
-    if found is None:
-        return None
-    path, size = found
-    return Upload(
-        id=upload_id,
-        name=files.document_name(upload_id),
-        bytes=size,
-        media_type="application/pdf",
-        path=path,
+#: How long a document no action took is kept: the next app built for the
+#: workspace removes anything older (``Documents``).
+DOCUMENT_MAX_AGE = 24 * 60 * 60
+
+
+def documents_dir(serve_dir):
+    """Where the documents uploaded to the workspace at ``serve_dir`` are
+    kept: the user's cache directory for the product, one directory per
+    workspace, outside the served tree (``files.DOCUMENTS_DIRNAME`` says
+    why)."""
+    import platformdirs
+
+    return (
+        Path(platformdirs.user_cache_dir(product.current().config_dirname))
+        / files.DOCUMENTS_DIRNAME
+        / sessions.project_key_for_directory(serve_dir)
     )
+
+
+class Documents:
+    """The documents uploaded to one app, in ``directory``
+    (``documents_dir``).
+
+    ``record`` notes each one's size and SHA-256 as ``/upload`` wrote it, in
+    this process's memory. Only a recorded upload can be found, and the
+    bytes an action sends must still have that digest when read at approval
+    (``run``), so a file changed on disk in between, by anything, is not
+    what leaves. ``discard`` removes one (its action ended, or the human
+    removed it). Building one removes whatever an earlier process left more
+    than ``DOCUMENT_MAX_AGE`` seconds ago.
+    """
+
+    def __init__(self, directory, *, max_age=DOCUMENT_MAX_AGE):
+        self.directory = Path(directory)
+        self._known = {}
+        self.sweep(max_age)
+
+    def create(self, name):
+        """``files.create_unique_document_file`` for a file the human named
+        ``name``."""
+        return files.create_unique_document_file(self.directory, files.document_stem(name))
+
+    def record(self, upload_id, size, sha256):
+        self._known[upload_id] = (size, sha256)
+
+    def find(self, upload_id):
+        """The ``Upload`` ``upload_id`` names, or None when this app did not
+        record it or it is gone."""
+        known = self._known.get(upload_id) if isinstance(upload_id, str) else None
+        if known is None:
+            return None
+        found = files.open_document(self.directory, upload_id)
+        if found is None:
+            return None
+        return Upload(
+            id=upload_id,
+            name=files.document_name(upload_id),
+            bytes=known[0],
+            media_type="application/pdf",
+            path=found[0],
+            sha256=known[1],
+        )
+
+    def discard(self, upload_id):
+        """Forget ``upload_id`` and remove its file; True if it was known."""
+        if self._known.pop(upload_id, None) is None:
+            return False
+        try:
+            os.unlink(self.directory / upload_id)
+        except OSError:
+            pass
+        return True
+
+    def sweep(self, max_age):
+        """Remove every document here last written more than ``max_age``
+        seconds ago."""
+        cutoff = time.time() - max_age
+        try:
+            entries = list(os.scandir(self.directory))
+        except OSError:
+            return
+        for entry in entries:
+            try:
+                if (
+                    files.document_name(entry.name) is not None
+                    and entry.is_file(follow_symlinks=False)
+                    and entry.stat(follow_symlinks=False).st_mtime < cutoff
+                ):
+                    os.unlink(entry.path)
+            except OSError:
+                pass
 
 
 def call_args(action, upload, human):
@@ -208,13 +294,14 @@ def size_text(count):
     return "%.1f MB" % (count / (1024 * 1024))
 
 
-async def run(action, upload, human, args, *, broker, server, publish, queue_note):
+async def run(action, upload, human, args, *, broker, server, publish, queue_note, documents):
     """Ask the human, then make the call: the flow in the module docstring,
     from the card on, with ``args`` from ``call_args``. ``server`` is the
     ``RemoteServer`` ``action.tool`` names, ``broker`` the live session's
-    ``PermissionBroker``, ``publish`` the app's event publisher and
-    ``queue_note`` the bus's. Never raises: however it ends, it ends with an
-    ``UploadActionEnded``."""
+    ``PermissionBroker``, ``publish`` the app's event publisher,
+    ``queue_note`` the bus's and ``documents`` the app's ``Documents``,
+    which the upload is discarded from at the end. Never raises: however it
+    ends, it ends with an ``UploadActionEnded``."""
     # Imported here: the tool layer and the MCP client come with the SDK,
     # which only an app with an agent (the only kind with actions) loads.
     from . import remote
@@ -224,6 +311,7 @@ async def run(action, upload, human, args, *, broker, server, publish, queue_not
     tool = namespaced(remote_name, tool_name)
 
     def ended(outcome, text):
+        documents.discard(upload.id)
         publish(
             UploadActionEnded(
                 id="ua_%s" % secrets.token_hex(6),
@@ -234,6 +322,7 @@ async def run(action, upload, human, args, *, broker, server, publish, queue_not
                 outcome=outcome,
                 text=text,
                 by=human.login,
+                upload=upload.id,
             )
         )
         if outcome != ACTION_DENIED:
@@ -250,6 +339,13 @@ async def run(action, upload, human, args, *, broker, server, publish, queue_not
         data = await loop.run_in_executor(None, files.read_document, upload.path, upload.bytes)
     except OSError as exc:
         ended(ACTION_FAILED, "%s could not be read, so nothing was sent: %s" % (upload.name, exc))
+        return
+    if len(data) != upload.bytes or hashlib.sha256(data).hexdigest() != upload.sha256:
+        ended(
+            ACTION_FAILED,
+            "%s changed on disk after it was uploaded, so nothing was sent; upload it again"
+            % upload.name,
+        )
         return
     arguments = {
         **args,

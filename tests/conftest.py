@@ -106,6 +106,8 @@ def isolated_user_config(tmp_path_factory, monkeypatch):
     earlier.
     """
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path_factory.mktemp("config")))
+    # Uploaded documents are kept in the user's cache directory (uploads.py).
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path_factory.mktemp("cache")))
 
 
 @pytest.fixture(autouse=True)

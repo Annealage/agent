@@ -391,6 +391,9 @@ def create_app(
     auth = BrowserAuth(token, identity, allowed_origins=allowed_origins)
     agent_mode = session_id is not None or external_agents
     upload_actions = uploads.check_upload_actions(upload_actions) if agent_mode else ()
+    # The documents uploaded for them, outside the served tree; building it
+    # removes what an earlier run left more than a day ago.
+    documents = uploads.Documents(uploads.documents_dir(serve_dir)) if upload_actions else None
     installed = product.current()
     server_header = installed.server_header
     if (session_id is not None or external_agents) and installed.build_tools is None:
@@ -410,7 +413,10 @@ def create_app(
 
     if register_routes is not None:
         register_routes(app, allowed_origins)
-    register_chat_routes(app, serve_dir, auth=auth, upload_actions=upload_actions)
+    app.agent_documents = documents
+    register_chat_routes(
+        app, serve_dir, auth=auth, upload_actions=upload_actions, documents=documents
+    )
     register_agent_static_routes(app)
     app.agent_login = login if login is not None else LoginNonces()
     register_login_routes(app, token=token, nonces=app.agent_login, allowed_origins=allowed_origins)
@@ -684,6 +690,7 @@ def create_app(
                     server=tools.remote_servers[action.tool[0]],
                     publish=publish_action,
                     queue_note=bus.queue_note,
+                    documents=documents,
                 )
             )
             running_actions.add(task)
@@ -691,7 +698,11 @@ def create_app(
             return None
 
         register_upload_action_route(
-            app, serve_dir, auth=auth, actions=upload_actions, begin=_begin_upload_action
+            app,
+            auth=auth,
+            actions=upload_actions,
+            documents=documents,
+            begin=_begin_upload_action,
         )
 
     register_ws(

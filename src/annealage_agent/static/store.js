@@ -577,6 +577,17 @@ function updateChatDocument(id, fields) {
   }, ["chat"]);
 }
 
+// An upload action on the document the server knows as `upload` ended:
+// the document is gone from the server, so it offers no action any more,
+// and `message` says how it ended.
+function endChatDocument(upload, message) {
+  commit(() => {
+    const documents = Object.freeze(state.chat.documents.map((d) => (
+      d.upload === upload ? Object.freeze({ ...d, state: "ended", message }) : d)));
+    state = { ...state, chat: Object.freeze({ ...state.chat, documents }) };
+  }, ["chat"]);
+}
+
 function dropChatDocument(id) {
   commit(() => {
     const documents = Object.freeze(state.chat.documents.filter((d) => d.id !== id));
@@ -693,6 +704,7 @@ export const store = Object.freeze({
   reserveChatDocument,
   updateChatDocument,
   dropChatDocument,
+  endChatDocument,
   addChatActionResult,
   setChatBanner,
   clearChatBanner,

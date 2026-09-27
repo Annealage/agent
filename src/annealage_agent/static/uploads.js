@@ -118,6 +118,22 @@ export async function uploadDocument(file) {
 }
 
 /**
+ * Removes document `id`: from the page, and from the server, which keeps it
+ * for its actions only. An upload that failed or whose action has ended has
+ * nothing left there.
+ */
+export async function discardDocument(id) {
+  const doc = store.getState().chat.documents.find((d) => d.id === id);
+  store.dropChatDocument(id);
+  if (!doc || !doc.upload || doc.state === "ended") return;
+  try {
+    await fetch(withToken(appUrl("upload/" + encodeURIComponent(doc.upload))), { method: "DELETE" });
+  } catch (err) {
+    // Removed from the page either way; the server removes what is left a day on.
+  }
+}
+
+/**
  * Starts upload action `action` (its name) on document `id`: the server puts
  * the call in front of the human as a permission card, and its end arrives as
  * an `upload_action` event.

@@ -212,8 +212,9 @@ ACTION_DENIED = "denied"
 @dataclasses.dataclass(frozen=True)
 class UploadActionEnded(AgentEvent):
     """An action the human started on an uploaded file ended
-    (``uploads.py``): which (``label``), on what (``file``, ``bytes``), the
-    call it made (``tool``, as the card named it), ``outcome`` (one of the
+    (``uploads.py``): which (``label``), on what (``file``, ``bytes``, and
+    ``upload``, the upload's id, which the page's chip for it is keyed by),
+    the call it made (``tool``, as the card named it), ``outcome`` (one of the
     ``ACTION_`` values) and ``text``, what the call answered or why it did not
     run. ``by`` is the login of the human who started it. ``id`` is the
     action's own, so a page adds it to the conversation once."""
@@ -228,6 +229,7 @@ class UploadActionEnded(AgentEvent):
     text: str
     by: Optional[str] = None
     viewer: Optional[str] = None
+    upload: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)

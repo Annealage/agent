@@ -46,7 +46,7 @@
 
 import { initAttention, notifyAttention } from "./attention.js";
 import { store } from "./store.js";
-import { startUploadAction, uploadDocument, uploadImage } from "./uploads.js";
+import { discardDocument, startUploadAction, uploadDocument, uploadImage } from "./uploads.js";
 import { toast } from "./ui.js";
 import { appUrl } from "./url.js";
 import { whoami, withToken } from "./ws.js";
@@ -568,7 +568,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
       }
     }
     rec.removeBtn.hidden = doc.state === "uploading";
-    rec.removeBtn.onclick = () => store.dropChatDocument(doc.id);
+    rec.removeBtn.onclick = () => discardDocument(doc.id);
   }
 
   // How each upload action ended, as a row in the conversation, in the order
@@ -1314,6 +1314,10 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
         break;
       case "upload_action":
         store.addChatActionResult(event);
+        if (event.upload) {
+          store.endChatDocument(event.upload, event.label + ": "
+            + (ACTION_OUTCOME[event.outcome] || event.outcome));
+        }
         break;
       case "permission_resolved":
         if (!replayed) reportResolution(event);

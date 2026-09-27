@@ -11,10 +11,12 @@ Registers, against one served directory:
     POST /session/<sid>/export    renders that session's event log into review/
     POST /upload/action           starts an upload action on a document
                                    (``uploads.py``), when the app has any
+    DELETE /upload/<id>           removes a document no action will take
 
 With upload actions, ``/upload`` also takes ``kind=document`` (and ``name``):
 a PDF, up to ``files.MAX_DOCUMENT_BYTES``, sniffed by ``files.sniff_document``
-and kept in the state directory, never under images/ and never served back.
+and kept outside the served tree (``uploads.documents_dir``) with the digest
+of the bytes received, never under images/ and never served back.
 
 The export route deliberately does not go through the permission broker, while
 the ``export_transcript`` tool the model calls does. That asymmetry is the
@@ -59,6 +61,7 @@ active content on this origin.
 
 import asyncio
 import functools
+import hashlib
 import os
 import re
 import sys
@@ -212,8 +215,9 @@ def _abandon(fd, target):
         pass
 
 
-async def _receive(req, loop, fd, first, content_length):
-    """Stream the rest of the body onto ``fd`` and return the total written.
+async def _receive(req, loop, fd, first, content_length, hasher=None):
+    """Stream the rest of the body onto ``fd`` and return the total written,
+    fed to ``hasher`` too when there is one.
 
     Raises ``_Refused`` for a body that stops short of its declared length or
     a write that fails, and propagates anything the stream itself raises. The
@@ -222,6 +226,8 @@ async def _receive(req, loop, fd, first, content_length):
     knows there is a file to remove.
     """
     total = len(first)
+    if hasher is not None:
+        hasher.update(first)
     try:
         await loop.run_in_executor(None, _write_all, fd, first)
     except OSError as exc:
@@ -236,6 +242,8 @@ async def _receive(req, loop, fd, first, content_length):
         except OSError as exc:
             raise _Refused(500, "write failed: %s" % exc) from exc
         total += len(chunk)
+        if hasher is not None:
+            hasher.update(chunk)
 
     try:
         await loop.run_in_executor(None, _finish, fd)
@@ -284,14 +292,14 @@ async def _file_or_same_404(target, ctype, method, request_key, expect_identity=
     return res
 
 
-def register_chat_routes(app, serve_dir, *, auth, upload_actions=()):
+def register_chat_routes(app, serve_dir, *, auth, upload_actions=(), documents=None):
     """Register ``POST /upload``, ``GET /asset/<rel>`` and
     ``POST /session/<sid>/export`` on ``app``, the two POSTs gated by ``auth``
     (``identity.BrowserAuth``). ``upload_actions`` are the app's
-    ``uploads.UploadAction``s: with any, ``/upload`` also takes a document
-    one of them accepts (``DOCUMENT_UPLOAD_KIND``)."""
+    ``uploads.UploadAction``s and ``documents`` its ``uploads.Documents``:
+    with actions, ``/upload`` also takes a document one of them accepts
+    (``DOCUMENT_UPLOAD_KIND``), kept and recorded there."""
     serve_dir = files.resolve_serve_dir(serve_dir)
-    documents = sessions.state_dir(serve_dir) / files.DOCUMENTS_DIRNAME
     kinds = upload_kinds() + ((DOCUMENT_UPLOAD_KIND,) if upload_actions else ())
 
     @app.post("/upload")
@@ -352,12 +360,8 @@ def register_chat_routes(app, serve_dir, *, auth, upload_actions=()):
 
         if document:
             names = _query_values(req, "name")
-            create = functools.partial(
-                files.create_unique_document_file,
-                documents,
-                files.document_stem(names[0] if names else ""),
-            )
-            where = "the state directory's %s/" % files.DOCUMENTS_DIRNAME
+            create = functools.partial(documents.create, names[0] if names else "")
+            where = "the documents directory"
         else:
             create = functools.partial(files.create_unique_image_file, serve_dir, kind, suffix)
             where = "%s/" % files.IMAGES_DIRNAME
@@ -391,8 +395,11 @@ def register_chat_routes(app, serve_dir, *, auth, upload_actions=()):
         # EMFILE and no upload ever succeeds again, and would leave a
         # truncated image in a git-tracked directory that /asset serves and
         # the model can attach later.
+        # A document's digest is taken from the bytes as they arrive, not read
+        # back from the file, which something else could change meanwhile.
+        hasher = hashlib.sha256() if document else None
         try:
-            total = await _receive(req, loop, fd, first, content_length)
+            total = await _receive(req, loop, fd, first, content_length, hasher)
         except BaseException as exc:
             await loop.run_in_executor(None, _abandon, fd, target)
             if isinstance(exc, _Refused):
@@ -400,6 +407,7 @@ def register_chat_routes(app, serve_dir, *, auth, upload_actions=()):
             raise
 
         if document:
+            documents.record(target.name, total, hasher.hexdigest())
             # Never served back: the page gets the id to name it by, the name
             # to show, and the actions it can offer for it.
             return {
@@ -477,18 +485,17 @@ def register_chat_routes(app, serve_dir, *, auth, upload_actions=()):
         }, 200
 
 
-def register_upload_action_route(app, serve_dir, *, auth, actions, begin):
+def register_upload_action_route(app, *, auth, actions, documents, begin):
     """Register ``POST /upload/action``, body ``{"upload": <id>, "action":
     <name>}``: the human starting one of ``actions`` (``uploads.UploadAction``)
-    on a document they uploaded. Gated by ``auth`` like every browser POST,
-    ``Origin`` included, so the agent token never opens it. ``begin(action,
+    on a document they uploaded to ``documents`` (the app's
+    ``uploads.Documents``); and ``DELETE /upload/<id>``, the human removing
+    one they will not use. Gated by ``auth`` like every browser request,
+    ``Origin`` included, so the agent token never opens either. ``begin(action,
     upload, human)`` is the app's: it returns None once the action is under
     way (its card raised, its end published as ``upload_action``), or
     ``(message, status)`` refusing it. Answers 202 once begun."""
-    from .. import uploads
-
     by_name = {action.name: action for action in actions}
-    documents = sessions.state_dir(files.resolve_serve_dir(serve_dir)) / files.DOCUMENTS_DIRNAME
 
     @app.post("/upload/action")
     async def upload_action(req):
@@ -505,9 +512,7 @@ def register_upload_action_route(app, serve_dir, *, auth, actions, begin):
             return {"ok": False, "error": "no upload action %r" % (data["action"],)}, 404
         upload_id = data["upload"]
         loop = asyncio.get_running_loop()
-        upload = None
-        if isinstance(upload_id, str):
-            upload = await loop.run_in_executor(None, uploads.find_upload, documents, upload_id)
+        upload = await loop.run_in_executor(None, documents.find, upload_id)
         if upload is None:
             return {"ok": False, "error": "no upload %r" % (upload_id,)}, 404
         if upload.media_type != action.accepts:
@@ -520,3 +525,12 @@ def register_upload_action_route(app, serve_dir, *, auth, actions, begin):
             message, status = refused
             return {"ok": False, "error": message}, status
         return {"ok": True}, 202
+
+    @app.delete("/upload/<upload_id>")
+    async def discard_upload(req, upload_id):
+        if auth.authenticate(req) is None:
+            return refusal()
+        loop = asyncio.get_running_loop()
+        if not await loop.run_in_executor(None, documents.discard, upload_id):
+            return {"ok": False, "error": "no upload %r" % (upload_id,)}, 404
+        return {"ok": True}, 200

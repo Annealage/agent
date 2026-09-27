@@ -10,13 +10,16 @@ server as ``datum``; its ``submit`` answers ``job 123``.
 import asyncio
 import base64
 import json
+import os
+import stat
+import time
 
 import pytest
 import toy_product
 from conftest import create_toy_app, make_test_client
 from test_remote_tools import FAKE_GRADING, FakeRemote
 
-from annealage_agent import files, sessions
+from annealage_agent import sessions, uploads
 from annealage_agent.remote import RemoteServer
 from annealage_agent.session.fake import FakeSession
 from annealage_agent.session.permissions import PermissionBroker
@@ -109,8 +112,8 @@ async def test_an_approved_action_sends_the_bytes_from_the_server_and_tells_the_
     assert upload["actions"] == [
         {"name": "datum", "label": "Submit to Datum", "accepts": "application/pdf"}
     ]
-    # Kept in the state directory, not the served tree, and never served.
-    kept = sessions.state_dir(served_dir) / files.DOCUMENTS_DIRNAME / upload["upload"]
+    # Kept outside the served tree, and never served.
+    kept = app.agent_documents.directory / upload["upload"]
     assert kept.read_bytes() == PDF
     assert (await client.get("/asset/%s" % upload["upload"])).status_code == 404
 
@@ -144,6 +147,8 @@ async def test_an_approved_action_sends_the_bytes_from_the_server_and_tells_the_
         "filename": "LM2596-datasheet.pdf",
         "content_base64": base64.b64encode(PDF).decode(),
     }
+    assert ended["upload"] == upload["upload"]
+    assert not kept.exists(), "the document is removed once its action ends"
     (note,) = app.agent_bus._notes
     assert note.startswith('The human used "Submit to Datum" on LM2596-datasheet.pdf')
     assert note.endswith("It answered:\njob 123")
@@ -159,6 +164,7 @@ async def test_a_declined_action_sends_nothing_and_tells_the_agent_nothing(app, 
     assert (ended["outcome"], ended["text"]) == ("denied", "not that one")
     assert "submit" not in remote.calls
     assert app.agent_bus._notes == []
+    assert not (app.agent_documents.directory / upload).exists()
 
 
 async def test_a_standing_grant_for_the_agent_does_not_answer_the_human_s_action(app, remote):
@@ -184,7 +190,7 @@ async def test_a_standing_grant_for_the_agent_does_not_answer_the_human_s_action
     await broker.decide(cards[0]["request_id"], "allow_always")
     await _next(app, "upload_action")
     assert TOOL in broker._granted_tools
-    await _start(client, upload)
+    await _start(client, (await _upload(client)).json["upload"])
     for _ in range(500):
         if (
             len([e for e in app.events if e["kind"] == "permission_request" and e.get("action")])
@@ -201,8 +207,74 @@ async def test_a_file_that_is_not_a_pdf_is_refused_and_nothing_is_kept(app, serv
     res = await _upload(client, body=b"<html><script>alert(1)</script></html>")
     assert res.status_code == 415
     assert "not a PDF" in res.json["error"]
-    documents = sessions.state_dir(served_dir) / files.DOCUMENTS_DIRNAME
+    documents = uploads.documents_dir(served_dir)
     assert not documents.exists() or list(documents.iterdir()) == []
+
+
+async def test_a_document_changed_on_disk_before_approval_is_not_sent(app, remote):
+    """The file is kept outside the served tree, but whatever reaches it
+    between the upload and the human's Allow, the bytes sent must be the ones
+    the card was raised for: a changed file is refused, not sent."""
+    client = make_test_client(app)
+    upload = (await _upload(client)).json["upload"]
+    await _start(client, upload)
+    card = await _next(app, "permission_request")
+    kept = app.agent_documents.directory / upload
+    kept.write_bytes(PDF.replace(b"obj", b"sec"))
+    await app.agent_bus.broker.decide(card["request_id"], "allow")
+    ended = await _next(app, "upload_action")
+    assert ended["outcome"] == "failed"
+    assert "changed on disk after it was uploaded, so nothing was sent" in ended["text"]
+    assert "submit" not in remote.calls
+    assert not kept.exists()
+
+
+async def test_documents_are_kept_privately_outside_the_workspace_and_removed_when_done(
+    app, remote, served_dir
+):
+    client = make_test_client(app)
+    first = (await _upload(client)).json["upload"]
+    directory = app.agent_documents.directory
+    assert directory == uploads.documents_dir(served_dir)
+    assert not directory.is_relative_to(served_dir)
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert (directory / first).read_bytes() == PDF
+
+    # The chip's remove: only the browser, and the file goes.
+    delete = "/upload/%s?t=%s" % (first, TOKEN)
+    assert (await client.delete("/upload/%s?t=%s" % (first, AGENT_TOKEN))).status_code == 403
+    assert (await client.delete(delete)).status_code == 200
+    assert not (directory / first).exists()
+    assert (await client.delete(delete)).status_code == 404
+    assert (await _start(client, first)).status_code == 404
+
+    # A declined action removes it too.
+    second = (await _upload(client)).json["upload"]
+    await _start(client, second)
+    card = await _next(app, "permission_request")
+    await app.agent_bus.broker.decide(card["request_id"], "deny")
+    await _next(app, "upload_action")
+    assert list(directory.iterdir()) == []
+
+
+async def test_a_new_app_removes_documents_left_more_than_a_day_ago(served_dir, remote):
+    directory = uploads.documents_dir(served_dir)
+    directory.mkdir(parents=True)
+    old = directory / "20260101-000000-0123abcd-old.pdf"
+    recent = directory / "20260927-000000-4567cdef-recent.pdf"
+    for path in (old, recent):
+        path.write_bytes(PDF)
+    two_days_ago = time.time() - 2 * 24 * 60 * 60
+    os.utime(old, (two_days_ago, two_days_ago))
+    built = create_toy_app(
+        served_dir,
+        token=TOKEN,
+        session_id=sessions.create_session(served_dir),
+        build_session=lambda on_event, *, bus: None,
+        upload_actions=(DATUM,),
+    )
+    built.agent_event_log.close()
+    assert sorted(p.name for p in directory.iterdir()) == [recent.name]
 
 
 async def test_only_the_browser_can_upload_a_document_or_start_an_action(app, remote):

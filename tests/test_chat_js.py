@@ -45,6 +45,7 @@ class El {
   append(...kids) { this.children.push(...kids); }
   remove() {}
   before(...nodes) { (this.inserted ||= []).push(...nodes); }
+  replaceChildren(...kids) { this.children = [...kids]; }
   setAttribute() {}
   getAttribute() { return null; }
   focus() {}
@@ -154,6 +155,16 @@ chat.handleHello({ id: "s", agent: "ready", usage: { cost_usd: 1, tokens: {}, co
 chat.handleEvent({ kind: "session_reset", reason: "new" }, { replayed: false });
 out.usageHiddenAfterReset = usageChip.hidden;
 
+// A document's chip says how its action ended, and offers the action no more.
+const docId = store.reserveChatDocument("sheet.pdf");
+store.updateChatDocument(docId, { state: "done", upload: "u-1", bytes: 10,
+  actions: [{ name: "datum", label: "Submit to Datum", accepts: "application/pdf" }] });
+chat.handleEvent({ kind: "upload_action", id: "ua_1", upload: "u-1", label: "Submit to Datum",
+  file: "sheet.pdf", bytes: 10, tool: "mcp__datum__submit", outcome: "done", text: "job 1" },
+  { replayed: false });
+const endedDoc = store.getState().chat.documents.find((d) => d.id === docId);
+out.documentAfterAction = { state: endedDoc.state, message: endedDoc.message };
+
 console.log(JSON.stringify(out));
 process.exit(0);
 """
@@ -225,3 +236,10 @@ def test_the_header_shows_the_conversation_s_usage_from_the_hello_and_live_event
     assert observed["usageHiddenAfterReset"] is True, (
         "a new conversation's usage is not the old one's"
     )
+
+
+def test_a_document_s_chip_says_how_its_action_ended(observed):
+    assert observed["documentAfterAction"] == {
+        "state": "ended",
+        "message": "Submit to Datum: sent",
+    }
