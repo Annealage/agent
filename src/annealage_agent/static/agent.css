@@ -38,7 +38,8 @@
 .chatbanner[hidden] { display: none; }
 .chatbanner[data-kind="error"] { background: #3a1e1e; border: 1px solid #5c2f2f; color: #e8a0a0; }
 .chatbanner[data-kind="reset"] { background: #3a2f1e; border: 1px solid #5c4a2f; color: #e0c07f; }
-.chatbanner[data-kind="info"] { background: #1e2f3a; border: 1px solid #2f4a5c; color: #9fc8e0; }
+.chatbanner[data-kind="info"],
+.chatbanner[data-kind="attention"] { background: #1e2f3a; border: 1px solid #2f4a5c; color: #9fc8e0; }
 .chatbanner span { flex: 1; white-space: pre-wrap; }
 .chatbanner button { flex: none; background: none; border: none; color: inherit; font-size: 16px; line-height: 1; cursor: pointer; padding: 0 4px; }
 /* The backend's own text under an error's message, which chat.js adds: a

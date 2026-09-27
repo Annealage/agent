@@ -81,8 +81,11 @@
  *                 request is not added twice.
  *                 `agentStatus` mirrors the hello frame's `session.agent`
  *                 ('connecting' | 'ready' | 'unavailable'). `banner` is the most
- *                 recent `session_reset` or `agent_error` event as
- *                 `{kind, text, detail}`, or null once dismissed; `detail` is
+ *                 recent `session_reset`, `agent_error` or `attention` event
+ *                 (or an info line the pane raised itself) as
+ *                 `{kind, text, detail}`, or null once dismissed; an
+ *                 `attention` one also clears when the human's next turn
+ *                 arrives. `detail` is
  *                 the backend's own text under the message (an
  *                 `agent_error`'s stderr), or null. A `session_reset`
  *                 also clears `turns` (`resetChatTurns`), because the new

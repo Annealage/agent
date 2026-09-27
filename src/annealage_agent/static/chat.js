@@ -1043,6 +1043,16 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     switch (event.kind) {
       case "user_turn":
         store.setChatUserTurn(event.turn, event.blocks, event.client_id || null);
+        // The human answering is what the agent asked for, so its question
+        // leaves the banner (it stays in the conversation, with the tool
+        // call that raised it). Replayed too: a tab reconnecting after the
+        // human answered elsewhere catches up here. Nothing replayed raises
+        // an attention banner, so this can only clear a live one. Any other
+        // banner is left as it is.
+        {
+          const banner = store.getState().chat.banner;
+          if (banner && banner.kind === "attention") store.clearChatBanner();
+        }
         break;
       case "text_delta":
         store.appendChatTextDelta(event.turn, event.text);
@@ -1059,7 +1069,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
       case "attention":
         if (!replayed) {
           notifyAttention(event.title, event.body);
-          store.setChatBanner("info", event.title + ": " + event.body);
+          store.setChatBanner("attention", event.title + ": " + event.body);
         }
         break;
       case "permission_request":

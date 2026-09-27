@@ -97,6 +97,21 @@ chat.handleEvent({ kind: "agent_error", remediation: "new trouble", stderr: "" }
 out.bannerFromLive = store.getState().chat.banner && store.getState().chat.banner.text;
 store.clearChatBanner();
 
+// The agent's question (attention) leaves the banner once the human answers;
+// an error banner outlives the next message.
+chat.handleEvent({ kind: "attention", title: "demo: circuit checkpoint", body: "OK?" }, { replayed: false });
+out.attentionBanner = store.getState().chat.banner && store.getState().chat.banner.text;
+chat.handleEvent({ kind: "user_turn", turn: 7, blocks: [{ type: "text", text: "yes" }] }, { replayed: false });
+out.afterAnswer = store.getState().chat.banner;
+chat.handleEvent({ kind: "agent_error", remediation: "still broken", stderr: "" }, { replayed: false });
+chat.handleEvent({ kind: "user_turn", turn: 8, blocks: [{ type: "text", text: "and?" }] }, { replayed: false });
+out.errorAfterTurn = store.getState().chat.banner && store.getState().chat.banner.text;
+store.clearChatBanner();
+// A tab that reconnects after the human answered from another one.
+chat.handleEvent({ kind: "attention", title: "demo: schematic checkpoint", body: "Pin comments" }, { replayed: false });
+chat.handleEvent({ kind: "user_turn", turn: 9, blocks: [{ type: "text", text: "done" }] }, { replayed: true });
+out.afterReplayedAnswer = store.getState().chat.banner;
+
 // Ready: a message is sent, and refused after the human started another.
 chat.handleHello({ id: "s", agent: "ready" });
 sendMessage("first");
@@ -144,6 +159,13 @@ def test_a_page_opened_while_the_agent_is_down_shows_why(observed):
 def test_only_a_live_agent_error_raises_the_banner(observed):
     assert observed["bannerFromReplay"] is None
     assert observed["bannerFromLive"] == "new trouble"
+
+
+def test_the_agents_question_leaves_the_banner_when_the_human_answers(observed):
+    assert observed["attentionBanner"] == "demo: circuit checkpoint: OK?"
+    assert observed["afterAnswer"] is None
+    assert observed["errorAfterTurn"] == "still broken"
+    assert observed["afterReplayedAnswer"] is None
 
 
 def test_a_refused_message_goes_back_in_front_of_what_was_typed_since(observed):
