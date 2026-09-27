@@ -132,7 +132,6 @@ def configure_request_limits():
     Request.max_body_length = 0
 
 
-
 #: What a route reading a buffered body is told.
 _UNBUFFERED = (
     "this request's body is not buffered (the agent layer sets "
@@ -933,6 +932,9 @@ async def retry_remotes(tools, bus, session, interval=REMOTE_RETRY_INTERVAL):
             continue
         reached, pending = pending, ()
         if not taken:
+            if getattr(session, "closed", False):
+                # Nothing to tell: the next session is built with these tools.
+                continue
             sys.stderr.write(
                 "warning: %s can be reached now, but this agent backend cannot take new tools "
                 "mid-session; they arrive when the session is next started\n" % names
