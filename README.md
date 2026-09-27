@@ -315,7 +315,7 @@ A product describes itself with one `annealage_agent.product.Product`, installed
 
 `install` refuses a product whose event kind, frame type or settings key collides with the package's own.
 
-`app.create_app` takes the product's page (`page_html`, whose inline scripts the Content-Security-Policy hashes at startup), a `register_routes(app, allowed_origins)` for its own routes, the two tokens, the session factory and, optionally, a `review_store` and `external_agents=True` (below). `app.serve` binds, starts the session once the socket is listening, runs the product's background tasks and shuts it all down on Ctrl-C.
+`app.create_app` takes the product's page (`page_html`, whose inline scripts the Content-Security-Policy hashes at startup), a `register_routes(app, allowed_origins)` for its own routes, the two tokens, the session factory and, optionally, a `review_store` and `external_agents=True` (below). `app.serve` binds, starts the app once the socket is listening (`app.agent_start(background)`: the session, the product's background tasks and the package's own), and stops it on Ctrl-C (`app.agent_stop()`: tasks cancelled, session closed, pages told to go, then each of `app.agent_on_stop`, the product's own teardown, sync or async) before closing the listener.
 
 For a service that runs persistently (behind `tailscale serve`, say), `create_app` also takes:
 
@@ -335,6 +335,30 @@ What the bus gives a product's tools beyond `call`:
 
 On omp, a message sent while a turn runs steers it (the page's Send button reads "Steer" then), a message omp refuses is reported and leaves the session ready, and each turn's cost and tokens come from `get_session_stats`. A remote MCP server that could not be reached at startup is tried again on the first turn and every minute; omp gets its tools at once (`set_host_tools`) and the model a note saying so. Claude's SDK servers and allow list, and Codex's bridges and tool list, are fixed when the session starts, so there the remote's tools arrive with the next start.
 
+## Many workspaces in one process
+
+`annealage_agent.frontdoor.FrontDoor` serves several apps from one socket, each a whole `create_app` app mounted at `/p/<id>/` with its own served directory, session, event log, review, tool server and background tasks, behind a page of the product's own:
+
+```python
+front = FrontDoor(FRONT_PAGE, token=token, agent_token=agent_token, host=bind.address, port=port,
+                  register_routes=front_routes)
+app = await asyncio.to_thread(
+    agent_app.create_app, root, page_html=PAGE, port=port, host=bind.address, token=token,
+    agent_token=agent_token, login=front.login, url_prefix=mount_prefix("demo"),
+    session_id=sid, build_session=build, resume_session=resume, idle_timeout=900)
+app.agent_on_stop.append(release_lock)
+front.mount("demo", app, background=(watch,))
+await front.serve(on_ready=on_ready)
+```
+
+- **Build apps off the loop.** `create_app` blocks while the tool server reaches its remote MCP servers (up to 10 s each) and reads the event log back, and needs no running loop, so a front door that adds a workspace while serving the others builds it with `asyncio.to_thread`, then mounts it on the loop.
+- **`create_app(url_prefix="/p/<id>")`** (`frontdoor.mount_prefix(id)`) goes into every address the app gives out: `bus.url` (what a tool and the permission broker tell the model to open), and the Codex bridge's `--path` for `/mcp` and each `/mcp/<remote>`. A URL a route builds for the page (`/upload`'s `url`) takes the request's prefix, so an app at the root answers exactly as before. A mounted app's settings window shows `host` and `port` as not in effect and refuses to save them: the front door owns the bind. `net.server_url`, `login_url` and `viewer_url` take a `url_prefix` too, for the link a product prints or opens.
+- **Idle close.** With `resume_session` (shaped like `build_session`; a product's passes `resumed=True` to `launch.build_session`) and `idle_timeout` seconds (positive), an app with no page connected, no turn running and no permission request open closes its session and that session's broker. The next page to connect, a turn, or a call through `/mcp` builds a new one from `resume_session`, starts it and, if the human had switched models, switches it to that model again; every route reads the live session when it runs (`app.agent_holder`), and `app.agent_session` is `None` while the app is closed. `app.agent_stop()` finishes an idle close under way, and its teardown runs to the end (the `agent_on_stop` hooks included) even if the caller awaiting it is cancelled.
+- **`FrontDoor(page_html, *, token, agent_token, host, port, extra_origins, extra_hosts, login, register_routes)`** has its own Host check, policy, headers, access log (one line per request, a mounted app's included) and the JSON 413 every app's body limit answers with. It serves `page_html` at `/`, `POST /login` over `front.login` (the one `LoginNonces` every app is built with, so a nonce issued anywhere opens any app), `/agent/static/`, `GET /apps?t=<browser token>` (`front.apps()`, `{id: app.agent_status()}`, for the page to poll), and redirects `/p/<id>` to `/p/<id>/`.
+- **`front.mount(id, app, background=())`** takes an id of letters, digits, `_` and `-` (no `.`: microdot reads a route's static text as a regular expression, so `a.b` would also match `axb`), and refuses an id already mounted (there is no unmounting) and an app built for another prefix or another `LoginNonces`. `front.serve(on_ready=None)` binds, starts every app, and on the way out stops every app, then the listener; an app mounted while serving is started as it is mounted (a failed start is written to stderr), and `await front.start_app(id)` waits for that.
+- **`app.agent_status()`** is `{"agent": "connecting" | "ready" | "unavailable" | "closed", "turn_running", "waiting", "attention", "last_activity", "viewers"}`: `waiting` is a permission request open or an `attention` raised since the human's last turn (`attention` is its `title: body`), `last_activity` epoch seconds. Each of `app.agent_status_listeners` is called with no arguments whenever it changes.
+- **The product's page** under a prefix loads the agent modules through the relative import map entry `"agent/": "./agent/static/"` and its own files relative to itself too (a `<base>` is refused by the policy's `base-uri 'none'`), and names its own routes through `appUrl` (below).
+
 ## The backend's own logs
 
 Every product gets all of this from `create_app`, with nothing to wire:
@@ -353,8 +377,9 @@ Every product gets all of this from `create_app`, with nothing to wire:
 
 ## The front end
 
-The page loads the pane's modules through one import map entry, `"agent/": "/agent/static/"`, and its stylesheet from `/agent/static/agent.css`. Nothing is bundled, and the page's own inline scripts are allowed by hash, so the product needs no build step either.
+The page loads the pane's modules through one import map entry, `"agent/": "/agent/static/"` (`"./agent/static/"` for a page that may be served under a front door's prefix), and its stylesheet from `/agent/static/agent.css`. Nothing is bundled, and the page's own inline scripts are allowed by hash, so the product needs no build step either.
 
+- `url.js`: `appUrl(route)` resolves a route, written without a leading slash (`appUrl("settings")`), against the page's own directory: `/settings` for a page at the root, `/p/demo/settings` for one at `/p/demo/`. Every request the package's modules make goes through it, the WebSocket included, so a product's page names its own routes the same way.
 - `ws.js`: `initWs({onEvent, onLive, onFallback, onHello, onAgentEvent, onPaused, onRefused, dispatchCall, connTitles, indicator})` connects to `/ws`, reads the token out of the URL fragment (trading an `#n=` nonce at `POST /login`), replays what the tab missed and reconnects with backoff. `onEvent` takes handlers for the product's own event kinds, called for live events only (the history a connection opens with is not handed to them, so `onLive` should refetch what they would). `onRefused(reason, clientId)` gets each refusal, with the refused turn's `client_id` when it was a turn (pass chat.js's `handleRefused`). It returns `{send}`. `authToken()` gives the token to anything that calls a token-gated route.
 - `chat.js`: `initChat({send, root, ids, agentTitles})` mounts the pane, finding its elements by id under `root`. The ids in the example are the defaults. `ids` maps a role (`log`, `input`, `banner`, `exportButton` and the rest, as in `DEFAULT_IDS`) to a different id. Every role's element has to exist except `exportButton` (default `#chatExport`, for transcript export).
 - `settings.js`: `initSettings({openButton, container, onLoad})` is the settings window, on the page's `#settingsBtn` and `#settingsModal` by default.

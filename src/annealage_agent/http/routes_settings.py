@@ -46,6 +46,16 @@ from .. import settings as settings_module
 from . import read_json_body
 from .ws import _origin_is_allowed, _token_is_allowed, refusal
 
+#: The settings a mounted app neither applies nor saves: the front door it is
+#: served under owns the process's one listening socket.
+BIND_KEYS = ("host", "port")
+
+#: Why, as the settings window shows it and a refused write says it.
+MOUNTED_BIND_REASON = (
+    "this workspace is served by a front door that owns the address and port "
+    "for every workspace, so it has no host or port of its own"
+)
+
 
 def register_settings_routes(
     app,
@@ -57,6 +67,7 @@ def register_settings_routes(
     session_id=None,
     bind=None,
     port=None,
+    mounted=False,
 ):
     """Register ``GET`` and ``PUT /settings`` on ``app``.
 
@@ -69,6 +80,12 @@ def register_settings_routes(
     diagnostics collector, which is the only consumer of them here, and so is
     the running session's ``backend_logs``, read off ``app.agent_session`` per
     request because the session is built after these routes are registered.
+
+    ``mounted`` is an app served under a front door's URL prefix
+    (``create_app(url_prefix=...)``). Its ``host`` and ``port`` (``BIND_KEYS``)
+    are reported as not in effect and not editable (``"in_effect": false``
+    with the reason beside it, and never ``pending``), and a ``PUT`` naming
+    either is refused whole, saying why.
     """
     if settings is None:
         settings = settings_module.resolve(serve_dir)
@@ -96,6 +113,9 @@ def register_settings_routes(
         )
         facts = await loop.run_in_executor(None, collect)
         wire = settings.to_wire()
+        if mounted:
+            for name in BIND_KEYS:
+                wire[name].update(editable=False, in_effect=False, reason=MOUNTED_BIND_REASON)
         installed = product.current()
         body = {
             "ok": True,
@@ -138,6 +158,8 @@ def register_settings_routes(
         # preference forever.
         pending = {}
         for name, entry in wire.items():
+            if entry.get("in_effect") is False:
+                continue
             if entry["effect"] == "load":
                 entry["value"] = saved[name]
                 entry["from"] = saved.provenance(name)
@@ -178,6 +200,12 @@ def register_settings_routes(
             }, 400
         if not changes:
             return {"ok": False, "error": "changes is empty; nothing to write"}, 400
+        refused = sorted(name for name in BIND_KEYS if name in changes) if mounted else ()
+        if refused:
+            return {
+                "ok": False,
+                "error": "%s cannot be set here: %s" % (" and ".join(refused), MOUNTED_BIND_REASON),
+            }, 400
 
         loop = asyncio.get_running_loop()
         try:

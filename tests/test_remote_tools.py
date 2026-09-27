@@ -192,12 +192,13 @@ class CountingBroker:
         return self.decision
 
 
-def _session(backend, tools, tmp_path):
-    """``launch.build_session``'s session for ``backend`` over ``tools``."""
+def _session(backend, tools, tmp_path, **bus_fields):
+    """``launch.build_session``'s session for ``backend`` over ``tools``, on a
+    stand-in bus with ``bus_fields`` besides the members every run has."""
     return launch.build_session(
         backend,
         lambda event: None,
-        bus=SimpleNamespace(tools=tools, broker=None, url="http://127.0.0.1:8765/"),
+        bus=SimpleNamespace(tools=tools, broker=None, url="http://127.0.0.1:8765/", **bus_fields),
         serve_dir=tmp_path,
         session_id=sessions.create_session(tmp_path),
         resumed=False,
@@ -376,8 +377,12 @@ async def test_codex_reaches_the_remote_through_a_bridge_of_its_own(
     assert servers["fake"]["env_vars"] == ["ANNEALAGE_AGENT_TOKEN"]
 
     broker = CountingBroker(Decision(allow=True))
+
+    async def current_broker():
+        return broker
+
     app = Microdot()
-    register_mcp_routes(app, tools=tools, broker=broker, agent_token=TOKEN)
+    register_mcp_routes(app, tools=tools, current_broker=current_broker, agent_token=TOKEN)
     client = make_test_client(app)
 
     async def post(path, method, params=None):
@@ -404,6 +409,49 @@ async def test_codex_reaches_the_remote_through_a_bridge_of_its_own(
 
     status, _ = await post("/mcp/elsewhere", "tools/list")
     assert status == 404
+
+
+@pytest.mark.asyncio
+async def test_codex_under_a_mounted_app_reaches_every_server_under_its_prefix(
+    fake, bus, tmp_path, monkeypatch
+):
+    """An app a front door serves at /p/demo has its /mcp routes there, so
+    each bridge, the product's own included, is pointed under the prefix."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib
+
+    tools = _tools(bus, tmp_path, _fake(fake))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    codex = _session("codex", tools, tmp_path, url_prefix="/p/demo")
+    servers = tomllib.loads("\n".join(codex._mcp_config_overrides()))["mcp_servers"]
+    paths = {name: s["args"][s["args"].index("--path") + 1] for name, s in servers.items()}
+    assert paths == {"toy": "/p/demo/mcp", "fake": "/p/demo/mcp/fake"}
+
+
+@pytest.mark.asyncio
+async def test_a_remote_reached_after_the_routes_were_registered_is_served(fake, bus, tmp_path):
+    """A remote first reached by the retry is in the next session an app
+    resumes with (a Codex bridge at /mcp/<name>), so its route must answer
+    though it was not there when the routes were registered."""
+    tools = _tools(bus, tmp_path, _fake(fake))
+    reached, tools.remotes = tools.remotes, ()
+
+    async def current_broker():
+        return CountingBroker(Decision(allow=True))
+
+    app = Microdot()
+    register_mcp_routes(app, tools=tools, current_broker=current_broker, agent_token=TOKEN)
+    client = make_test_client(app)
+    body = json.dumps({"method": "tools/list"})
+    path = "/mcp/fake?t=%s" % TOKEN
+    headers = {"Content-Type": "application/json"}
+    assert (await client.post(path, headers=dict(headers), body=body)).status_code == 404
+    tools.remotes += reached
+    res = await client.post(path, headers=dict(headers), body=body)
+    assert res.status_code == 200
+    assert {t["name"] for t in json.loads(res.body)["result"]["tools"]} == PROXIED
 
 
 @pytest.mark.asyncio

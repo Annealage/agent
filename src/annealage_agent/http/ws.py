@@ -112,8 +112,7 @@ def register_ws(
     registry,
     event_log,
     session_info,
-    session=None,
-    bus=None,
+    holder,
 ):
     """Register ``/ws`` on ``app``.
 
@@ -124,11 +123,17 @@ def register_ws(
     token, so the only way to reach this state is a caller that built an app
     without one.
 
-    ``bus`` is the ``ViewerBus`` holding the human's pause switch, and is
-    ``None`` in viewer-only mode, where there are no agent tools to pause. It is
-    read for the ``hello`` frame and written by an inbound ``pause`` frame; this
-    module never calls through it, because a ``call`` originates with a tool,
-    never with a socket.
+    ``holder`` is the app's ``AgentHolder`` (``app.py``), read as each
+    connection opens and as each frame arrives rather than once here: its
+    ``session`` is the live session, ``None`` in viewer-only mode, and a
+    connection or an agent frame (``turn``, ``interrupt``, ``permission``,
+    ``set_model``) reaching an app its idle timer closed resumes one first
+    (``holder.ensure()``). Its ``bus`` is the ``ViewerBus`` holding the human's
+    pause switch, handed on only while a session exists, since viewer-only
+    mode has no agent tools to pause. The bus is read for the ``hello`` frame
+    and written by an inbound ``pause`` frame; this module never calls
+    through it, because a ``call`` originates with a tool, never with a
+    socket.
     """
 
     @app.get("/ws")
@@ -144,6 +149,13 @@ def register_ws(
         ws.max_message_length = MAX_WS_MESSAGE
         conn = None
         try:
+            # After the upgrade, so the page's plain-HTTP refusal probe
+            # (static/ws.js) never starts a session; noted as activity, so
+            # the idle sweep does not close the session this page is greeted
+            # with before the page counts as connected.
+            session = await holder.ensure()
+            holder.note_activity()
+            bus = holder.bus if session is not None else None
             # Greeting and replay both happen before the connection is
             # registered, and that order is load-bearing. Registering starts a
             # writer task that also sends on this socket, and a replayed event
@@ -180,7 +192,7 @@ def register_ws(
             if not await _greet(ws, event_log, token, session_info["id"]):
                 return Response.already_handled
             conn = await registry.add(ws)
-            await _serve_connection(ws, conn, registry, event_log, token, session, bus)
+            await _serve_connection(ws, conn, registry, event_log, token, holder)
         except WebSocketError:
             # The peer closed, or sent a frame microdot could not read. Not
             # an error worth reporting: a browser tab closing is the ordinary
@@ -372,7 +384,12 @@ async def _parse(ws, raw):
     return result
 
 
-async def _serve_connection(ws, conn, registry, event_log, token, session=None, bus=None):
+#: The frames that need a session, which one reaching an idle-closed app
+#: resumes first.
+_AGENT_FRAMES = frozenset(("turn", "interrupt", "permission", "set_model"))
+
+
+async def _serve_connection(ws, conn, registry, event_log, token, holder):
     """Read and dispatch frames until the peer goes away.
 
     Every frame this sends is either a ``refused``, which carries no seq, or a
@@ -382,6 +399,9 @@ async def _serve_connection(ws, conn, registry, event_log, token, session=None, 
     interleave mid-frame either: microdot's ``awrite`` is a single
     ``StreamWriter.write`` of the whole frame followed by a ``drain``, and
     ``write`` buffers synchronously.
+
+    The session each frame goes to is the holder's at that moment, so a
+    session resumed while this connection was open is the one it reaches.
     """
     while True:
         raw = await ws.receive()
@@ -390,6 +410,10 @@ async def _serve_connection(ws, conn, registry, event_log, token, session=None, 
             continue
         if frame is _CLOSED:
             return
+        if frame["type"] in _AGENT_FRAMES:
+            await holder.ensure()
+        session = holder.session
+        bus = holder.bus if session is not None else None
         await _dispatch(ws, conn, registry, event_log, token, frame, session, bus)
 
 
@@ -450,7 +474,7 @@ async def _dispatch(ws, conn, registry, event_log, token, frame, session=None, b
         seq = event_log.append(event)
         await asyncio.ensure_future(registry.broadcast(protocol.build_event(seq, event.to_wire())))
         return
-    if kind in ("turn", "interrupt", "permission", "set_model"):
+    if kind in _AGENT_FRAMES:
         if session is None:
             # Viewer-only: the frames are still defined and validated so one
             # browser build works against both modes, and answering with a

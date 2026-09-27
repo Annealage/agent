@@ -34,14 +34,17 @@ from ..session import logfiles
 from .ws import _origin_is_allowed, _token_is_allowed, refusal
 
 
-def register_log_routes(app, *, session, token, allowed_origins=()):
+def register_log_routes(app, *, current_session, token, allowed_origins=()):
     """Register ``GET /agent/logs`` and ``GET /agent/logs/<name>`` on ``app``
-    over ``session`` (an ``AgentSession``, or ``None`` for a run without one)."""
+    over the session ``current_session()`` returns when a request arrives (an
+    ``AgentSession``, or ``None`` for a run without one, or an app whose
+    session its idle timer closed)."""
 
     async def _entries():
         # backend_logs looks at files, so it runs off the loop; it must not
         # raise, and a session that does anyway lists nothing rather than
         # failing the window it is shown in.
+        session = current_session()
         if session is None:
             return []
         loop = asyncio.get_running_loop()

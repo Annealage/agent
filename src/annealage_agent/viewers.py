@@ -747,6 +747,11 @@ class ViewerBus:
 
     ``write_protected`` is the app's write-protected patterns
     (``create_app``), which ``launch.build_session`` hands to the session.
+
+    ``url_prefix`` is the path the app is mounted under in a front door
+    (``""`` at the root; ``url`` already ends in it), which
+    ``launch.build_session`` hands to a Codex session for its bridge's
+    ``--path``.
     """
 
     def __init__(
@@ -754,12 +759,14 @@ class ViewerBus:
         registry: ViewerRegistry,
         *,
         url: str,
+        url_prefix: str = "",
         timeout: float = CALL_TIMEOUT,
         publish: Optional[Any] = None,
         turn: int = 0,
     ):
         self._registry = registry
         self._url = url
+        self.url_prefix = url_prefix
         self._timeout = timeout
         self._paused = False
         self._publish = publish

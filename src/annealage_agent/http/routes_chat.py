@@ -365,7 +365,10 @@ def register_chat_routes(app, serve_dir, *, token, allowed_origins=()):
         return {
             "ok": True,
             "path": "images/%s" % target.name,
-            "url": "/asset/%s" % target.name,
+            # Under the prefix this request came in on, so a page served
+            # under a front door fetches it from its own app; "" (the page
+            # at the root) gives exactly "/asset/<name>".
+            "url": "%s/asset/%s" % (req.url_prefix, target.name),
             "bytes": total,
             "media_type": media_type,
         }, 200

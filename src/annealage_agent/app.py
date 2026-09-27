@@ -12,6 +12,14 @@ served directories never share route state, which matters for tests.
 to the caller once it is actually listening, then serves until interrupted and
 closes the listener before returning.
 
+Everything that belongs to one app's run rather than to its socket lives on
+the app itself, in its ``AgentHolder`` (``app.agent_holder``): the live
+session, which an idle app closes and a returning page resumes as a new one,
+the lifecycle ``serve`` drives (``app.agent_start``/``app.agent_stop``), and
+the status summary a front door shows (``app.agent_status``). That is what
+lets several apps share one server under URL prefixes
+(``frontdoor.FrontDoor``), each started and stopped on its own.
+
 A product's own application module (Mesh's ``app.py``, for one) calls both,
 adding its routes and the background tasks that watch its files.
 """
@@ -22,6 +30,7 @@ import hashlib
 import inspect
 import re
 import sys
+import time
 
 from microdot import Microdot, Request
 
@@ -39,6 +48,7 @@ from .review.watcher import ReviewWatcher
 from .session import secret_paths
 from .session.base import (
     AGENT_READY,
+    AGENT_UNAVAILABLE,
     AgentError,
     AgentModelChanged,
     AgentStatus,
@@ -56,6 +66,23 @@ from .viewers import ViewerBus, ViewerRegistry
 # must return control in a couple of seconds, not stall until that transfer
 # completes.
 SHUTDOWN_DRAIN_TIMEOUT = 2.0
+
+#: What ``app.agent_status()`` reports as ``agent`` for an app whose session
+#: is closed: by its idle timer (the next page to connect resumes it) or by
+#: ``agent_stop``. The other three values are the session's own.
+AGENT_CLOSED = "closed"
+
+#: The longest an app with an idle timeout waits between two looks at whether
+#: it has been idle long enough; a shorter timeout is looked at that often.
+IDLE_SWEEP_INTERVAL = 5.0
+
+#: A ``url_prefix``: empty, or one or more path segments each introduced by a
+#: ``/``, with no trailing ``/``, and nothing microdot would read as a
+#: placeholder (``<``) or a URL would read as a query or fragment. No ``.``
+#: either: microdot joins a route's static segments into its regex unescaped,
+#: so a prefix ``/p/a.b`` would also match ``/p/axb`` and take another app's
+#: requests.
+_URL_PREFIX_RE = re.compile(r"(?:/[A-Za-z0-9_~-]+)*")
 
 # microdot's request body limits are class attributes on ``Request`` and
 # therefore process-global: raising them (done in configure_request_limits,
@@ -163,6 +190,9 @@ def create_app(
     login=None,
     review_store=None,
     external_agents=False,
+    url_prefix="",
+    resume_session=None,
+    idle_timeout=None,
 ):
     """Build a Microdot app serving ``serve_dir``, routes registered, not started.
 
@@ -230,6 +260,36 @@ def create_app(
     ``None`` resolves the file and default layers here instead, so a caller
     with no flags to declare, which is every test, needs to know nothing about
     settings at all.
+
+    ``url_prefix`` is the path this app is mounted under in a front door
+    (``"/p/demo"``: no trailing slash; ``""``, the default, is an app served
+    at the root). It goes into every address this app gives out itself:
+    ``bus.url`` (the no-viewer message and the broker's ``viewer_url``) and,
+    through ``bus.url_prefix``, the Codex bridge's ``--path`` for ``/mcp``
+    and each ``/mcp/<remote>``. A URL a route builds for the page (``/upload``'s
+    ``url``) comes from the request instead (microdot's ``req.url_prefix``),
+    so an app at the root answers exactly as it did before prefixes existed.
+    A mounted app refuses to save ``host`` and ``port`` from its settings
+    window, since the front door owns the bind (``http/routes_settings.py``).
+
+    ``resume_session`` is a factory shaped like ``build_session``
+    (``(on_event, *, bus) -> session``) for the session an idle-closed app
+    reopens with (a product's passes ``resumed=True`` to
+    ``launch.build_session``, so the backend resumes the conversation).
+    ``idle_timeout`` is how many seconds (more than zero) an app that has one
+    waits, with no page connected, no turn running and no permission request
+    open, before it closes its session and that session's broker; the next
+    page to connect (or a turn, or a call through ``/mcp``) builds and starts
+    a new one from ``resume_session`` (``AgentHolder``), switched to the model
+    the human last chose if that is not the run's. Without both, the app never
+    closes for being idle.
+
+    Building an app blocks: the product's tool server connects to its remote
+    MCP servers (up to ``remote.DISCOVERY_TIMEOUT`` each) and the event log is
+    read back from disk. Nothing here needs a running event loop, so a
+    process that builds apps while it serves others (a front door adding a
+    workspace) calls this through ``asyncio.to_thread`` rather than on the
+    loop every other app is served from.
     """
     if agent_token is not None and agent_token == token:
         raise ValueError(
@@ -237,6 +297,11 @@ def create_app(
             "processes beside the agent's shell, and the browser token approves "
             "permission requests"
         )
+    check_url_prefix(url_prefix)
+    if idle_timeout is not None and not idle_timeout > 0:
+        # Zero would make the idle sweep spin the event loop every other app
+        # of a front door is served from.
+        raise ValueError("idle_timeout must be a positive number of seconds: %r" % (idle_timeout,))
     configure_request_limits()
     if write_protected is None:
         write_protected = product.current().write_protected
@@ -258,18 +323,8 @@ def create_app(
         )
 
     app = Microdot()
-
-    @app.before_request
-    async def _check_host(req):
-        # Every route, not only /ws: a rebound DNS name can read /manifest
-        # and write through /submit as readily as it can open a socket. A
-        # before_request handler that returns a value short-circuits the
-        # route entirely, so a refused request never reaches a handler.
-        if not host_is_allowed(req, allowed_hosts):
-            return refusal()
-        # Explicit: microdot treats any returned value as a short-circuit, so
-        # "carry on to the route" is expressed by returning nothing at all.
-        return None
+    app.agent_url_prefix = url_prefix
+    install_host_check(app, allowed_hosts)
 
     if settings is None:
         settings = settings_module.resolve(serve_dir)
@@ -290,17 +345,15 @@ def create_app(
         session_id=session_id,
         bind=bind.address,
         port=port,
+        mounted=bool(url_prefix),
     )
     register_review_routes(app, store=review_store, token=token, allowed_origins=allowed_origins)
 
-    # Set after the session exists, since the broker it belongs to is built by
-    # the session factory below; a list with one slot rather than a nonlocal so
-    # the closure reads the current value instead of capturing None.
-    presence_listener = []
-
+    # The registry reports presence before the holder exists to take it (the
+    # holder is built from the registry); the name is bound by the time a
+    # connection can arrive.
     def _presence(count):
-        for listen in presence_listener:
-            listen(count)
+        holder.on_presence(count)
 
     # Given a path in agent mode, so the conversation survives the process. The
     # 500-event ring alone covers a browser reconnecting; it is this file that
@@ -334,7 +387,8 @@ def create_app(
     # must not appear in anything a tool or the broker says to the model.
     bus = ViewerBus(
         registry,
-        url=net.server_url(bind, port),
+        url=net.server_url(bind, port, url_prefix),
+        url_prefix=url_prefix,
         publish=_event_publisher(registry, event_log),
         turn=event_log.last_turn,
     )
@@ -425,66 +479,93 @@ def create_app(
     # returns the session or None for viewer-only. It is a factory rather than a
     # constructed object so that both of those, which need the registry and the
     # log built above, exist before the session that will use them, without
-    # either module importing the other.
-    session = None
-    if build_session is not None:
-        session = build_session(_event_publisher(registry, event_log, session_info), bus=bus)
-    app.agent_session = session
-    if session is None and external_agents:
-        # Imported here, like the backends' own sessions: a product that never
-        # asks for this pays nothing for it.
-        from .session.external import ExternalAgentSession
-        from .session.permissions import PermissionBroker
+    # either module importing the other. ``resume_session`` goes through the
+    # same path when an idle-closed app reopens (``AgentHolder``).
+    def _make_session(factory):
+        # A broker belongs to one session: the factory sets the new one, and
+        # a factory that sets none leaves /mcp failing closed rather than
+        # gating with the shut-down broker of the session before.
+        bus.broker = None
+        session = None
+        if factory is not None:
+            session = factory(_event_publisher(registry, event_log, session_info), bus=bus)
+        if session is None and external_agents:
+            # Imported here, like the backends' own sessions: a product that
+            # never asks for this pays nothing for it.
+            from .session.external import ExternalAgentSession
+            from .session.permissions import PermissionBroker
 
-        publish = _event_publisher(registry, event_log, session_info)
-        # The broker a real session's factory would have built (launch.py),
-        # over the same grants file, and set on the bus for the same reason:
-        # /mcp below and a review tool that asks the human read it there.
-        bus.broker = PermissionBroker(
-            publish,
-            permissions_path=sessions.state_dir(serve_dir) / "permissions.toml",
-            viewer_url=bus.url,
-            timeout=float(settings["approval_timeout"]),
-            never_remembered=tools.never_remembered,
-        )
-        session = app.agent_session = ExternalAgentSession(publish, bus.broker)
+            publish = _event_publisher(registry, event_log, session_info)
+            # The broker a real session's factory would have built
+            # (launch.py), over the same grants file, and set on the bus for
+            # the same reason: /mcp below and a review tool that asks the
+            # human read it there.
+            bus.broker = PermissionBroker(
+                publish,
+                permissions_path=sessions.state_dir(serve_dir) / "permissions.toml",
+                viewer_url=bus.url,
+                timeout=float(settings["approval_timeout"]),
+                never_remembered=tools.never_remembered,
+            )
+            session = ExternalAgentSession(publish, bus.broker)
+        return session
+
+    holder = AgentHolder(
+        app,
+        bus=bus,
+        registry=registry,
+        event_log=event_log,
+        session_info=session_info,
+        tools=tools,
+        review_watcher=app.agent_review_watcher,
+        make_session=_make_session,
+        resume_session=resume_session,
+        idle_timeout=idle_timeout,
+    )
+    app.agent_holder = holder
+    app.agent_start = holder.start
+    app.agent_stop = holder.stop
+    app.agent_on_stop = holder.on_stop
+    app.agent_status = holder.status
+    app.agent_status_listeners = holder.status_listeners
+    # A factory returning None is the ordinary viewer-only case, not a
+    # failure: it leaves an app that serves the product's page with no agent
+    # attached rather than one that could not be built.
+    session = _make_session(build_session)
+    holder.install(session)
+    # A tool result's end_turn (tools.ok) reaches whichever session is live
+    # then; a session that cannot stop a turn has nothing to call.
+    bus.end_turn_handler = holder.end_turn
     if session is not None:
-        # Both of these read the session, so both are inside this guard: a
-        # factory returning None is the ordinary viewer-only case, not a
-        # failure, and it must leave an app that serves the product's page
-        # with no agent attached rather than one that could not be built.
-        presence_listener.append(session.on_viewer_presence)
-        # The hello frame publishes whatever the session currently knows, so a
-        # tab that connects later sees a ready agent rather than the
-        # connecting state this dict was built with.
-        session_info["agent"] = session.agent_status()
-        session_info["steers"] = bool(getattr(session, "steers", False))
-        # A tool result's end_turn (tools.ok) reaches the session through
-        # the bus; a session that cannot stop a turn has no handler.
-        bus.end_turn_handler = getattr(session, "end_turn_after_tool", None)
-        # /mcp is mounted here, not unconditionally above, for the same
-        # reason register_ws's own bus= is None until a session exists: a
-        # viewer-only app has no tools and no broker to gate them, so there
-        # is nothing for this route to serve. tools is never None here
-        # (built above whenever session_id is not None, which every real
-        # caller - the CLI's build_session, and every test fixture that
-        # wants a real session - must set for exactly this reason); broker
-        # is bus.broker, set by build_session's own closure while
-        # constructing PermissionBroker - None only if a caller supplied a
-        # build_session that never sets it, in which case register_mcp_routes
-        # fails closed on every write-class call rather than gating with no
-        # broker at all.
+        # /mcp is mounted only when this app has a session, for the same
+        # reason /ws answers a turn only then: a viewer-only app has no
+        # tools and no broker to gate them, so there is nothing for this
+        # route to serve. tools is never None here (built above whenever
+        # session_id is not None, which every real caller - the CLI's
+        # build_session, and every test fixture that wants a real session -
+        # must set for exactly this reason). The broker is the live
+        # session's, read per call: bus.broker, set by the session factory
+        # while constructing PermissionBroker, and None only if a factory
+        # never sets it, in which case register_mcp_routes fails closed on
+        # every write-class call rather than gating with no broker at all.
+        async def _current_broker():
+            await holder.ensure()
+            holder.note_activity()
+            return bus.broker
+
         register_mcp_routes(
             app,
             tools=tools,
-            broker=bus.broker,
+            current_broker=_current_broker,
             agent_token=agent_token,
             allowed_origins=allowed_origins,
         )
 
-    # Listed from whatever session this run ended up with; a viewer-only run
-    # still answers, with nothing to list.
-    register_log_routes(app, session=session, token=token, allowed_origins=allowed_origins)
+    # Listed from whatever session is live; a viewer-only run still answers,
+    # with nothing to list.
+    register_log_routes(
+        app, current_session=lambda: holder.session, token=token, allowed_origins=allowed_origins
+    )
 
     register_ws(
         app,
@@ -494,9 +575,56 @@ def create_app(
         registry=registry,
         event_log=event_log,
         session_info=session_info,
-        session=session,
-        bus=bus if session is not None else None,
+        holder=holder,
     )
+
+    install_response_handlers(app, csp_value, server_header)
+    return app
+
+
+def check_url_prefix(url_prefix):
+    """Refuse a ``url_prefix`` that is not ``""`` or ``/segment[/segment...]``
+    with no trailing slash: microdot mounts by concatenation, so ``/p/x/``
+    would put every route at ``/p/x//...``, a ``<`` would be read as a
+    placeholder handing every route an argument it does not take, and a
+    ``.`` would match any character (``_URL_PREFIX_RE``)."""
+    if not isinstance(url_prefix, str) or not _URL_PREFIX_RE.fullmatch(url_prefix):
+        raise ValueError(
+            "url_prefix must be empty or like /p/demo (path segments of letters, digits, "
+            "'_', '~' and '-', no trailing slash): %r" % (url_prefix,)
+        )
+
+
+def install_host_check(app, allowed_hosts):
+    """Refuse, on every route of ``app``, a request whose ``Host`` is not in
+    ``allowed_hosts``."""
+
+    @app.before_request
+    async def _check_host(req):
+        # Every route, not only /ws: a rebound DNS name can read /manifest
+        # and write through /submit as readily as it can open a socket. A
+        # before_request handler that returns a value short-circuits the
+        # route entirely, so a refused request never reaches a handler.
+        if not host_is_allowed(req, allowed_hosts):
+            return refusal()
+        # Explicit: microdot treats any returned value as a short-circuit, so
+        # "carry on to the route" is expressed by returning nothing at all.
+        return None
+
+
+def install_response_handlers(app, csp_value, server_header, *, front_door=False):
+    """The JSON 413, the access log and the headers every response of ``app``
+    carries: ``csp_value`` as its Content-Security-Policy, ``no-store``, the
+    ``Server`` header and the rest.
+
+    ``front_door`` is for the parent app apps are mounted in
+    (``frontdoor.FrontDoor``). A mounted app's own handlers run first on its
+    routes and set every header, which the parent's then leave alone (each
+    only fills in a header that is missing); the parent's access log skips
+    those routes, which the mounted app has logged already, so each request
+    is one line. Its 413 handler is the one that answers, even for a mounted
+    route: microdot checks the body limit before it looks the route up.
+    """
 
     @app.errorhandler(413)
     async def _payload_too_large(req):
@@ -519,6 +647,8 @@ def create_app(
         # the failure.
         if req is None:
             sys.stderr.write('  ? - "?" %s -\n' % res.status_code)
+            return res
+        if front_door and req.subapp is not None:
             return res
         addr = req.client_addr[0] if req.client_addr else "-"
         sys.stderr.write(
@@ -581,8 +711,6 @@ def create_app(
     app.after_error_request(_no_store)
     app.after_request(_security_headers)
     app.after_error_request(_security_headers)
-
-    return app
 
 
 def _event_publisher(registry, event_log, session_info=None):
@@ -690,7 +818,8 @@ async def retry_remotes(tools, bus, session, interval=REMOTE_RETRY_INTERVAL):
     new tools mid-session: a Claude session's SDK servers and allow list, and
     Codex's bridge entries and tool list, are fixed when it starts, so there
     the remote's tools arrive with the next session start (a restart, which
-    ``-c`` resumes)."""
+    ``-c`` resumes). An app passes its ``AgentHolder`` as ``session``, which
+    hands the table to whichever session is live when a remote is reached."""
     # Imported here: the tool module loads the agent SDK, which a viewer-only
     # run never does, and this runs only for an agent session with remotes.
     from .tools import instructions_of
@@ -741,6 +870,407 @@ async def retry_remotes(tools, bus, session, interval=REMOTE_RETRY_INTERVAL):
         bus.queue_note(note + ("\n\n" + instructions if instructions else ""))
 
 
+class AgentHolder:
+    """One app's live agent session, and the lifecycle and status built
+    around it (``app.agent_holder``; ``create_app`` builds it).
+
+    **Why a holder.** A session and its ``PermissionBroker`` run once:
+    ``close()`` shuts the broker down for good, after which every ``ask``
+    denies. So an app idle past its ``idle_timeout`` closes its session and,
+    when a page next connects (``/ws``), a turn arrives or an agent in another
+    process calls ``/mcp``, builds a new one from ``resume_session`` instead
+    of restarting the old one (``ensure``). Nothing that needs the session
+    keeps it: ``/ws``, ``/mcp`` and ``/mcp/<remote>``, ``/agent/logs``, the
+    registry's presence listener, the bus's ``end_turn_handler`` and
+    ``retry_remotes`` all read this object when they run. ``session`` is the
+    live session (``None`` while closed, or for a viewer-only app), and
+    ``app.agent_session`` is kept equal to it; ``bus.broker`` is always the
+    live session's broker, set by the factory that built it.
+
+    **Lifecycle** (``app.agent_start``/``app.agent_stop``): ``start``
+    starts the session once the socket listens and the app's tasks
+    (the product's ``background``, the pings, the review watcher, the remote
+    retry, the idle sweep); ``stop`` cancels those, closes the session, tells
+    every viewer to go away and then runs ``on_stop`` (``app.agent_on_stop``),
+    the product's own teardown, sync or async, each one's failure reported
+    and the rest still run.
+
+    **Status** (``app.agent_status``): a plain dict for a front door's list of
+    apps, with ``status_listeners`` (``app.agent_status_listeners``) called
+    with no arguments whenever it changes. It is kept from the events the
+    app's event log records (``EventLog.observers``), whichever publisher
+    sent them: ``user_turn`` starts a turn and ``turn_end`` ends it, a
+    ``permission_request`` waits until its ``permission_resolved``, and an
+    ``attention`` waits until the human's next turn.
+    """
+
+    def __init__(
+        self,
+        app,
+        *,
+        bus,
+        registry,
+        event_log,
+        session_info,
+        tools,
+        review_watcher,
+        make_session,
+        resume_session=None,
+        idle_timeout=None,
+    ):
+        self._app = app
+        self.bus = bus
+        self._registry = registry
+        self._session_info = session_info
+        self._tools = tools
+        self._review_watcher = review_watcher
+        self._make_session = make_session
+        self._resume_session = resume_session
+        self._idle_timeout = (
+            float(idle_timeout) if idle_timeout is not None and resume_session is not None else None
+        )
+        self.session = None
+        #: Closed by the idle sweep; the next ``ensure`` resumes it.
+        self.closed = False
+        self._started = False
+        self._stopped = False
+        self._tasks = []
+        self._start_task = None
+        # The idle close in flight or last done, shielded from cancellation
+        # so a stop arriving meanwhile waits for it rather than abandoning it.
+        self._closing = None
+        # The one teardown, shielded likewise: a cancelled agent_stop leaves
+        # it running, and a second call waits for the same one.
+        self._stop_task = None
+        # The model every session this app builds starts on (the run's
+        # settings); session_info["model"] follows live switches.
+        self._startup_model = session_info.get("model")
+        # Held across every change of session (idle close, resume, stop), so
+        # a page arriving while one closes waits for it and then resumes.
+        self._lock = asyncio.Lock()
+        self.on_stop = []
+        self.status_listeners = []
+        self._viewers = 0
+        self._turns = set()
+        self._requests = set()
+        self._attention = None
+        self._last_activity = time.time()
+        self._last_active = time.monotonic()
+        event_log.observers.append(self._observe)
+
+    # -- the session -----------------------------------------------------------
+
+    def install(self, session):
+        """Make ``session`` (or ``None``) the live session."""
+        self.session = session
+        self._app.agent_session = session
+        if session is None:
+            self._session_info["agent"] = AGENT_UNAVAILABLE
+            return
+        # The hello frame publishes whatever the session currently knows, so a
+        # tab that connects later sees a ready agent rather than the
+        # connecting state session_info was built with.
+        self._session_info["agent"] = session.agent_status()
+        self._session_info["steers"] = bool(getattr(session, "steers", False))
+
+    async def ensure(self):
+        """The live session, after resuming one if the idle sweep closed the
+        last: a new session from ``resume_session``, started in the
+        background (the page learns when it is ready from its
+        ``agent_status`` events, as it does at startup). A factory that
+        raises leaves the app closed, reported, for the next caller to try
+        again."""
+        if self.closed and not self._stopped:
+            async with self._lock:
+                if self.closed and not self._stopped:
+                    self._resume()
+        return self.session
+
+    def _resume(self):
+        # The model the human last switched to, which the new session does not
+        # start on: every factory builds from the run's settings.
+        wanted = self._session_info.get("model")
+        try:
+            session = self._make_session(self._resume_session)
+        except Exception as exc:
+            sys.stderr.write("error: could not resume the agent session: %r\n" % (exc,))
+            return
+        self.closed = False
+        self.install(session)
+        if session is not None:
+            # What the new session runs until the switch is made again: the
+            # hello says so, and the switch's own event puts it back.
+            self._session_info["model"] = self._startup_model
+            if self._viewers:
+                # A turn frame resuming on a connection already open: the new
+                # session's broker has to know a page is there to answer it.
+                session.on_viewer_presence(self._viewers)
+            self._start_task = asyncio.ensure_future(
+                _start_session(session, model=wanted if wanted != self._startup_model else None)
+            )
+        self._note_change()
+
+    async def _close_idle(self):
+        async with self._lock:
+            remaining = self._idle_remaining()
+            if remaining is None or remaining > 0:
+                return
+            session, start = self.session, self._start_task
+            self._start_task = None
+            # Closed before the session is: a page arriving meanwhile waits on
+            # the lock and then resumes, rather than getting the one closing.
+            self.closed = True
+            self.install(None)
+            self._turns.clear()
+            # Shielded: a stop cancelling this sweep waits for the close
+            # rather than abandoning it halfway (a backend's child left behind).
+            self._closing = asyncio.ensure_future(_end_session(start, session))
+            await asyncio.shield(self._closing)
+        self._note_change()
+
+    # -- what reads the session at call time -------------------------------------
+
+    def on_presence(self, count):
+        """The registry's presence listener: ``count`` pages are connected."""
+        self._viewers = count
+        try:
+            if self.session is not None:
+                self.session.on_viewer_presence(count)
+        finally:
+            self._note_change()
+
+    def end_turn(self):
+        """``bus.end_turn_handler``: a tool result asked to end the turn."""
+        handler = getattr(self.session, "end_turn_after_tool", None)
+        if handler is not None:
+            handler()
+
+    async def set_tool_table(self, table):
+        """What ``retry_remotes`` hands a reached remote's tools to: the live
+        session's ``set_tool_table``, or False (not taken) for a session that
+        cannot take tools mid-session or while the app is closed, since the
+        next session is built with every remote reached by then."""
+        set_table = getattr(self.session, "set_tool_table", None)
+        if set_table is None:
+            return False
+        return await set_table(table)
+
+    def note_activity(self):
+        """Something used this app without changing its status (a call through
+        ``/mcp``): it is not idle."""
+        self._note_change()
+
+    # -- lifecycle ---------------------------------------------------------------
+
+    async def start(self, background=()):
+        """Start the session and this app's tasks; once only, and only once
+        the socket the app is served on is listening.
+
+        Listening first matters: a Codex backend's start() launches
+        session/codex.py's stdio-to-HTTP MCP proxy (codex_mcp_stdio_bridge.py)
+        as a subprocess of the app-server it also launches, and that proxy's
+        first tools/list call reaches this app's own /mcp route while Codex's
+        own session startup is still in progress. Starting the session before
+        the socket accepts connections would point that first call at a port
+        nothing is listening on yet, which Codex treats as the MCP server
+        having failed, leaving every product tool unavailable for the rest of
+        the session. A failure inside start() is reported as an event and
+        never raised, so this cannot stop the page from being served either
+        way.
+
+        ``background`` is the product's own long-running coroutine functions,
+        each called and started as a task once the session has started, and
+        cancelled by ``stop``.
+        """
+        if self._started:
+            raise RuntimeError("this app has already been started")
+        self._started = True
+        if self.session is not None:
+            await self.session.start()
+        # Started here rather than in create_app, because create_app is called
+        # by tests that have no running loop to own a background task and no
+        # interest in one; a task per constructed app would leak a task per
+        # test.
+        tasks = [asyncio.ensure_future(run()) for run in background]
+        tasks.append(asyncio.ensure_future(ping_forever(self._registry)))
+        if self._review_watcher is not None:
+            tasks.append(asyncio.ensure_future(self._review_watcher.run()))
+        if self.session is not None and self._tools is not None and self._tools.unreached:
+            tasks.append(asyncio.ensure_future(retry_remotes(self._tools, self.bus, self)))
+        if self._idle_timeout is not None:
+            tasks.append(asyncio.ensure_future(self._sweep_idle()))
+        self._tasks = tasks
+
+    async def stop(self):
+        """Cancel the app's tasks, close its session, close every viewer's
+        socket, then run ``on_stop``. Idempotent: the teardown runs once, as
+        a task of its own that cancelling a caller does not cancel, so a
+        second call waits for the same one; and the ``on_stop`` hooks run
+        however the rest of it ends, so a product's lock is released even
+        then."""
+        if self._stop_task is None:
+            self._stop_task = asyncio.ensure_future(self._stop())
+        await asyncio.shield(self._stop_task)
+
+    async def _stop(self):
+        self._stopped = True
+        for task in self._tasks:
+            task.cancel()
+        self._tasks = []
+        try:
+            async with self._lock:
+                # Before the viewers are told to go away, so a permission
+                # request still open is denied and its event reaches the
+                # browser on the socket that is about to close, rather than
+                # vanishing with it. An idle close under way (the sweep just
+                # cancelled) is finished, not abandoned.
+                if self.closed:
+                    if self._closing is not None:
+                        await asyncio.shield(self._closing)
+                else:
+                    start, self._start_task = self._start_task, None
+                    await _end_session(start, self.session)
+                self._turns.clear()
+            # Viewers are told before the listener closes, so a browser
+            # reconnects or falls back at once instead of waiting out its
+            # liveness timeout, and so the bounded drain of the server is not
+            # spent waiting on WebSocket handlers that would never return on
+            # their own.
+            await self._registry.close_all()
+        finally:
+            self._note_change()
+            await self._run_on_stop()
+
+    async def _run_on_stop(self):
+        """Every ``on_stop`` hook, each one's failure reported and the rest
+        still run, a cancellation meanwhile included (re-raised after)."""
+        cancelled = None
+        for hook in list(self.on_stop):
+            try:
+                result = hook()
+                if inspect.isawaitable(result):
+                    await result
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+            except Exception as exc:
+                sys.stderr.write("warning: a stop hook failed: %r\n" % (exc,))
+        if cancelled is not None:
+            raise cancelled
+
+    async def _sweep_idle(self):
+        interval = min(self._idle_timeout, IDLE_SWEEP_INTERVAL)
+        while True:
+            remaining = self._idle_remaining()
+            if remaining is not None and remaining <= 0:
+                await self._close_idle()
+                remaining = None
+            await asyncio.sleep(interval if remaining is None else min(interval, remaining))
+
+    def _idle_remaining(self):
+        """Seconds until the idle sweep closes this app, or ``None`` while
+        something keeps it open: a page, a turn, a permission request, or
+        there being no open session to close."""
+        if self._idle_timeout is None or self.closed or self._stopped or self.session is None:
+            return None
+        if self._viewers or self._turns or self._requests:
+            return None
+        return self._idle_timeout - (time.monotonic() - self._last_active)
+
+    # -- status ------------------------------------------------------------------
+
+    def status(self):
+        """``{"agent", "turn_running", "waiting", "attention",
+        "last_activity", "viewers"}``: the agent's status (connecting, ready,
+        unavailable, or ``AGENT_CLOSED``), whether a turn is running, whether
+        the agent waits on the human (a permission request open, or an
+        ``attention`` raised since their last turn, whose ``title: body`` is
+        ``attention``), when anything last changed (epoch seconds), and how
+        many pages are connected."""
+        if self._stopped or self.closed:
+            agent = AGENT_CLOSED
+        elif self.session is None:
+            agent = AGENT_UNAVAILABLE
+        else:
+            agent = self.session.agent_status()
+        return {
+            "agent": agent,
+            "turn_running": bool(self._turns),
+            "waiting": bool(self._requests) or self._attention is not None,
+            "attention": self._attention,
+            "last_activity": self._last_activity,
+            "viewers": self._viewers,
+        }
+
+    def _observe(self, wire):
+        kind = wire.get("kind")
+        if kind == "user_turn":
+            self._turns.add(wire.get("turn"))
+            self._attention = None
+        elif kind == "turn_end":
+            self._turns.discard(wire.get("turn"))
+        elif kind == "permission_request":
+            self._requests.add(wire.get("request_id"))
+        elif kind == "permission_resolved":
+            self._requests.discard(wire.get("request_id"))
+        elif kind == "attention":
+            self._attention = "%s: %s" % (wire.get("title", ""), wire.get("body", ""))
+        elif kind != "agent_status":
+            return
+        self._note_change()
+
+    def _note_change(self):
+        self._last_activity = time.time()
+        self._last_active = time.monotonic()
+        for listen in list(self.status_listeners):
+            try:
+                listen()
+            except Exception as exc:
+                sys.stderr.write("warning: an app status listener failed: %r\n" % (exc,))
+
+
+async def _start_session(session, model=None):
+    """Start a resumed ``session`` and, when ``model`` is given, switch it
+    back to that model: the one the human chose before the app closed, which
+    its factory knew nothing of. The switch publishes ``agent_model_changed``
+    like one made from the page."""
+    try:
+        await session.start()
+    except Exception as exc:
+        sys.stderr.write("warning: the agent session did not start: %r\n" % (exc,))
+        return
+    if model is None:
+        return
+    if session.agent_status() != AGENT_READY:
+        sys.stderr.write(
+            "warning: the resumed agent session is not ready, so it stays on its "
+            "starting model rather than %s\n" % model
+        )
+        return
+    try:
+        await session.set_model(model)
+    except Exception as exc:
+        sys.stderr.write(
+            "warning: could not switch the resumed agent session back to %s: %r\n" % (model, exc)
+        )
+
+
+async def _end_session(start, session):
+    """Cancel ``start`` (a session's start task, or None) if still running,
+    then close ``session`` (or nothing, for None)."""
+    if start is not None and not start.done():
+        start.cancel()
+        try:
+            await start
+        except asyncio.CancelledError:
+            pass
+    if session is None:
+        return
+    try:
+        await session.close()
+    except Exception as exc:
+        sys.stderr.write("warning: the agent session did not close cleanly: %r\n" % (exc,))
+
+
 async def serve(app, host, port, on_ready=None, background=()):
     """Serve ``app`` on ``host``:``port`` until interrupted.
 
@@ -756,13 +1286,13 @@ async def serve(app, host, port, on_ready=None, background=()):
     work (such as opening a browser) onto the event loop's executor instead
     of running it inline on the loop that is meant to already be serving.
 
-    ``background`` is the product's own long-running coroutine functions
-    (Mesh: its models watcher's ``run``), each called and started as a task
-    once the session has started, and cancelled on the way out. Functions
-    rather than coroutines, so nothing is created that a failed bind would
-    leave never awaited. The review watcher (``app.agent_review_watcher``)
-    is started the same way without being listed, since ``create_app``
-    built it.
+    Between the two, the app is started (``app.agent_start``, with
+    ``background``: the product's own long-running coroutine functions, Mesh's
+    models watcher's ``run`` for one), and on the way out it is stopped
+    (``app.agent_stop``) before the listener closes. Functions rather than
+    coroutines, so nothing is created that a failed bind would leave never
+    awaited. The review watcher (``app.agent_review_watcher``) is started
+    the same way without being listed, since ``create_app`` built it.
 
     ``start_serving()`` alone is enough to keep the server accepting
     connections; nothing further needs to run for that to continue, so this
@@ -780,54 +1310,23 @@ async def serve(app, host, port, on_ready=None, background=()):
     """
     server = await app.start_server(host=host, port=port, start_serving=False)
     await server.start_serving()
-    # Started after the listening socket is already accepting connections,
-    # not before: a Codex backend's start() launches
-    # session/codex.py's stdio-to-HTTP MCP proxy
-    # (codex_mcp_stdio_bridge.py) as a subprocess of the app-server it also
-    # launches, and that proxy's first tools/list call reaches this
-    # process's own /mcp route while Codex's own session startup is still
-    # in progress. Every route is already registered by create_app, above,
-    # well before this point, but the socket itself only starts accepting
-    # connections here; starting the session before this would point that
-    # first call at a port nothing is listening on yet, which Codex treats
-    # as the MCP server having failed, leaving every product tool unavailable
-    # for the rest of the session. A failure inside start() is reported as
-    # an event and never raised, so this cannot stop the page from being
-    # served either way.
-    if app.agent_session is not None:
-        await app.agent_session.start()
-    # Started here rather than in create_app, because create_app is called by
-    # tests that have no running loop to own a background task and no interest
-    # in one; a task per constructed app would leak a task per test.
-    tasks = [asyncio.ensure_future(start()) for start in background]
-    tasks.append(asyncio.ensure_future(ping_forever(app.agent_registry)))
-    if app.agent_review_watcher is not None:
-        tasks.append(asyncio.ensure_future(app.agent_review_watcher.run()))
-    if app.agent_session is not None and app.agent_tools is not None and app.agent_tools.unreached:
-        tasks.append(
-            asyncio.ensure_future(retry_remotes(app.agent_tools, app.agent_bus, app.agent_session))
-        )
-    if on_ready is not None:
-        result = on_ready()
-        if inspect.isawaitable(result):
-            await result
     try:
+        await app.agent_start(background)
+        if on_ready is not None:
+            result = on_ready()
+            if inspect.isawaitable(result):
+                await result
         await asyncio.Event().wait()
     finally:
-        for task in tasks:
-            task.cancel()
-        if app.agent_session is not None:
-            # Before the viewers are told to go away, so a permission request
-            # still open is denied and its event reaches the browser on the
-            # socket that is about to close, rather than vanishing with it.
-            await app.agent_session.close()
-        # Viewers are told before the listener closes, so a browser reconnects
-        # or falls back at once instead of waiting out its liveness timeout,
-        # and so the bounded drain below is not spent waiting on WebSocket
-        # handlers that would never return on their own.
-        await app.agent_registry.close_all()
-        server.close()
-        try:
-            await asyncio.wait_for(server.wait_closed(), timeout=SHUTDOWN_DRAIN_TIMEOUT)
-        except asyncio.TimeoutError:
-            pass
+        await app.agent_stop()
+        await close_server(server)
+
+
+async def close_server(server):
+    """Stop ``server`` accepting connections and wait up to
+    ``SHUTDOWN_DRAIN_TIMEOUT`` for the requests in flight."""
+    server.close()
+    try:
+        await asyncio.wait_for(server.wait_closed(), timeout=SHUTDOWN_DRAIN_TIMEOUT)
+    except asyncio.TimeoutError:
+        pass

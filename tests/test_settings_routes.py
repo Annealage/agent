@@ -326,3 +326,29 @@ async def test_put_does_not_promote_a_file_over_a_flag_that_still_outranks_it(ma
     # 9000 is on disk but the flag outranks it, so nothing is pending: this run
     # and the next both use 9101 until the flag is dropped.
     assert "port" not in payload["pending"]
+
+
+# --- an app served under a front door ------------------------------------------
+
+
+async def test_a_mounted_app_neither_applies_nor_saves_a_bind_of_its_own(served_dir):
+    """Under a front door the process has one socket, and the front door owns
+    it: a workspace's host and port would change nothing, so its window shows
+    them as not in effect (never as pending) and a save naming either is
+    refused whole, with nothing written."""
+    settings.apply(served_dir, {"port": 9000})
+    client = make_test_client(create_toy_app(served_dir, token=TOKEN, url_prefix="/p/demo"))
+
+    payload = body_of(await client.get("/settings?t=%s" % TOKEN))
+    for name in ("host", "port"):
+        entry = payload["settings"][name]
+        assert entry["in_effect"] is False and entry["editable"] is False
+        assert "front door" in entry["reason"]
+        assert name not in payload["pending"]
+    assert "in_effect" not in payload["settings"]["model"]
+
+    res = await _put(client, {"port": 9100, "units": "in"})
+    assert res.status_code == 400
+    assert "front door" in body_of(res)["error"]
+    saved = settings.resolve(served_dir)
+    assert saved["port"] == 9000 and saved["units"] != "in"

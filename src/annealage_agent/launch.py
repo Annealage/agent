@@ -149,8 +149,11 @@ def build_session(
             mcp_host=mcp_host,
             mcp_port=mcp_port,
             mcp_token=agent_token,
-            # One more bridge per remote MCP server, each at /mcp/<remote>.
+            # One more bridge per remote MCP server, each at /mcp/<remote>,
+            # and all of them under the prefix the app is mounted at, if any
+            # (bus.url_prefix; a stand-in bus without one is at the root).
             mcp_remotes=tuple(r.name for r in bus.tools.remotes) if bus.tools is not None else (),
+            mcp_path_prefix=getattr(bus, "url_prefix", ""),
             instructions=instructions,
             turn=getattr(bus, "turn", 0),
         )

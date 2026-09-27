@@ -170,6 +170,7 @@ class CodexSession:
         mcp_port: Optional[int] = None,
         mcp_token: Optional[str] = None,
         mcp_remotes: tuple = (),
+        mcp_path_prefix: str = "",
         instructions: Optional[str] = None,
         turn: int = 0,
     ):
@@ -201,6 +202,9 @@ class CodexSession:
         # (ToolServer.remotes), by name: each gets a bridge of its own,
         # pointed at /mcp/<name> (_mcp_config_overrides).
         self._mcp_remotes = tuple(mcp_remotes)
+        # The path the app is mounted under in a front door ("" at the root),
+        # in front of /mcp and each /mcp/<name> the bridges are pointed at.
+        self._mcp_path_prefix = mcp_path_prefix
         # The product's session context (Product.session_context), given to
         # the thread as its developer instructions.
         self._instructions = instructions or None
@@ -483,7 +487,9 @@ class CodexSession:
         real ``~/.codex/config.toml``. Each remote MCP server the product's
         tool server reached (``mcp_remotes``) gets one more, named after it
         and pointed at ``/mcp/<remote>`` (``--path``), so the model sees that
-        remote's tools as a server of their own.
+        remote's tools as a server of their own. An app mounted under a
+        prefix (``mcp_path_prefix``, ``/p/demo``) has every path under it,
+        the product's own server's included (``/p/demo/mcp``).
 
         Empty when this session was constructed with no ``/mcp`` endpoint to
         point at (``mcp_host``/``_port``/``_token`` all ``None``, the
@@ -573,9 +579,14 @@ class CodexSession:
                 "%s.tool_timeout_sec=%r" % (key, tool_timeout),
             )
 
-        overrides = bridge(installed.mcp_server_name, installed.distribution)
+        prefix = self._mcp_path_prefix
+        overrides = bridge(
+            installed.mcp_server_name,
+            installed.distribution,
+            ("--path", prefix + "/mcp") if prefix else (),
+        )
         for name in self._mcp_remotes:
-            overrides += bridge(name, name, ("--path", "/mcp/%s" % name))
+            overrides += bridge(name, name, ("--path", "%s/mcp/%s" % (prefix, name)))
         return overrides + (
             "shell_environment_policy.exclude=[%s]"
             % ", ".join(_toml_string(name) for name in _shell_excludes()),

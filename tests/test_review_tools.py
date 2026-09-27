@@ -333,8 +333,11 @@ async def test_the_pause_switch_does_not_refuse_a_resolve(store):
 
 
 async def _mcp_call(server, broker, name, arguments):
+    async def current_broker():
+        return broker
+
     app = Microdot()
-    register_mcp_routes(app, tools=server, broker=broker, agent_token=AGENT_TOKEN)
+    register_mcp_routes(app, tools=server, current_broker=current_broker, agent_token=AGENT_TOKEN)
     res = await make_test_client(app).post(
         "/mcp?t=%s" % AGENT_TOKEN,
         headers={"Content-Type": "application/json"},

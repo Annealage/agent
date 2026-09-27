@@ -435,28 +435,29 @@ def _origin_host(address):
     return "[%s]" % address if ":" in address else address
 
 
-def server_url(bind, port):
+def server_url(bind, port, url_prefix=""):
     """The bind's address as a URL, with no token: what can be said about a
     running instance by someone who does not hold its token (a refused second
-    start, say)."""
-    return "http://%s:%d/" % (_origin_host(bind.address), port)
+    start, say). ``url_prefix`` is where an app is mounted under a front door
+    (``"/p/demo"``), whose page is at that path's directory, not the root."""
+    return "http://%s:%d%s/" % (_origin_host(bind.address), port, url_prefix)
 
 
-def login_url(bind, port, nonce):
+def login_url(bind, port, nonce, url_prefix=""):
     """The URL a browser is launched with: the bind's address plus a
     single-use login nonce as a fragment, which the page trades for the token
     (``http/routes_login.py`` says why the token itself is not used)."""
-    return "%s#n=%s" % (server_url(bind, port), nonce)
+    return "%s#n=%s" % (server_url(bind, port, url_prefix), nonce)
 
 
-def viewer_url(bind, port, token):
+def viewer_url(bind, port, token, url_prefix=""):
     """The URL to open: the bind's address plus the token as a fragment.
 
     A fragment is never sent to a server, so the token stays out of access
     logs, out of ``Referer`` headers and out of any proxy's log, while still
     travelling in a link the human can open or bookmark.
     """
-    return "%s#t=%s" % (server_url(bind, port), token)
+    return "%s#t=%s" % (server_url(bind, port, url_prefix), token)
 
 
 def format_banner(bind, port, token):

@@ -94,9 +94,16 @@ def _notes(project):
 
 
 def _mcp_app(toy_tools, *, broker, token=TOKEN, allowed_origins=()):
+    async def current_broker():
+        return broker
+
     app = Microdot()
     register_mcp_routes(
-        app, tools=toy_tools, broker=broker, agent_token=token, allowed_origins=allowed_origins
+        app,
+        tools=toy_tools,
+        current_broker=current_broker,
+        agent_token=token,
+        allowed_origins=allowed_origins,
     )
     return app
 

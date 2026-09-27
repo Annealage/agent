@@ -145,7 +145,7 @@ async def _call_tool_result(tool_table, broker, name, arguments, *, server_name)
     )
 
 
-def register_mcp_routes(app, *, tools, broker, agent_token, allowed_origins=()):
+def register_mcp_routes(app, *, tools, current_broker, agent_token, allowed_origins=()):
     """Register ``POST /mcp``, and ``POST /mcp/<remote>`` for each remote MCP
     server the tool server reached, on ``app``.
 
@@ -157,7 +157,10 @@ def register_mcp_routes(app, *, tools, broker, agent_token, allowed_origins=()):
     of one served directory's app. A remote's tools (``remote_tables()``) are
     served on a route of their own, the path the Codex bridge registered for
     that remote is pointed at (``session/codex.py``), under bare names, with
-    the broker asked under ``mcp__<remote>__<tool>``.
+    the broker asked under ``mcp__<remote>__<tool>``. Those are looked up
+    when a call arrives, not here: a remote first reached after startup
+    (``app.retry_remotes``) has a bridge of its own in the next session an
+    app resumes with, which must find its route.
 
     ``agent_token`` is the run's agent token, and the only credential these
     routes accept. It is deliberately not the browser token: this route's
@@ -169,14 +172,24 @@ def register_mcp_routes(app, *, tools, broker, agent_token, allowed_origins=()):
     human; it opens no browser route (``create_app`` refuses a run whose two
     tokens are equal).
 
-    ``broker`` is whatever ``build_session`` attached to ``bus.broker``
-    while constructing the session (``app.py``'s own comment on that
-    channel); ``None`` for a viewer-only app, which never reaches this
-    function at all (``create_app`` only calls it once a real session
-    exists).
+    ``current_broker`` is an async function returning the broker a
+    ``tools/call`` is gated by, awaited once per call: ``create_app``'s
+    returns whatever the live session's factory attached to ``bus.broker``
+    (``app.py``'s own comment on that channel), after resuming a session its
+    idle timer closed, so a call never meets the broker of a session that
+    has gone. ``create_app`` registers these routes only once a real
+    session exists; a viewer-only app has no ``/mcp`` at all.
     """
     tool_table = tools.tool_table()
-    remote_tables = tools.remote_tables()
+    # Rebuilt only when the reached remotes change (``ToolServer.reconnect``
+    # replaces the tuple).
+    remote_cache = {"remotes": None, "tables": {}}
+
+    def remote_table(name):
+        if remote_cache["remotes"] is not tools.remotes:
+            remote_cache["remotes"] = tools.remotes
+            remote_cache["tables"] = tools.remote_tables()
+        return remote_cache["tables"].get(name)
 
     async def serve(req, table, server_name):
         if not _token_is_allowed(req, agent_token):
@@ -212,7 +225,7 @@ def register_mcp_routes(app, *, tools, broker, agent_token, allowed_origins=()):
                     "error": '"params" must be {"name": str, "arguments"?: object}',
                 }, 400
             call_result = await _call_tool_result(
-                table, broker, name, arguments, server_name=server_name
+                table, await current_broker(), name, arguments, server_name=server_name
             )
             return {
                 "result": call_result.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -226,4 +239,4 @@ def register_mcp_routes(app, *, tools, broker, agent_token, allowed_origins=()):
 
     @app.post("/mcp/<remote>")
     async def remote_mcp_route(req, remote):
-        return await serve(req, remote_tables.get(remote), remote)
+        return await serve(req, remote_table(remote), remote)

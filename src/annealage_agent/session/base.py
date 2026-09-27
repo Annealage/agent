@@ -560,7 +560,9 @@ class AgentSession(Protocol):
         ...
 
     async def start(self) -> None:
-        """Bring the session up. Called once by ``app.serve`` before serving.
+        """Bring the session up. Called once, by the app's ``agent_start``
+        once its socket is listening (``app.serve`` and a front door call
+        it), or as the app resumes after closing for idle.
 
         Must not raise: the HTTP server starts first and independently and has
         to keep serving the viewer whatever the agent does, so a failure here
@@ -570,8 +572,10 @@ class AgentSession(Protocol):
         ...
 
     async def close(self) -> None:
-        """Shut the session down. Called once from ``app.serve``'s ``finally``,
-        while there is still a socket to carry any last event."""
+        """Shut the session down. Called once: by the app's ``agent_stop``,
+        while there is still a socket to carry any last event, or by its idle
+        sweep, with no page connected. A closed session is not started again;
+        an app that resumes builds a new one."""
         ...
 
     def on_viewer_presence(self, count: int) -> None:

@@ -52,6 +52,7 @@ import collections
 import dataclasses
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
@@ -133,6 +134,12 @@ class EventLog:
         #: before anyone answered, which ``app.create_app`` closes, so a page
         #: replaying the history is not shown a card nobody can answer.
         self.unresolved_requests: tuple = ()
+        #: Called with each appended event's wire dict, after it is recorded:
+        #: every event a page sees passes through here, whichever of the
+        #: app's publishers sent it, so this is where the app's status
+        #: summary (``AgentHolder``) watches them. One that raises is
+        #: reported and never stops the append.
+        self.observers: list = []
         if self._path is not None:
             self._seq = self._recover_seq()
             self._fd = os.open(str(self._path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -213,6 +220,11 @@ class EventLog:
         if self._fd is not None:
             line = json.dumps({"seq": seq, "event": wire}) + "\n"
             os.write(self._fd, line.encode("utf-8"))
+        for observe in self.observers:
+            try:
+                observe(wire)
+            except Exception as exc:
+                sys.stderr.write("warning: an event log observer failed: %r\n" % (exc,))
         return seq
 
     def replay(self, last_seq: Optional[int]) -> Replay:
