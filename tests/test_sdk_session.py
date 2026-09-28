@@ -44,6 +44,7 @@ from annealage_agent.session.base import (
     AgentError,
     AgentModelChanged,
     AgentStatus,
+    SessionReset,
     TextDelta,
     ToolResult,
     ToolUse,
@@ -794,6 +795,131 @@ async def test_after_a_compaction_the_context_fill_is_unknown_until_the_next_cal
         assert isinstance(usage, Usage)
         assert usage.context is None
         assert usage.cost_usd == 0.5
+    finally:
+        await session.close()
+
+
+def _init(session_id):
+    """The CLI's ``system`` init, which it sends at the start of every turn."""
+    return {"type": "system", "subtype": "init", "session_id": session_id}
+
+
+async def _turn_end_and_usage(recorder):
+    """The next ``TurnEnd`` and the ``Usage`` after it."""
+    end = await recorder.next()
+    while not isinstance(end, TurnEnd):
+        end = await recorder.next()
+    usage = await recorder.next()
+    assert isinstance(usage, Usage)
+    return end, usage
+
+
+@pytest.mark.asyncio
+async def test_a_turn_end_carries_the_turn_s_own_share_of_the_running_totals():
+    """Each result carries the conversation's running totals (checked against
+    the real CLI: 0.0327 then 0.0348 over two turns of one process), so a
+    ``TurnEnd`` is what those grew by since the result before, while the
+    ``Usage`` after it stays the totals themselves. Totals that fall mean the
+    CLI started counting again, so they are that turn's own figures."""
+    session, transport, recorder = await _started_session()
+    try:
+        session._turn = 1
+        transport.push(_result(0.03, {"claude-haiku-4-5": _model_usage(100, 10, 1000, 500)}))
+        end, usage = await _turn_end_and_usage(recorder)
+        assert end.cost_usd == pytest.approx(0.03)
+        assert end.tokens == {"input": 100, "output": 10, "cache_read": 1000, "cache_write": 500}
+        assert usage.cost_usd == 0.03
+
+        session._turn = 2
+        transport.push(
+            _result(
+                0.05,
+                {
+                    "claude-haiku-4-5": _model_usage(120, 30, 2000, 550),
+                    "claude-opus-4-5": _model_usage(30, 10, 500, 50),
+                },
+            )
+        )
+        end, usage = await _turn_end_and_usage(recorder)
+        assert end.cost_usd == pytest.approx(0.02)
+        assert end.tokens == {"input": 50, "output": 30, "cache_read": 1500, "cache_write": 100}
+        assert usage.cost_usd == 0.05
+        assert usage.tokens == {"input": 150, "output": 40, "cache_read": 2500, "cache_write": 600}
+
+        session._turn = 3
+        transport.push(_result(0.01, {"claude-haiku-4-5": _model_usage(20, 5, 0, 300)}))
+        end, _usage = await _turn_end_and_usage(recorder)
+        assert end.cost_usd == pytest.approx(0.01)
+        assert end.tokens == {"input": 20, "output": 5, "cache_read": 0, "cache_write": 300}
+
+        # A result that reports neither costs nothing known and counts no
+        # tokens; the next is still measured from the last totals reported.
+        session._turn = 4
+        transport.push(_result(None))
+        end, _usage = await _turn_end_and_usage(recorder)
+        assert (end.cost_usd, end.tokens) == (0.0, None)
+        session._turn = 5
+        transport.push(_result(0.04, {"claude-haiku-4-5": _model_usage(25, 9, 100, 300)}))
+        end, _usage = await _turn_end_and_usage(recorder)
+        assert end.cost_usd == pytest.approx(0.03)
+        assert end.tokens == {"input": 5, "output": 4, "cache_read": 100, "cache_write": 0}
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_conversation_s_first_turn_is_measured_from_its_usage_so_far():
+    """The CLI restores its totals on a resume (checked against the real CLI:
+    a resumed process's first result was 0.0039, the 0.0019 before it plus
+    the turn), so the first ``TurnEnd`` is that result less the usage the
+    session was given, not the whole conversation again."""
+    before = {
+        "cost_usd": 0.0019,
+        "tokens": {"input": 10, "output": 73, "cache_read": None, "cache_write": 900},
+        "context": None,
+    }
+    session, transport, recorder = await _started_session(resume="prior-sdk", usage=before)
+    try:
+        session._turn = 3
+        transport.push(_init("prior-sdk"))
+        transport.push(_result(0.0039, {"claude-haiku-4-5": _model_usage(20, 113, 1000, 1200)}))
+        end, usage = await _turn_end_and_usage(recorder)
+        assert end.cost_usd == pytest.approx(0.002)
+        assert end.tokens == {"input": 10, "output": 40, "cache_read": 1000, "cache_write": 300}
+        assert usage.cost_usd == 0.0039
+        assert not any(isinstance(e, SessionReset) for e in recorder.all)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_resume_that_did_not_take_is_measured_from_nothing():
+    """When the CLI starts a different conversation from the one asked to
+    resume, the usage the session was given is not this conversation's, so
+    its turns are measured from zero; the CLI's init on every later turn
+    names the same new conversation and changes nothing."""
+    before = {
+        "cost_usd": 0.01,
+        "tokens": {"input": 5, "output": 5, "cache_read": 5, "cache_write": 5},
+        "context": None,
+    }
+    session, transport, recorder = await _started_session(resume="prior-sdk", usage=before)
+    try:
+        session._turn = 1
+        transport.push(_init("sdk-new"))
+        assert isinstance(await recorder.next(), SessionReset)
+        transport.push(_result(0.03, {"claude-haiku-4-5": _model_usage(100, 10, 1000, 500)}))
+        end, _usage = await _turn_end_and_usage(recorder)
+        assert end.cost_usd == pytest.approx(0.03)
+        assert end.tokens == {"input": 100, "output": 10, "cache_read": 1000, "cache_write": 500}
+
+        session._turn = 2
+        transport.push(_init("sdk-new"))
+        transport.push(_result(0.05, {"claude-haiku-4-5": _model_usage(150, 40, 2500, 600)}))
+        end, _usage = await _turn_end_and_usage(recorder)
+        assert end.cost_usd == pytest.approx(0.02)
+        assert end.tokens == {"input": 50, "output": 30, "cache_read": 1500, "cache_write": 100}
+        assert sum(isinstance(e, SessionReset) for e in recorder.all) == 1
     finally:
         await session.close()
 

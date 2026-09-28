@@ -193,6 +193,12 @@ class SdkSession:
     build without cannot disagree: a write-grade name reaching this list would
     silently remove the human's approval card. Empty (the default) pre-allows
     nothing, so every tool call reaches the broker.
+
+    ``usage`` is what a resumed conversation had used before this session,
+    in ``Usage.snapshot()``'s shape (launch passes the event log's last
+    ``usage``), or None. The CLI's results carry the conversation's running
+    totals, which it restores on a resume, so a ``TurnEnd``'s own figures
+    are a result's totals less the ones before it, these for the first.
     """
 
     def __init__(
@@ -215,6 +221,7 @@ class SdkSession:
         instructions=None,
         write_protected=None,
         turn: int = 0,
+        usage: Optional[dict] = None,
     ):
         self._on_event = on_event
         self.cwd = str(cwd)
@@ -261,6 +268,14 @@ class SdkSession:
         # The model and prompt size (tokens) of the last main-conversation API
         # call, which is how full the context window is (``_usage``).
         self._last_call: Optional[Tuple[str, int]] = None
+        # The conversation's running totals as of the last result (or, before
+        # the first, the resumed conversation's), which the next result's are
+        # differenced against for its turn's own figures (``_turn_figures``).
+        self._totals = _totals_of(usage)
+        # Whether the first init has been compared with the conversation asked
+        # to resume: the CLI sends an init every turn, and only the first says
+        # whether the resume took.
+        self._resume_checked = False
         self._stderr_lines = []
         # Predicted now so the banner, printed once at startup, is right on a
         # machine that plainly cannot sandbox. Corrected by the child if it
@@ -765,6 +780,7 @@ class SdkSession:
             return
         if isinstance(message, ResultMessage):
             self._remember_sdk_session(getattr(message, "session_id", None))
+            cost, tokens = self._turn_figures(message)
             self._emit(
                 TurnEnd(
                     turn=self._turn,
@@ -772,7 +788,8 @@ class SdkSession:
                     or message.stop_reason
                     or message.subtype
                     or "end_turn",
-                    cost_usd=message.total_cost_usd,
+                    cost_usd=cost,
+                    tokens=tokens,
                 )
             )
             self._stop_reason = None
@@ -787,29 +804,44 @@ class SdkSession:
             self._handle_system(message)
             return
 
+    def _turn_figures(self, message: ResultMessage) -> Tuple[float, Optional[dict]]:
+        """This turn's cost and tokens from a result: its running totals less
+        the previous ones (``self._totals``), which then become these. A total
+        below the one before it means the CLI started counting again, so it is
+        this turn's figure itself. A figure the result does not report is 0.0
+        for the cost and None for a token count, and its total stays as it was."""
+        before_cost, before_tokens = self._totals
+        cost = 0.0
+        if isinstance(message.total_cost_usd, (int, float)):
+            cost = max(0.0, _since(float(message.total_cost_usd), before_cost))
+            before_cost = float(message.total_cost_usd)
+        totals = _summed_tokens(message.model_usage)
+        tokens = None
+        if totals is not None:
+            tokens = {}
+            before_tokens = dict(before_tokens)
+            for key, total in totals.items():
+                tokens[key] = None if total is None else max(0, _since(total, before_tokens[key]))
+                if total is not None:
+                    before_tokens[key] = total
+        self._totals = (before_cost, before_tokens)
+        return cost, tokens
+
     def _usage(self, message: ResultMessage) -> Usage:
         """``Usage`` from a result: the CLI's running totals for the
         conversation (``total_cost_usd``, and ``modelUsage`` summed over the
         models it used), which it restores on a resume, so they cover the
         turns before it too; and the context window's fill, the last main
         call's prompt against its model's window."""
-        models = [m for m in (message.model_usage or {}).values() if isinstance(m, dict)]
-        tokens = None
-        if models:
-            tokens = {
-                key: _sum_counts(models, field)
-                for key, field in (
-                    ("input", "inputTokens"),
-                    ("output", "outputTokens"),
-                    ("cache_read", "cacheReadInputTokens"),
-                    ("cache_write", "cacheCreationInputTokens"),
-                )
-            }
         context = None
         if self._last_call is not None:
             model, prompt = self._last_call
             context = context_figures(prompt, _context_window(message.model_usage, model))
-        return Usage(cost_usd=message.total_cost_usd, tokens=tokens, context=context)
+        return Usage(
+            cost_usd=message.total_cost_usd,
+            tokens=_summed_tokens(message.model_usage),
+            context=context,
+        )
 
     def _handle_stream_event(self, message: StreamEvent) -> None:
         """Turn one raw API stream event into a ``TextDelta``, or ignore it.
@@ -843,9 +875,12 @@ class SdkSession:
             # The context was compacted: the last call's prompt no longer says
             # how full it is, so the fill is unknown until the next call.
             self._last_call = None
-        if message.subtype == "init" and self._resume:
+        if message.subtype == "init" and self._resume and not self._resume_checked:
+            self._resume_checked = True
             reported = data.get("session_id")
             if reported and reported != self._resume:
+                # A new conversation, whose totals start from nothing.
+                self._totals = _totals_of(None)
                 self._emit(
                     SessionReset(
                         reason="asked to resume %s and the agent started %s instead; "
@@ -1057,6 +1092,44 @@ def _prompt_tokens(usage) -> Optional[int]:
     if counts[0] is None:
         return None
     return sum(c for c in counts if c is not None)
+
+
+#: ``Usage.tokens``'s keys and the ``modelUsage`` fields they sum.
+_TOKEN_FIELDS = (
+    ("input", "inputTokens"),
+    ("output", "outputTokens"),
+    ("cache_read", "cacheReadInputTokens"),
+    ("cache_write", "cacheCreationInputTokens"),
+)
+
+
+def _summed_tokens(model_usage) -> Optional[dict]:
+    """The conversation's token counts so far from a result's ``modelUsage``,
+    each summed over the models it used (None where none reports it), or
+    None when the result has no ``modelUsage``."""
+    models = [m for m in (model_usage or {}).values() if isinstance(m, dict)]
+    if not models:
+        return None
+    return {key: _sum_counts(models, field) for key, field in _TOKEN_FIELDS}
+
+
+def _totals_of(usage: Optional[dict]) -> Tuple[float, dict]:
+    """The running totals ``SdkSession._turn_figures`` differences against,
+    from a ``Usage.snapshot()`` (any figure of which may be None, as 0), or
+    nothing used for None."""
+    usage = usage or {}
+    cost = usage.get("cost_usd")
+    tokens = usage.get("tokens") or {}
+    return (
+        float(cost) if isinstance(cost, (int, float)) else 0.0,
+        {key: _count(tokens.get(key)) or 0 for key, _field in _TOKEN_FIELDS},
+    )
+
+
+def _since(total, before):
+    """A running total's growth since ``before``, or the total itself when it
+    is lower, which means counting started again."""
+    return total if total < before else total - before
 
 
 def _sum_counts(models: list, field: str) -> Optional[int]:

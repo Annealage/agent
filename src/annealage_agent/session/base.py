@@ -267,11 +267,13 @@ class PermissionResolved(AgentEvent):
 @dataclasses.dataclass(frozen=True)
 class TurnEnd(AgentEvent):
     """A turn ended. ``cost_usd`` is what this turn cost, 0.0 where the
-    backend reports none; ``tokens``, where the backend reports them (omp),
-    is this turn's ``{"input", "output", "cache_read", "cache_write"}``
-    token counts. ``stop_reason`` is the backend's own, or one of the
-    session's: ``steered`` (omp: the human sent another message while this
-    turn was running, and the agent carries on under the next turn number),
+    backend reports none; ``tokens``, where the backend reports them (omp,
+    Claude), is this turn's ``{"input", "output", "cache_read",
+    "cache_write"}`` token counts. Both of those backends report running
+    totals for the conversation, so these are a total less the one before.
+    ``stop_reason`` is the backend's own, or one of the session's:
+    ``steered`` (omp: the human sent another message while this turn was
+    running, and the agent carries on under the next turn number),
     ``rejected`` (the backend refused the message that started it) or
     ``ended_by_tool`` (a tool result carried ``end_turn``, ``tools.ok``)."""
 

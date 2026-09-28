@@ -577,6 +577,12 @@ def create_app(
         # a factory that sets none leaves /mcp failing closed rather than
         # gating with the shut-down broker of the session before.
         bus.broker = None
+        # What the conversation has used so far (the log's last usage, kept
+        # live since): a resumed Claude conversation's results carry running
+        # totals that include it, so launch.build_session hands it on for the
+        # session to take each turn's own figures from. Read here, not once,
+        # so a session an idle-closed app reopens gets it as it now stands.
+        bus.usage = session_info["usage"]
         session = None
         if factory is not None:
             session = factory(_event_publisher(registry, event_log, session_info), bus=bus)

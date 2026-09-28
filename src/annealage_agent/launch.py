@@ -222,5 +222,8 @@ def build_session(
         instructions=instructions,
         # A resumed session continues its history's turn numbering.
         turn=getattr(bus, "turn", 0),
+        # A resumed conversation's usage so far (bus.usage, which create_app
+        # sets), which the CLI's running totals include; a new one has none.
+        usage=getattr(bus, "usage", None) if resume else None,
         write_protected=getattr(bus, "write_protected", None),
     )
