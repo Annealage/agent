@@ -258,6 +258,8 @@ async def test_resolving_the_model_s_own_callout_asks_nobody(store, grade):
     store.add_comment(anchor={"card": "back", "x": 1, "y": 1}, text="mine", author="model")
     result = await _handlers(_graded_server(store, broker, grade))["resolve_comment"]({"id": 1})
     assert _payload(result)["resolved"]["status"] == "resolved"
+    # No card was shown, so the result claims no approval.
+    assert "approved" not in _payload(result)
     assert broker.calls == []
 
 
@@ -271,6 +273,9 @@ async def test_resolving_a_human_s_comment_asks_the_human_once(store, grade):
         {"id": 1, "note": " made it 2 mm "}
     )
     assert _payload(result)["resolved"]["resolution"] == "made it 2 mm"
+    # The result says the human already approved it, so the model does not
+    # go on to ask them to approve it again.
+    assert "human approved" in _payload(result)["approved"]
     assert len(broker.calls) == 1
     name, card = broker.calls[0]
     assert name == RESOLVE
@@ -315,7 +320,7 @@ async def test_an_already_resolved_comment_is_not_asked_about_again(store):
     _human_comment(store)
     store.resolve_comment(1, "done")
     result = await _handlers(_toy_server(store, broker))["resolve_comment"]({"id": 1})
-    assert "is_error" not in result
+    assert "approved" not in _payload(result)
     assert broker.calls == []
 
 

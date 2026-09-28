@@ -73,8 +73,19 @@ def present_added(store, written):
     return ok({"added": written.comment.shown()})
 
 
-def present_resolved(store, written):
-    return ok({"resolved": written.comment.shown()})
+#: What a resolve the human approved on a card says, so the model does not go
+#: on to ask them for an approval they have already given.
+_APPROVED = (
+    "the human approved this resolve in the page, so it is done; there is nothing "
+    "left for them to approve"
+)
+
+
+def present_resolved(store, written, approved):
+    result = {"resolved": written.comment.shown()}
+    if approved:
+        result["approved"] = _APPROVED
+    return ok(result)
 
 
 def present_deleted(store, written):
@@ -104,7 +115,8 @@ _RESOLVE_DESCRIPTION = (
     "Mark a comment resolved, with a note on what you changed. Resolving one "
     "of the human's comments changes their review, so it waits for them to "
     "approve it in the page and is refused if they decline or nobody is there "
-    "to answer. Resolve your own callouts once they have been answered."
+    "to answer; a result that says they approved it needs nothing more from "
+    "them. Resolve your own callouts once they have been answered."
 )
 _DELETE_DESCRIPTION = (
     "Remove one of your own callouts by its id once it has served its "
@@ -150,7 +162,10 @@ class AddCallout:
 
 @dataclasses.dataclass(frozen=True)
 class ResolveComment:
-    """The tool resolving a comment; its input is ``id`` and ``note``."""
+    """The tool resolving a comment; its input is ``id`` and ``note``.
+    ``present`` turns ``(store, Written, approved)`` into the tool's result,
+    ``approved`` being true when the human approved the resolve on a card
+    (their own open comment), false when it needed no card."""
 
     name: str = "resolve_comment"
     description: str = _RESOLVE_DESCRIPTION
@@ -379,12 +394,15 @@ def _resolve_tool(spec, store, bus, comments_list):
             raise ReviewError("note must be text saying what you changed")
         note = (note or "").strip()
         comment = await _blocking(store.get_comment, comment_id)
-        if comment.author == HUMAN and comment.status != RESOLVED:
+        # Past the card, a comment that needed one was approved: a refusal
+        # has returned already.
+        needs_approval = comment.author == HUMAN and comment.status != RESOLVED
+        if needs_approval:
             denial = await _ask_human(spec.name, bus, comment, note)
             if denial is not None:
                 return fail(denial)
         written = await _blocking(store.resolve_comment, comment_id, note or None)
-        return spec.present(store, written)
+        return spec.present(store, written, needs_approval)
 
     return resolve_handler
 
