@@ -24,12 +24,14 @@ connect, ``initialize``, make the optional ``prime`` call (a server that
 advertises more tools once a first tool has been called, as some do until
 their getting-started tool is called, lists only a few before it), then
 ``list_tools``. Each listed tool the remote's grading names becomes a proxied
-tool with the remote's own schema and description. Unlike the product's own
-tools, which ``tools._verify`` holds to their grading exactly, a remote's
-tool set changes without the product changing, so a listed tool its grading
-does not name is left out and a graded one it does not list is skipped, each
-with a warning, and neither stops the session. Nor does a remote that cannot
-be reached within ``DISCOVERY_TIMEOUT``: the session starts without it, and
+tool with the remote's own schema and description, and one the remote's
+``excluded`` names (a tool the product leaves out on purpose) is left out
+silently. Unlike the product's own tools, which ``tools._verify`` holds to
+their grading exactly, a remote's tool set changes without the product
+changing, so a listed tool neither names is left out and a graded one it does
+not list is skipped, each with a warning, and neither stops the session. Nor
+does a remote that cannot be reached within ``DISCOVERY_TIMEOUT``: the
+session starts without it, and
 ``ToolServer.reconnect`` tries it again later (``app.serve`` does, on a timer
 and on the first turn). A reached remote's tool set is fixed from then on; its
 later ``tools/list_changed`` is not followed.
@@ -99,7 +101,7 @@ _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
 class RemoteServer(
-    namedtuple("RemoteServer", "name url grading prime headers", defaults=(None, None))
+    namedtuple("RemoteServer", "name url grading prime headers excluded", defaults=(None, None, ()))
 ):
     """A remote MCP server, reached over streamable HTTP at ``url``.
 
@@ -109,7 +111,10 @@ class RemoteServer(
     a product's grading does for its own tools. ``prime`` is ``(tool,
     arguments)``, called once before listing, for a server that advertises
     more tools after a first call. ``headers`` are sent with every request
-    (an ``Authorization`` header, say).
+    (an ``Authorization`` header, say). ``excluded`` names the tools the
+    product deliberately does not offer: they are not proxied, and a remote
+    listing them is not warned about, as it is for a tool the grading merely
+    does not name. A tool cannot be both graded and excluded.
     """
 
     __slots__ = ()
@@ -125,8 +130,8 @@ def connect(servers, *, product_server, bus, paused_message, retry=False):
     """``(connected, unreached)``: the ``Connected`` remotes of ``servers``,
     in order, and the ``RemoteServer``s that could not be reached. Refuses,
     before connecting to anything, a remote named like ``product_server``, two
-    remotes with one name, a name no backend can carry, or a grading naming a
-    tool twice.
+    remotes with one name, a name no backend can carry, a grading naming a
+    tool twice, or a tool both graded and excluded.
 
     ``retry`` is a second attempt at remotes already reported unreachable
     (``ToolServer.reconnect``): one still unreachable is not reported again,
@@ -151,7 +156,7 @@ def connect(servers, *, product_server, bus, paused_message, retry=False):
         instructions, listed = listing
         listed = {tool.name: tool for tool in listed}
         graded = set(server.grading.read) | set(server.grading.view) | set(server.grading.write)
-        ungraded = sorted(set(listed) - graded)
+        ungraded = sorted(set(listed) - graded - set(server.excluded))
         if ungraded:
             _warn(
                 "the %s MCP server lists %s, which its grading does not name, so the "
@@ -211,6 +216,12 @@ def _check(servers, product_server):
                     "%s tool(s) %s are classified both %s and %s"
                     % (name, ", ".join(overlap), first, second)
                 )
+        graded = set(server.grading.read) | set(server.grading.view) | set(server.grading.write)
+        excluded = sorted(graded & set(server.excluded))
+        if excluded:
+            raise RuntimeError(
+                "%s tool(s) %s are both graded and excluded" % (name, ", ".join(excluded))
+            )
 
 
 def _warn(message):

@@ -262,6 +262,24 @@ def test_ungraded_and_unlisted_tools_are_left_out_with_a_warning(fake, bus, tmp_
     assert "the fake MCP server does not list vanished, which its grading names" in err
 
 
+def test_excluded_tools_are_left_out_without_a_warning(fake, bus, tmp_path, capsys):
+    """``extra`` is listed and ``withdrawn`` is not; excluding both leaves
+    the listing warning-free."""
+    tools = _tools(bus, tmp_path, _fake(fake, excluded=("extra", "withdrawn")))
+    assert set(tools.remote_tables()["fake"]) == PROXIED
+    assert not any(name.endswith(("__extra", "__withdrawn")) for name in tools.pre_allowed)
+    err = capsys.readouterr().err
+    assert "which its grading does not name" not in err
+    assert "withdrawn" not in err
+
+
+def test_a_tool_both_graded_and_excluded_is_refused(fake, bus, tmp_path):
+    with pytest.raises(RuntimeError, match="fake tool\\(s\\) lookup are both graded and excluded"):
+        _tools(bus, tmp_path, _fake(fake, excluded=("lookup", "extra")))
+    # Refused before anything was reached.
+    assert fake.headers == []
+
+
 @pytest.mark.parametrize("failure", ["refused", "silent"])
 def test_an_unreachable_remote_is_skipped_and_the_tool_server_still_builds(
     failure, bus, tmp_path, capsys, monkeypatch
