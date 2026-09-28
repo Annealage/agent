@@ -925,6 +925,36 @@ async def test_a_resume_that_did_not_take_is_measured_from_nothing():
 
 
 @pytest.mark.asyncio
+async def test_after_a_conversation_reset_turns_are_measured_from_nothing():
+    """A ``conversation_reset`` zeroes the totals later results report, so the
+    first turn after it is that result's figures whole, never some of them
+    measured against the replaced conversation's totals."""
+    before = {
+        "cost_usd": 5.0,
+        "tokens": {"input": 100, "output": 50, "cache_read": 20000, "cache_write": 9000},
+        "context": None,
+    }
+    session, transport, recorder = await _started_session(resume="prior-sdk", usage=before)
+    try:
+        session._turn = 1
+        transport.push(_init("prior-sdk"))
+        transport.push(
+            {
+                "type": "conversation_reset",
+                "new_conversation_id": "sdk-cleared",
+                "uuid": "u-1",
+                "session_id": "prior-sdk",
+            }
+        )
+        transport.push(_result(0.3, {"claude-haiku-4-5": _model_usage(150, 10, 1000, 12000)}))
+        end, _usage = await _turn_end_and_usage(recorder)
+        assert end.cost_usd == pytest.approx(0.3)
+        assert end.tokens == {"input": 150, "output": 10, "cache_read": 1000, "cache_write": 12000}
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_a_tool_result_carrying_end_turn_interrupts_the_turn_once_the_cli_has_it():
     """``tools.ok(..., end_turn=True)`` reaches the session as
     ``end_turn_after_tool`` while the tool runs; the interrupt waits for the

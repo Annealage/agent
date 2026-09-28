@@ -797,8 +797,10 @@ class SdkSession:
             return
         if isinstance(message, ConversationResetMessage):
             # The conversation was replaced: its context fill is unknown until
-            # the next call reports one.
+            # the next call reports one, and the CLI's running totals start
+            # again from nothing.
             self._last_call = None
+            self._totals = _totals_of(None)
             return
         if isinstance(message, SystemMessage):
             self._handle_system(message)
