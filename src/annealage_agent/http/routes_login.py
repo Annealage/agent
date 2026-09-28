@@ -10,8 +10,9 @@ anything that read it, the agent's own shell included, open ``/ws`` and
 approve its own permission cards.
 
 So the URL the run opens carries a nonce instead (``#n=<nonce>``), and the page
-trades it here, once, for the browser token, which it then keeps in memory
-exactly as it keeps a token read from ``#t=``. A nonce is spent by its first
+trades it here, once, for the browser token, which it then keeps exactly as it
+keeps a token read from ``#t=`` (in memory, and in that tab's sessionStorage
+so a reload keeps working: ``static/ws.js``). A nonce is spent by its first
 use, successful or not for anyone else, and expires after ``NONCE_TTL``
 seconds whether or not it was used, so what a later reader of the command line
 finds is a string that opens nothing. The window that remains is a process

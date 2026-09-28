@@ -6,10 +6,20 @@
  * that retrying cannot fix within this page load: a protocol-version
  * mismatch, and a confirmed refusal.
  *
- * This module is the only place the token is held; it lives in the
- * TOKEN module variable, never in localStorage or sessionStorage, because a
- * token that outlives the run it belongs to is a liability and a fresh one
- * is generated every server start anyway.
+ * This module is the only place the token is held: the TOKEN module variable,
+ * and a copy in this tab's sessionStorage, which is what lets a reload keep
+ * working (the fragment it arrived in is stripped, so a reloaded page has no
+ * other way to get it back). Never localStorage, which every tab of the origin
+ * shares and which outlives the tab: sessionStorage is this tab's alone, so a
+ * new tab, a bookmark or a URL picked from the browser's history carries no
+ * token and needs the printed link, exactly as before, and the copy goes with
+ * the tab. What the copy does cost is disk: a browser keeps a tab's
+ * sessionStorage in its profile, to restore the tab after a crash, beside the
+ * history that already holds any `#t=` link opened in it. That is the residual
+ * risk the printed link was accepted with (a profile file the agent's shell
+ * can read), now also for a tab opened by the single-use `#n=` link, which
+ * held its token in memory alone. The alternative, a page that signs out on
+ * every reload, is what sends the human back to the reusable `#t=` link.
  *
  * A page with no token is not refused here: behind `tailscale serve` the
  * server may know the human by their tailnet login, which the browser never
@@ -90,10 +100,8 @@ const MAX_BACKOFF_MS = 15000;
 const LIVENESS_TIMEOUT_MS = 15000;
 
 const REFUSED_MESSAGE =
-  "This page's link has gone stale (the server was restarted, or this " +
-  "tab was opened without the printed link, since a plain reload does not " +
-  "keep the token). Reopen the URL printed in the terminal to get a " +
-  "working one.";
+  "This page's link has gone stale (the server was restarted since it was " +
+  "opened). Reopen the URL printed in the terminal to get a working one.";
 // The refusal of a page that holds no token, which the server has decided on
 // the human's tailnet login alone (or on nothing, off the tailnet).
 const SIGN_IN_MESSAGE =
@@ -119,14 +127,25 @@ const MISMATCH_MESSAGE =
  *
  * The fragment is stripped from the visible URL unconditionally, whether
  * or not a token was found in it, and before the nonce is traded: a token
- * left visible in the address bar survives a reload, a bookmark and a
- * screen share, all of which are wider exposure than the "never sent to a
- * server" property the fragment was chosen for in the first place. A nonce
- * the server refuses (spent or expired) leaves no token, and the page goes on
- * as one opened without a link: the server takes it by its tailnet login, or
- * refuses it.
+ * left visible in the address bar survives a bookmark and a screen share,
+ * both of which are wider exposure than the "never sent to a server"
+ * property the fragment was chosen for in the first place. The token found
+ * is kept in this tab's sessionStorage (the header comment says why), and a
+ * page whose URL carries none, a reload above all, takes that copy instead.
+ * A nonce the server refuses (spent or expired) leaves the copy, if the tab
+ * has one, or no token, and the page goes on as one opened without a link:
+ * the server takes it by its tailnet login, or refuses it.
  */
 async function extractToken() {
+  const token = await tokenFromFragment();
+  if (token) {
+    keepToken(token);
+    return token;
+  }
+  return storedToken();
+}
+
+async function tokenFromFragment() {
   const hash = location.hash;
   const params = hash.startsWith("#") ? new URLSearchParams(hash.slice(1)) : null;
   if (hash) {
@@ -148,6 +167,28 @@ async function extractToken() {
     return typeof data.token === "string" ? data.token : "";
   } catch (err) {
     return "";
+  }
+}
+
+// This tab's copy of the token. One key for the origin: one server is one
+// origin with one browser token, the front door's apps included.
+const TOKEN_KEY = "annealage-agent-token";
+
+// Storage can refuse (a sandboxed frame, a browser set to block it), which
+// costs only the reload: the page still has its token until then.
+function storedToken() {
+  try {
+    return sessionStorage.getItem(TOKEN_KEY) || "";
+  } catch (err) {
+    return "";
+  }
+}
+
+function keepToken(token) {
+  try {
+    sessionStorage.setItem(TOKEN_KEY, token);
+  } catch (err) {
+    // As above: nothing lost but the reload.
   }
 }
 
