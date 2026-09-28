@@ -75,6 +75,7 @@ The "brief", "M4" and "M5" named above are Annealage Mesh's planning
 history, from before this layer was extracted from it.
 """
 
+import asyncio
 import json
 import struct
 
@@ -596,6 +597,81 @@ async def test_protocol_version_mismatch_closes_with_4400(make_client):
     assert opcode == WebSocket.CLOSE
     assert close_code == protocol.CLOSE_VERSION_MISMATCH
     assert reason != b""
+
+
+# ---------------------------------------------------------------------------
+# A client that vanishes: the socket is reset or its pipe broken as the
+# server reads or writes, or the stream ends partway through a frame. That is
+# how a killed tab or a phone dropping off the network ends a connection, and
+# it must end the route as quietly as a close does, not as a traceback and a
+# 500 in the server's log.
+# ---------------------------------------------------------------------------
+
+
+class _VanishingSock(_RawSock):
+    """A ``_RawSock`` whose peer goes away: once the buffered bytes run out,
+    a read raises ``on_read``; a WebSocket TEXT frame the server writes (first
+    byte 0x81, FIN and the TEXT opcode) raises ``on_send``."""
+
+    def __init__(self, initial_bytes, on_read=None, on_send=None):
+        super().__init__(initial_bytes)
+        self.on_read = on_read
+        self.on_send = on_send
+
+    async def read(self, n):
+        if not self.buffer and self.on_read is not None:
+            raise self.on_read
+        return await super().read(n)
+
+    async def readexactly(self, n):
+        data = await self.read(n)
+        if len(data) < n:
+            raise asyncio.IncompleteReadError(data, n)
+        return data
+
+    async def awrite(self, data):
+        if self.on_send is not None and bytes(data[:1]) == b"\x81":
+            raise self.on_send
+        await super().awrite(data)
+
+
+def _hello_frame():
+    return bytes(
+        WebSocket._encode_websocket_frame(
+            WebSocket.TEXT,
+            json.dumps(
+                {"v": protocol.PROTOCOL_VERSION, "type": "hello", "token": TOKEN, "last_seq": 0}
+            ),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "frames, vanish",
+    [
+        # Reset while the server waits for the next frame, after a hello
+        # registered the connection.
+        (_hello_frame(), {"on_read": ConnectionResetError(104, "Connection reset by peer")}),
+        # The pipe broken as the server sends its own hello.
+        (b"", {"on_send": BrokenPipeError(32, "Broken pipe")}),
+        # The stream ending partway through the hello frame.
+        (_hello_frame()[:6], {}),
+    ],
+    ids=["reset-on-receive", "broken-pipe-on-send", "eof-mid-frame"],
+)
+async def test_a_vanished_client_ends_the_route_quietly(make_client, capfd, frames, vanish):
+    client = make_client()
+    request_bytes = client._render_request("GET", _ws_query(), dict(_ws_headers()), b"")
+    sock = _VanishingSock(request_bytes + frames, **vanish)
+    req = await Request.create(client.app, sock, sock, ("127.0.0.1", 1234), scheme=None)
+    capfd.readouterr()
+    res = await client.app.dispatch_request(req)
+    # An exception escaping the route would have turned into a 500 response,
+    # after microdot printed its traceback.
+    assert res is Response.already_handled
+    logged = capfd.readouterr()
+    assert "Traceback" not in logged.out + logged.err
+    assert " 500" not in logged.out + logged.err
 
 
 # ---------------------------------------------------------------------------

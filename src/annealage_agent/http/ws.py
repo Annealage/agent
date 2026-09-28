@@ -205,10 +205,13 @@ def register_ws(
             viewer = hello.get("viewer") or {}
             conn = await registry.add(ws, tab_id=viewer.get("tab_id"), human=human)
             await _serve_connection(ws, conn, registry, event_log, token, holder)
-        except WebSocketError:
-            # The peer closed, or sent a frame microdot could not read. Not
-            # an error worth reporting: a browser tab closing is the ordinary
-            # end of every connection.
+        except (WebSocketError, ConnectionError, asyncio.IncompleteReadError):
+            # The peer closed, vanished (a reset or broken pipe as this
+            # sends or reads, or the stream ending mid-frame: a tab killed,
+            # a phone off the network), or sent a frame microdot could not
+            # read. Not an error worth reporting: a browser tab going away is
+            # the ordinary end of every connection, and letting one of these
+            # escape would log a traceback and a 500 for it.
             pass
         finally:
             if conn is not None:
