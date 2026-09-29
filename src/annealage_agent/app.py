@@ -457,8 +457,7 @@ def create_app(
     # no one is waiting on the answer any more.
     for request_id in event_log.unresolved_requests:
         event_log.append(PermissionResolved(request_id=request_id, outcome=OUTCOME_SHUTDOWN))
-    for turn in event_log.unfinished_turns:
-        event_log.append(TurnEnd(turn=turn, stop_reason="interrupted", cost_usd=0.0))
+    _end_unfinished_turns(event_log.append, event_log.unfinished_turns)
     registry = ViewerRegistry(event_log=event_log, on_presence=_presence)
     # The tool layer's view of the browser, and the holder of the human's pause
     # switch. Built here rather than by the session factory because both halves
@@ -616,6 +615,7 @@ def create_app(
         tools=tools,
         review_watcher=app.agent_review_watcher,
         make_session=_make_session,
+        build_session=build_session,
         resume_session=resume_session,
         idle_timeout=idle_timeout,
     )
@@ -939,8 +939,10 @@ JOURNAL_STDERR_LIMIT = 4000
 
 def _journal_agent_error(event, journaled):
     """Write ``event`` to stderr as ``agent error: <remediation>: <stderr>``,
-    the backend's own text trimmed and its later lines indented under the
-    first, unless it repeats the error written last (``journaled[0]``).
+    the backend's own text trimmed and every line after the first (of the
+    remediation, whose command may sit on a line of its own, and of the
+    backend's text) indented under it, unless it repeats the error written
+    last (``journaled[0]``).
 
     A burst of identical errors is one fact: each turn sent to an agent that
     never started, or a backend reporting the same failure again, would
@@ -954,10 +956,13 @@ def _journal_agent_error(event, journaled):
     detail = (event.stderr or "").strip()
     if len(detail) > JOURNAL_STDERR_LIMIT:
         detail = "..." + detail[-JOURNAL_STDERR_LIMIT:]
-    line = "agent error: %s" % (event.remediation or "the agent reported an error")
+    text = event.remediation or "the agent reported an error"
     if detail:
-        first, *rest = detail.splitlines()
-        line += ": " + "\n".join([first] + [("  " + more) if more.strip() else "" for more in rest])
+        text += ": " + detail
+    first, *rest = text.splitlines()
+    line = "agent error: " + "\n".join(
+        [first] + [("  " + more) if more.strip() else "" for more in rest]
+    )
     try:
         sys.stderr.write(line + "\n")
         sys.stderr.flush()
@@ -1046,7 +1051,11 @@ class AgentHolder:
     process calls ``/mcp``, builds a new one from ``resume_session`` instead
     of restarting the old one (``ensure``). An app built closed
     (``start_closed``) opens its first session the same way, from
-    ``build_session``. Nothing that needs the session
+    ``build_session``. A session that went down (its start failed, or its
+    backend died) is replaced the same way when a page connects or sends an
+    agent frame (``ensure(retry=True)``), so a reload after fixing what
+    stopped it (a model login, say) starts the agent again without
+    restarting the process. Nothing that needs the session
     keeps it: ``/ws``, ``/mcp`` and ``/mcp/<remote>``, ``/agent/logs``, the
     registry's presence listener, the bus's ``end_turn_handler`` and
     ``retry_remotes`` all read this object when they run. ``session`` is the
@@ -1082,6 +1091,7 @@ class AgentHolder:
         tools,
         review_watcher,
         make_session,
+        build_session=None,
         resume_session=None,
         idle_timeout=None,
     ):
@@ -1089,10 +1099,16 @@ class AgentHolder:
         self.bus = bus
         self._registry = registry
         self._session_info = session_info
+        # What ends the turns a replaced session left running (_replace_down),
+        # so the pages stop showing them as running too.
+        self._publish = _event_publisher(registry, event_log, session_info)
         self._tools = tools
         self._review_watcher = review_watcher
         self._make_session = make_session
         self._resume_session = resume_session
+        # What ``ensure(retry=True)`` replaces a session that went down with:
+        # a resume where the app has one, else what a restart would build.
+        self._retry_with = resume_session or build_session
         # What ``ensure`` builds the next session from (``close_at_start``).
         self._reopen_with = resume_session
         self._idle_timeout = (
@@ -1101,6 +1117,9 @@ class AgentHolder:
         self.session = None
         #: Closed by the idle sweep; the next ``ensure`` resumes it.
         self.closed = False
+        # The live session announced it is unavailable (its start failed, or
+        # its backend is gone); ``ensure(retry=True)`` replaces it.
+        self._down = False
         self._started = False
         self._stopped = False
         self._tasks = []
@@ -1132,6 +1151,7 @@ class AgentHolder:
     def install(self, session):
         """Make ``session`` (or ``None``) the live session."""
         self.session = session
+        self._down = False
         self._app.agent_session = session
         if session is None:
             self._session_info["agent"] = AGENT_UNAVAILABLE
@@ -1151,19 +1171,49 @@ class AgentHolder:
         self._reopen_with = factory
         self.install(None)
 
-    async def ensure(self):
+    async def ensure(self, retry=False):
         """The live session, after opening one if the app is closed (by the
         idle sweep, or built closed): a new session from ``resume_session``
         (``close_at_start`` says which factory builds the first), started in
         the background (the page learns when it is ready from its
         ``agent_status`` events, as it does at startup). A factory that
         raises leaves the app closed, reported, for the next caller to try
-        again."""
-        if self.closed and not self._stopped:
+        again.
+
+        With ``retry`` (a page connecting, or an agent frame from one), a
+        session that announced it is unavailable is closed and replaced the
+        same way, from ``resume_session`` or, for an app without one,
+        ``build_session``. Only a human's action retries: a call through
+        ``/mcp`` does not, so an agent in another process polling a broken
+        backend does not relaunch it on every call."""
+        if self._stopped:
+            return self.session
+        if self.closed or (retry and self._down):
             async with self._lock:
-                if self.closed and not self._stopped:
+                if self._stopped:
+                    pass
+                elif self.closed:
                     self._resume()
+                elif retry and self._down and self._retry_with is not None:
+                    await self._replace_down()
         return self.session
+
+    async def _replace_down(self):
+        """Close the session that went down, as an idle close would, end the
+        turns it left running (as interrupted, as ``create_app`` ends a killed
+        process's: no one will end them now, and a turn left running would
+        keep the app from ever closing for being idle), and open its
+        replacement from ``_retry_with``; a factory that raises leaves the app
+        closed, for the next ``ensure`` to try again."""
+        session, start = self.session, self._start_task
+        self._start_task = None
+        self.closed = True
+        self._reopen_with = self._retry_with
+        self.install(None)
+        await _end_session(start, session)
+        _end_unfinished_turns(self._publish, self._turns)
+        self._turns.clear()
+        self._resume()
 
     def _resume(self):
         # The model the human last switched to, which the new session does not
@@ -1400,7 +1450,9 @@ class AgentHolder:
             self._requests.discard(wire.get("request_id"))
         elif kind == "attention":
             self._attention = "%s: %s" % (wire.get("title", ""), wire.get("body", ""))
-        elif kind != "agent_status":
+        elif kind == "agent_status":
+            self._down = self.session is not None and wire.get("status") == AGENT_UNAVAILABLE
+        else:
             return
         self._note_change()
 
@@ -1455,6 +1507,14 @@ async def _end_session(start, session):
         await session.close()
     except Exception as exc:
         sys.stderr.write("warning: the agent session did not close cleanly: %r\n" % (exc,))
+
+
+def _end_unfinished_turns(publish, turns):
+    """End each of ``turns`` as interrupted through ``publish``: turns whose
+    backend is gone (a killed process, a session that went down) and will
+    never end them, so a page does not show them as running."""
+    for turn in sorted(turns):
+        publish(TurnEnd(turn=turn, stop_reason="interrupted", cost_usd=0.0))
 
 
 async def serve(app, host, port, on_ready=None, background=()):

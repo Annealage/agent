@@ -21,7 +21,14 @@ from toy_product import NOTES_FILE
 
 from annealage_agent import app as agent_app
 from annealage_agent import sessions
-from annealage_agent.session.base import AGENT_READY, AgentModelChanged, TurnEnd, UserTurn
+from annealage_agent.session.base import (
+    AGENT_READY,
+    AGENT_UNAVAILABLE,
+    AgentModelChanged,
+    AgentStatus,
+    TurnEnd,
+    UserTurn,
+)
 from annealage_agent.session.external import ExternalAgentSession
 from annealage_agent.session.permissions import PermissionBroker
 
@@ -68,6 +75,26 @@ class _SlowClose(_Session):
     async def close(self):
         await self.gate.wait()
         await super().close()
+
+
+class _FailsToStart(_Session):
+    """Its start fails while ``failing`` holds, as a backend's does when its
+    profile has no model login: unavailable, and announcing it."""
+
+    failing = False
+
+    def __init__(self, on_event, broker, resumed):
+        super().__init__(on_event, broker, resumed)
+        self.status = AGENT_READY
+
+    def agent_status(self):
+        return self.status
+
+    async def start(self):
+        await super().start()
+        if self.failing:
+            self.status = AGENT_UNAVAILABLE
+            self.emit(AgentStatus(status=AGENT_UNAVAILABLE))
 
 
 def _factory(built, *, resumed, cls=_Session):
@@ -201,6 +228,69 @@ async def test_a_resumed_session_comes_back_on_the_model_the_human_switched_to(s
         await _until(lambda: len(built) == 2 and built[1].models == ["claude-haiku-5"])
         published = _logged(app, "agent_model_changed")[before_resume:]
         assert [event["model"] for event in published] == ["claude-haiku-5"]
+    finally:
+        await app.agent_stop()
+
+
+@pytest.mark.parametrize("resume", [True, False])
+async def test_a_page_connecting_after_the_agent_went_down_starts_it_again(served_dir, resume):
+    """A start that failed (a model login gone, say) is tried again by the
+    next page to connect, once what stopped it is fixed, rather than only by
+    restarting the process: resumed where the app resumes, else built as a
+    restart would build it. A call through /mcp (``ensure`` without retry)
+    leaves it down, and a page connecting to a live agent keeps it."""
+    built = []
+    _FailsToStart.failing = True
+    kwargs = {} if resume else {"resume_session": None}
+    app = _app(served_dir, built, cls=_FailsToStart, idle_timeout=None, **kwargs)
+    await app.agent_start()
+    try:
+        (first,) = built
+        assert first.started == 1 and app.agent_status()["agent"] == AGENT_UNAVAILABLE
+        assert await app.agent_holder.ensure() is first
+
+        _FailsToStart.failing = False
+        client = make_test_client(app)
+        await client.get("/ws?t=%s" % BROWSER_TOKEN, headers=_ws_headers())
+        assert len(built) == 2 and first.closed == 1
+        second = built[1]
+        assert second.resumed is resume and app.agent_session is second
+        await _until(lambda: second.started == 1)
+        assert app.agent_status()["agent"] == AGENT_READY
+        await client.get("/ws?t=%s" % BROWSER_TOKEN, headers=_ws_headers())
+        assert len(built) == 2 and app.agent_session is second
+    finally:
+        _FailsToStart.failing = False
+        await app.agent_stop()
+
+
+async def test_a_turn_the_agent_that_went_down_left_running_ends_when_it_is_replaced(
+    served_dir,
+):
+    """A backend that dies mid-turn never ends that turn. Replaced by a page
+    connecting, the turn is ended as interrupted (in the log, so the pages
+    stop showing it running) and no longer counts: the replacement is not
+    shown as running a turn, and with no page open it closes for being idle."""
+    built = []
+    app = _app(served_dir, built, cls=_FailsToStart, idle_timeout=IDLE * 5)
+    await app.agent_start()
+    try:
+        first = built[0]
+        first.emit(UserTurn(turn=1, blocks=[{"type": "text", "text": "add a note"}]))
+        assert app.agent_status()["turn_running"] is True
+        first.status = AGENT_UNAVAILABLE
+        first.emit(AgentStatus(status=AGENT_UNAVAILABLE))
+
+        client = make_test_client(app)
+        await client.get("/ws?t=%s" % BROWSER_TOKEN, headers=_ws_headers())
+        second = built[1]
+        await _until(lambda: second.started == 1)
+        status = app.agent_status()
+        assert status["agent"] == AGENT_READY and status["turn_running"] is False
+        ended = [(e["turn"], e["stop_reason"]) for e in _logged(app, "turn_end")]
+        assert ended == [(1, "interrupted")]
+        await _until(lambda: app.agent_status()["agent"] == agent_app.AGENT_CLOSED)
+        assert second.closed == 1
     finally:
         await app.agent_stop()
 

@@ -1339,7 +1339,15 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
       case "agent_status":
         // The hello frame's `session.agent` is the status at the moment this
         // connection was accepted; a live event is what keeps it current.
-        if (!replayed) store.setChatAgentStatus(event.status);
+        if (!replayed) {
+          store.setChatAgentStatus(event.status);
+          // Why it was down (a reload retries a failed start) no longer
+          // holds once it is up; an error during a turn comes after this.
+          const banner = store.getState().chat.banner;
+          if (event.status === "ready" && banner && banner.kind === "error") {
+            store.clearChatBanner();
+          }
+        }
         break;
       case "agent_model_changed":
         // The LLM backend's active model, confirmed to have taken effect

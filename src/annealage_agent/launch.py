@@ -44,6 +44,7 @@ def build_session(
     omp_agent_dir=None,
     omp_binary=None,
     omp_config_dir=None,
+    omp_login_command=None,
 ):
     """The session ``backend`` names, constructed and not yet started.
 
@@ -78,7 +79,10 @@ def build_session(
     page (``PUT /settings``), and neither an executable nor a profile
     directory is something a browser should choose. The omp conversation is
     kept under ``<state dir>/omp`` and resumed from the file recorded in the
-    session's ``meta.json``.
+    session's ``meta.json``. ``omp_login_command`` is the shell command that
+    logs the omp profile in (a service's own seed script, say), which the
+    page shows verbatim when omp cannot start for want of a model login;
+    ``None`` shows omp's own ``auth-broker login`` for that profile.
 
     The session's write-protected patterns are ``bus.write_protected``, the
     app's (``create_app``); a stand-in bus without them takes the product's.
@@ -193,6 +197,7 @@ def build_session(
             session_dir=sessions.state_dir(serve_dir) / "omp",
             resume=info.omp_session_file if info is not None else None,
             on_session_file=_record_session_file,
+            login_command=omp_login_command,
         )
 
     from .session.sdk import SdkSession

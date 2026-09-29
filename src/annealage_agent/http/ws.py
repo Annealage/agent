@@ -131,9 +131,12 @@ def register_ws(
     connection opens and as each frame arrives rather than once here: its
     ``session`` is the live session, ``None`` in viewer-only mode, and a
     connection or an agent frame (``turn``, ``interrupt``, ``permission``,
-    ``set_model``) reaching an app its idle timer closed resumes one first
-    (``holder.ensure()``). Its ``bus`` is the ``ViewerBus`` holding the human's
-    pause switch, handed on only while a session exists, since viewer-only
+    ``set_model``) reaching an app its idle timer closed resumes one first,
+    and one reaching an app whose session went down (a failed start, a dead
+    backend) replaces it (``holder.ensure(retry=True)``), so a reload after
+    fixing what stopped the agent starts it again. Its ``bus`` is the
+    ``ViewerBus`` holding the human's pause switch, handed on only while a
+    session exists, since viewer-only
     mode has no agent tools to pause. The bus is read for the ``hello`` frame
     and written by an inbound ``pause`` frame; this module never calls
     through it, because a ``call`` originates with a tool, never with a
@@ -157,7 +160,7 @@ def register_ws(
             # (static/ws.js) never starts a session; noted as activity, so
             # the idle sweep does not close the session this page is greeted
             # with before the page counts as connected.
-            session = await holder.ensure()
+            session = await holder.ensure(retry=True)
             holder.note_activity()
             bus = holder.bus if session is not None else None
             # Greeting and replay both happen before the connection is
@@ -431,7 +434,7 @@ async def _serve_connection(ws, conn, registry, event_log, token, holder):
         if frame is _CLOSED:
             return
         if frame["type"] in _AGENT_FRAMES:
-            await holder.ensure()
+            await holder.ensure(retry=True)
         session = holder.session
         bus = holder.bus if session is not None else None
         await _dispatch(ws, conn, registry, event_log, token, frame, session, bus)

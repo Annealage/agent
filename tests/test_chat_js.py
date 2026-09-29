@@ -98,6 +98,11 @@ chat.handleEvent({ kind: "agent_error", remediation: "old trouble", stderr: "" }
 out.bannerFromReplay = store.getState().chat.banner;
 chat.handleEvent({ kind: "agent_error", remediation: "new trouble", stderr: "" }, { replayed: false });
 out.bannerFromLive = store.getState().chat.banner && store.getState().chat.banner.text;
+// Why it was down stays while it starts again, and goes once it is up.
+chat.handleEvent({ kind: "agent_status", status: "connecting" }, { replayed: false });
+out.errorWhileStarting = store.getState().chat.banner && store.getState().chat.banner.text;
+chat.handleEvent({ kind: "agent_status", status: "ready" }, { replayed: false });
+out.errorOnceReady = store.getState().chat.banner;
 store.clearChatBanner();
 
 // The agent's question (attention) leaves the banner once the human answers;
@@ -207,6 +212,8 @@ def test_a_page_opened_while_the_agent_is_down_shows_why(observed):
 def test_only_a_live_agent_error_raises_the_banner(observed):
     assert observed["bannerFromReplay"] is None
     assert observed["bannerFromLive"] == "new trouble"
+    assert observed["errorWhileStarting"] == "new trouble"
+    assert observed["errorOnceReady"] is None
 
 
 def test_the_agents_question_leaves_the_banner_when_the_human_answers(observed):

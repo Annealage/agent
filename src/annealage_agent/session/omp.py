@@ -153,7 +153,11 @@ relative to it. A project's own context files (``AGENTS.md`` and the like in
 the served directory and above it) are read whatever these say. ``binary``
 is an absolute path to the `omp` executable, for a service whose ``PATH``
 does not have it; never relative, which would resolve inside the served
-directory.
+directory. A start `omp` refuses because the profile has no working model
+login ("No models available") is reported as that, with the command that
+logs the profile in: ``login_command`` when the product names one (a
+service's own seed script), else `omp`'s own ``auth-broker login`` under the
+environment this session launches it with (``_login_command``).
 
 **Steering and resuming.** Every human message is sent as ``prompt`` with
 ``streamingBehavior: "steer"``: an idle `omp` starts a turn with it, a busy
@@ -197,6 +201,7 @@ import functools
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import sys
 import tempfile
@@ -288,6 +293,9 @@ class OmpSession:
     conversation directory, conversation file to resume, and the callback
     that records the conversation file `omp` reports. Without
     ``session_dir`` the conversation is not kept (``--no-session``).
+    ``login_command`` is the shell command, shown verbatim, that logs the
+    profile in when a start fails for want of a model login; without it the
+    session names `omp`'s own.
     """
 
     #: A message sent while a turn runs redirects it (``hello``'s ``steers``).
@@ -314,6 +322,7 @@ class OmpSession:
         resume: Optional[str] = None,
         on_session_file=None,
         turn: int = 0,
+        login_command: Optional[str] = None,
     ):
         self._on_event = on_event
         self.cwd = str(cwd)
@@ -340,6 +349,7 @@ class OmpSession:
         self._session_dir = Path(session_dir) if session_dir is not None else None
         self._resume = resume or None
         self._on_session_file = on_session_file
+        self._login_command = login_command or None
         self.session_file: Optional[str] = None
         # For backend_logs: the client whose stderr omp_rpc keeps (bounded, and
         # still readable once that client has stopped, which is when it
@@ -640,6 +650,8 @@ class OmpSession:
             self._fail(ValueError(refusal))
             return
         self._started_at = time.time()
+        # What omp is launched with, for the login command a failure names.
+        env: dict = {}
         try:
             if self._base_url:
                 # An arbitrary/self-hosted OpenAI-compatible endpoint `omp`
@@ -722,7 +734,7 @@ class OmpSession:
                     )
                 self._client = None
             self._discard_agent_dir()
-            self._fail(exc)
+            self._fail(exc, remediation=self._no_login_remediation(exc, env))
             return
         if self._resume:
             await self._switch_to(self._resume)
@@ -1119,15 +1131,44 @@ class OmpSession:
                         "warning: could not record the omp conversation file: %r\n" % (exc,)
                     )
 
-    def _fail(self, exc: BaseException, viewer: Optional[str] = None) -> None:
+    def _no_login_remediation(self, exc: BaseException, env: dict) -> Optional[str]:
+        """What to do about a start that failed because the profile ``env``
+        launched omp with has no model it can use, or None for any other
+        failure. omp says so on stderr ("No models available. Use /login
+        ..."), which omp_rpc carries in the exception's message and keeps as
+        the client's ``stderr``; matched loosely, on those three words. A run
+        on ``omp_base_url`` has no login to fix: its throwaway profile names
+        the endpoint itself."""
+        if self._base_url:
+            return None
+        said = "%s\n%s" % (exc, getattr(self._stderr_client, "stderr", None) or "")
+        if "no models available" not in said.lower():
+            return None
+        launched = dict(os.environ)
+        launched.update(env)
+        home = os.path.expanduser("~")
+        # omp's own default when nothing names one (`omp config path`).
+        profile = launched.get("PI_CODING_AGENT_DIR") or os.path.join(
+            os.path.normpath(home + os.sep + (launched.get("PI_CONFIG_DIR") or ".omp")), "agent"
+        )
+        command = self._login_command or _login_command(env, self._binary)
+        return _no_login_remediation(profile, command)
+
+    def _fail(
+        self,
+        exc: BaseException,
+        viewer: Optional[str] = None,
+        remediation: Optional[str] = None,
+    ) -> None:
         """Report a failure as an event and mark the session unavailable.
         Never raises. Identical in intent to ``SdkSession._fail``/
-        ``CodexSession._fail``."""
+        ``CodexSession._fail``; ``remediation``, when given, replaces the
+        one ``_remediation_for`` guesses from the exception's class."""
         self._set_status(AGENT_UNAVAILABLE)
         self._emit(
             AgentError(
                 stderr="%s: %s" % (type(exc).__name__, exc),
-                remediation=_remediation_for(exc),
+                remediation=remediation or _remediation_for(exc),
                 viewer=viewer,
             )
         )
@@ -1403,3 +1444,33 @@ def _remediation_for(exc: BaseException) -> str:
     if name == "RpcProcessExitError":
         return "the omp process exited before it was ready; its stderr says why"
     return "the agent is unavailable; its captured output says why"
+
+
+def _login_command(env: dict, binary: Optional[str]) -> str:
+    """`omp`'s own login, as a shell command, for the profile an `omp`
+    launched with ``env`` (over this process's environment) uses:
+    ``auth-broker login`` under the same ``PI_CODING_AGENT_DIR`` and
+    ``PI_CONFIG_DIR``, with ``binary`` (else ``omp`` on ``PATH``). No provider
+    is named, so `omp` asks which one."""
+    words = []
+    for name in ("PI_CODING_AGENT_DIR", "PI_CONFIG_DIR"):
+        value = env.get(name) or os.environ.get(name)
+        if value:
+            words.append("%s=%s" % (name, shlex.quote(value)))
+    words += [shlex.quote(binary or "omp"), "auth-broker", "login"]
+    return " ".join(words)
+
+
+def _no_login_remediation(profile: str, command: str) -> str:
+    """What the page says when `omp` could not start because ``profile`` has
+    no model login it can use: why, ``command`` on a line of its own to copy,
+    and what to do once it has run. A reload starts the agent again
+    (``AgentHolder.ensure``)."""
+    return (
+        "the agent can't start because its omp profile (%s) has no working model "
+        "login; a login there may have expired or been revoked. Log it in again by "
+        "running this on the server:\n\n    %s\n\n"
+        "It's a browser sign-in: if the browser is on another machine, paste the "
+        "final redirect URL back into the terminal when it asks. Then reload this "
+        "page to start the agent again." % (profile, command)
+    )

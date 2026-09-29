@@ -1942,6 +1942,94 @@ async def test_backend_logs_after_omp_exits_before_ready_are_its_stderr_and_its_
         await session.close()
 
 
+def _exits_before_ready(stderr):
+    """A client whose omp exits before it is ready, having said ``stderr``,
+    as omp_rpc reports that."""
+
+    class ExitsBeforeReady(FakeRpcClient):
+        def start(self):
+            self.stderr = stderr
+            raise RpcProcessExitError("RPC process exited with code 1. Stderr: " + stderr)
+
+    return ExitsBeforeReady
+
+
+_NO_MODELS = (
+    "No models available. Use /login or set an API key environment variable. "
+    "Then use /model to select a model.\n"
+)
+
+
+async def _start_failure(tmp_path, stderr, **kwargs):
+    """The ``AgentError`` a start that fails with omp saying ``stderr``
+    reports, the session built with ``kwargs``."""
+    recorder = EventRecorder()
+    session = OmpSession(
+        recorder,
+        cwd=tmp_path,
+        session_id="s",
+        tool_table=_tool_table(),
+        client_factory=_exits_before_ready(stderr),
+        **kwargs,
+    )
+    await session.start()
+    try:
+        assert session.agent_status() == AGENT_UNAVAILABLE
+        return next(e for e in recorder.all if isinstance(e, AgentError))
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_profile_with_no_model_login_names_the_profile_and_the_products_login(
+    tmp_path, monkeypatch
+):
+    """omp's own advice (/login, models.yml) is for a human at its prompt; a
+    service's profile is logged in with the command the product names, shown
+    as given, and omp's words stay in the detail under it."""
+    _omp_home(tmp_path, monkeypatch)
+    command = "LOOM_OMP_ROOT=/srv/x /opt/loom/scripts/instance/seed-omp-profile.sh --login"
+    error = await _start_failure(
+        tmp_path, _NO_MODELS, agent_dir="/srv/x/omp", login_command=command
+    )
+    assert "omp profile (/srv/x/omp) has no working model login" in error.remediation
+    assert "\n    %s\n" % command in error.remediation
+    assert "reload this page" in error.remediation
+    assert "No models available" in error.stderr
+
+
+@pytest.mark.asyncio
+async def test_a_profile_with_no_model_login_and_no_products_login_names_omps_own(
+    tmp_path, monkeypatch
+):
+    """Without the product's command, omp's own login under the environment
+    the session launched it with: the profile, the config root (relative to
+    $HOME, as omp takes it) and the binary."""
+    config, _logs = _omp_home(tmp_path, monkeypatch)
+    error = await _start_failure(
+        tmp_path,
+        "error: no models AVAILABLE\n",
+        agent_dir="/srv/with space/omp",
+        config_dir=str(config),
+        binary="/opt/omp",
+    )
+    assert "omp profile (/srv/with space/omp)" in error.remediation
+    assert (
+        "\n    PI_CODING_AGENT_DIR='/srv/with space/omp' PI_CONFIG_DIR=%s /opt/omp "
+        "auth-broker login\n" % os.path.join("svc", "omp-config")
+    ) in error.remediation
+
+
+@pytest.mark.asyncio
+async def test_any_other_start_failure_keeps_the_generic_remediation(tmp_path, monkeypatch):
+    _omp_home(tmp_path, monkeypatch)
+    error = await _start_failure(
+        tmp_path, "error: unknown flag --no-extensions\n", agent_dir="/srv/x/omp"
+    )
+    assert error.remediation == "the omp process exited before it was ready; its stderr says why"
+    assert "unknown flag" in error.stderr
+
+
 @pytest.mark.asyncio
 async def test_backend_logs_of_a_running_omp_are_its_own_log_and_conversation(
     tmp_path, monkeypatch

@@ -273,7 +273,7 @@ async def _hello_of(app):
     return json.loads(payload)
 
 
-def _app_with_fake_session(served_dir, **kwargs):
+def _app_with_fake_session(served_dir, session_cls=None, **kwargs):
     from annealage_agent import sessions
     from annealage_agent.session.fake import FakeSession
 
@@ -281,7 +281,7 @@ def _app_with_fake_session(served_dir, **kwargs):
     sid = sessions.create_session(served_dir)
 
     def build_session(on_event, *, bus):
-        built.append(FakeSession(on_event, session_id=sid))
+        built.append((session_cls or FakeSession)(on_event, session_id=sid))
         return built[-1]
 
     app = create_toy_app(
@@ -321,24 +321,35 @@ async def test_a_fresh_connection_after_a_live_model_switch_sees_the_new_model(s
 async def test_a_page_opened_while_the_agent_is_down_is_told_why(served_dir):
     """The page raises no banner from a replayed ``agent_error``, so a tab
     opened after the agent failed to start (omp not logged in) would show an
-    unavailable pane with no reason. The hello carries the latest error while
-    the agent is not ready, and nothing once it is."""
-    from annealage_agent.session.base import AgentError, AgentStatus
+    unavailable pane with no reason. Opening it starts the agent again, and
+    the hello carries the latest error while that one is not ready, and
+    nothing once it is."""
+    from annealage_agent.session.base import AGENT_CONNECTING, AgentError, AgentStatus
+    from annealage_agent.session.fake import FakeSession
 
-    app, session = _app_with_fake_session(served_dir)
+    class Starting(FakeSession):
+        """Connecting until told otherwise, as a real backend's is."""
+
+        def __init__(self, on_event, session_id):
+            super().__init__(on_event, session_id=session_id)
+            self.set_status(AGENT_CONNECTING)
+
+    app, session = _app_with_fake_session(served_dir, session_cls=Starting)
     session.emit(AgentError(stderr="401 no credentials", remediation="log omp in"))
     session.set_status("unavailable")
     session.emit(AgentStatus(status="unavailable"))
     down = await _hello_of(app)
+    retried = app.agent_session
+    assert retried is not session and down["session"]["agent"] == AGENT_CONNECTING
     assert down["session"]["agent_error"] == {
         "remediation": "log omp in",
         "stderr": "401 no credentials",
     }
 
-    session.set_status("ready")
-    session.emit(AgentStatus(status="ready"))
+    retried.set_status("ready")
+    retried.emit(AgentStatus(status="ready"))
     up = await _hello_of(app)
-    assert up["session"]["agent_error"] is None
+    assert app.agent_session is retried and up["session"]["agent_error"] is None
 
 
 async def test_the_hello_carries_the_conversation_s_usage_across_a_restart(served_dir):
