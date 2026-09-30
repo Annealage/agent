@@ -18,13 +18,19 @@ import { store } from "./store.js";
 
 /**
  * @param send    ws.js's frame sender, for the outbound pause frame
- * @param button  the control (default: the page's `#pauseBtn`)
+ * @param button  the control (default: the page's `#pauseBtn`). Its state is
+ *                `.on` and `aria-pressed`. With a `[data-label]` child, only that
+ *                child's text is written ("Pause" / "Paused"), so an icon or other
+ *                markup the page put in the button stays; without one, the
+ *                button's whole text is.
  * Returns `{setPausedFromServer}`, which the page hands to ws.js's `onPaused`.
  */
 export function initPause({ send, button = document.getElementById("pauseBtn") }) {
+  const label = button.querySelector("[data-label]");
   function renderPause(state) {
     button.classList.toggle("on", state.paused);
-    button.textContent = state.paused ? "❙❙ Paused" : "❙❙ Pause";
+    if (label) label.textContent = state.paused ? "Paused" : "Pause";
+    else button.textContent = state.paused ? "❙❙ Paused" : "❙❙ Pause";
     button.setAttribute("aria-pressed", state.paused ? "true" : "false");
     // Disabled when there is no agent, which is both viewer-only mode and a
     // session that failed to start. In viewer-only mode the server refuses a
