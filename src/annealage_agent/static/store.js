@@ -51,8 +51,8 @@
  *                 pre-handshake 403 was confirmed, most likely a stale token
  *                 from a server restart, and the fallback runs under this
  *                 state too.
- *   chat          {turns, pendingUser, pending, agentStatus, model, banner,
- *                  attachments, usage}
+ *   chat          {turns, pendingUser, pending, agentStatus, model, models,
+ *                  banner, attachments, usage}
  *                 the whole chat pane's state.
  *                 `turns` is one record per turn number, `{turn, user,
  *                 text, tools, stopReason, costUsd, complete}`, built up
@@ -96,6 +96,9 @@
  *                 `set_model` frame actually took effect as: the LLM
  *                 backend's active model, read and written only by the chat
  *                 pane.
+ *                 `models` are the models the backend listed, for the model
+ *                 field to suggest (the hello's `session.models`, then any
+ *                 live `agent_models_available`); empty when it listed none.
  *                 `usage` is the conversation's usage so far, as the hello
  *                 frame's `session.usage` and each live `usage` event carry
  *                 it: `{cost_usd, tokens: {input, output, cache_read,
@@ -144,6 +147,7 @@ let state = Object.freeze({
     pending: Object.freeze([]),
     agentStatus: "connecting",
     model: null,
+    models: Object.freeze([]),
     banner: null,
     attachments: Object.freeze([]),
     usage: null,
@@ -523,6 +527,12 @@ function setChatModel(model) {
   }, ["chat"]);
 }
 
+function setChatModels(models) {
+  commit(() => {
+    state = { ...state, chat: Object.freeze({ ...state.chat, models: Object.freeze([...(models || [])]) }) };
+  }, ["chat"]);
+}
+
 function setChatUsage(usage) {
   commit(() => {
     state = { ...state, chat: Object.freeze({ ...state.chat, usage: usage || null }) };
@@ -719,6 +729,7 @@ export const store = Object.freeze({
   removeChatPermissionRequest,
   setChatAgentStatus,
   setChatModel,
+  setChatModels,
   setChatUsage,
   setChatUploadActions,
   reserveChatDocument,

@@ -981,12 +981,11 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
   // another edit's `change` event would ever call renderModel again.
   let queuedModelRevert = false;
 
-  // The model picker is a free-text field, not a dropdown: enumerating what
-  // a given backend/endpoint actually offers is out of this ticket's scope
-  // (protocol.py's build_hello and this pane only carry the *current*
-  // value). `change` fires on blur once the value differs from what it was
-  // on focus, which is what lets a human type a full model id without a
-  // frame going out on every keystroke.
+  // The model picker is a free-text field with the backend's listed models
+  // (`chat.models`) as datalist suggestions, so any other id can still be
+  // typed. `change` fires on blur once the value differs from what it held
+  // after focus (the focus handler below empties it), which is what lets a
+  // human type a full model id without a frame going out on every keystroke.
   //
   // This field tracks `agent_model_changed`, the LLM backend's active model;
   // a product's own event about its files (Mesh's `models_changed`) is taken
@@ -1038,12 +1037,48 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     }
   });
 
+  // The backend's listed models, as suggestions under the field: a datalist,
+  // so any other name can still be typed. Built here rather than asked of the
+  // page's markup, since a page without it would simply offer none.
+  const chatModelListEl = document.createElement("datalist");
+  chatModelListEl.id = "chatModelList";
+  chatModelInputEl.after(chatModelListEl);
+  chatModelInputEl.setAttribute("list", chatModelListEl.id);
+  let listedModels = null;
+  // A datalist only offers what matches the field's text, and the field holds
+  // the current model, so focusing it would offer that one alone. While
+  // focused it is emptied, the current model kept as its placeholder; leaving
+  // it empty puts the model back (applyModelInput's empty case).
+  const modelPlaceholder = chatModelInputEl.placeholder;
+  chatModelInputEl.addEventListener("focus", () => {
+    // Only the displayed current model is swapped for the placeholder: a
+    // refocus (the window regaining focus) must not erase a half-typed id.
+    const current = store.getState().chat.model || "";
+    if (!store.getState().chat.models.length || chatModelInputEl.value !== current) return;
+    chatModelInputEl.placeholder = chatModelInputEl.value || modelPlaceholder;
+    chatModelInputEl.value = "";
+  });
+  chatModelInputEl.addEventListener("blur", () => {
+    chatModelInputEl.placeholder = modelPlaceholder;
+    if (!chatModelInputEl.value) chatModelInputEl.value = store.getState().chat.model || "";
+  });
+
   // The one writer of the model field's value and disabled state; mirrors
   // renderSendButton's reasoning for gating on `agentStatus`. Skipped while
   // the field has focus, so a store update racing a human mid-edit (a
   // reconnect's hello, another tab's own AgentModelChanged) cannot overwrite
   // what they are typing.
   function renderModel(chat) {
+    if (chat.models !== listedModels) {
+      listedModels = chat.models;
+      chatModelListEl.replaceChildren(
+        ...chat.models.map((model) => {
+          const option = document.createElement("option");
+          option.value = model;
+          return option;
+        }),
+      );
+    }
     chatModelInputEl.disabled = chat.agentStatus === "unavailable";
     if (document.activeElement !== chatModelInputEl) {
       chatModelInputEl.value = chat.model || "";
@@ -1300,6 +1335,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
       queuedModelRevert = false;
       store.setChatAgentStatus(session.agent);
       store.setChatModel(session.model);
+      store.setChatModels(session.models);
       store.setChatUsage(session.usage);
       store.setChatUploadActions(session.upload_actions || []);
       // Why the agent is down, for a page opened after it went down: the
@@ -1435,6 +1471,10 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
           pendingSetModel = null;
         }
         store.setChatModel(event.model);
+        break;
+      case "agent_models_available":
+        // A replayed list is older than the hello's, which already has it.
+        if (!replayed) store.setChatModels(event.models);
         break;
       case "session_reset":
         store.resetChatTurns();

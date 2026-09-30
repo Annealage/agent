@@ -48,6 +48,7 @@ class El {
   append(...kids) { this.children.push(...kids); }
   remove() {}
   before(...nodes) { (this.inserted ||= []).push(...nodes); }
+  after(...nodes) { (this.inserted ||= []).push(...nodes); }
   replaceChildren(...kids) { this.children = [...kids]; }
   setAttribute() {}
   getAttribute() { return null; }
@@ -254,6 +255,28 @@ chat.handleEvent({ kind: "permission_resolved", request_id: "pr_c_1", outcome: "
 chat.handleEvent({ kind: "session_reset", reason: "new" }, live);
 out.paneAfterReset = paneData();
 
+// The model field: the listed models as its suggestions, emptied on focus so
+// all of them are offered, and the current model back if nothing is typed.
+chat.handleHello({ id: "m", agent: "ready", model: "opus", models: ["opus", "haiku"] });
+const modelInput = el("chatModelInput");
+const fire = (type) => { for (const fn of modelInput.listeners[type] || []) fn({ key: "" }); };
+const focusModel = () => { document.activeElement = modelInput; fire("focus"); };
+const blurModel = () => { document.activeElement = null; fire("blur"); fire("change"); };
+out.modelOptions = modelInput.inserted.find((n) => n.id === "chatModelList").children.map((o) => o.value);
+focusModel();
+out.modelOnFocus = [modelInput.value, modelInput.placeholder];
+blurModel();
+out.modelOnBlurUntyped = modelInput.value;
+sent.length = 0;
+focusModel();
+modelInput.value = "hai";
+// The window losing and regaining focus refocuses the field mid-edit.
+fire("blur"); fire("focus");
+out.modelAfterRefocus = modelInput.value;
+modelInput.value = "haiku";
+blurModel();
+out.modelSent = sent.filter((f) => f.type === "set_model").map((f) => f.model);
+
 console.log(JSON.stringify(out));
 process.exit(0);
 """
@@ -385,3 +408,16 @@ def test_a_finished_turn_s_meta_is_a_span_per_known_part(observed):
     ]
     # No tokens reported: no tokens part.
     assert observed["metaSteered"] == [["turnstop", "steered"], ", ", ["turncost", "$0.0000"]]
+
+
+def test_the_model_field_offers_the_listed_models_from_an_empty_field(observed):
+    assert observed["modelOptions"] == ["opus", "haiku"]
+    # Emptied on focus, so the datalist offers every model; the current one
+    # stays visible as the placeholder and comes back if nothing is typed.
+    assert observed["modelOnFocus"] == ["", "opus"]
+    assert observed["modelOnBlurUntyped"] == "opus"
+
+
+def test_a_half_typed_model_survives_a_refocus_and_is_sent(observed):
+    assert observed["modelAfterRefocus"] == "hai"
+    assert observed["modelSent"] == ["haiku"]
