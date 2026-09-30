@@ -43,6 +43,7 @@ from annealage_agent.session.base import (
     AGENT_UNAVAILABLE,
     AgentError,
     AgentModelChanged,
+    AgentModelsAvailable,
     AgentStatus,
     SessionReset,
     TextDelta,
@@ -123,6 +124,10 @@ class FakeTransport(Transport):
     it is how a test plays the part of the CLI child's stdout.
     """
 
+    # What the initialize response reports (the CLI's `models` among it);
+    # empty when None.
+    initialize_response = None
+
     def __init__(self):
         self.written = []
         self.connected = False
@@ -147,7 +152,9 @@ class FakeTransport(Transport):
                         "response": {
                             "subtype": "success",
                             "request_id": obj["request_id"],
-                            "response": {},
+                            "response": (
+                                (self.initialize_response or {}) if subtype == "initialize" else {}
+                            ),
                         },
                     }
                 )
@@ -227,6 +234,40 @@ def test_fake_transport_is_a_real_transport():
     network or a subprocess."""
     transport = FakeTransport()
     assert isinstance(transport, Transport)
+
+
+@pytest.mark.asyncio
+async def test_the_models_the_cli_reports_at_initialise_are_published():
+    """The CLI's own ``models`` list, as each entry's ``value``: the alias or
+    id ``set_model`` takes, not the display name."""
+    transport = FakeTransport()
+    transport.initialize_response = {
+        "models": [
+            {"value": "default", "displayName": "Default (recommended)"},
+            {"value": "opus", "displayName": "Opus"},
+            {"displayName": "no value, not offered"},
+        ]
+    }
+    session, transport, recorder = await _started_session(transport=transport)
+    try:
+        published = [e.models for e in recorder.all if isinstance(e, AgentModelsAvailable)]
+        assert published == [["default", "opus"]]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_model_list_still_leaves_the_session_ready():
+    """The list only feeds suggestions: an initialise response whose
+    ``models`` is not a list of entries costs those and nothing else."""
+    transport = FakeTransport()
+    transport.initialize_response = {"models": "not a list"}
+    session, transport, recorder = await _started_session(transport=transport)
+    try:
+        assert session.agent_status() == AGENT_READY
+        assert not [e for e in recorder.all if isinstance(e, AgentModelsAvailable)]
+    finally:
+        await session.close()
 
 
 @pytest.mark.asyncio

@@ -93,6 +93,7 @@ from .base import (
     AGENT_UNAVAILABLE,
     AgentError,
     AgentModelChanged,
+    AgentModelsAvailable,
     AgentStatus,
     SandboxStatus,
     SessionReset,
@@ -457,7 +458,28 @@ class SdkSession:
             self._fail(exc)
             return
         self._set_status(AGENT_READY)
+        # After READY: the list only feeds suggestions, so a slow listing
+        # must not hold the session at connecting.
+        await self._emit_available_models()
         self._pump_task = asyncio.ensure_future(self._pump())
+
+    async def _emit_available_models(self) -> None:
+        """Publish the ``models`` the CLI reported when it initialised, as
+        their ``value``, the alias or id ``set_model`` takes. An older CLI
+        that reports none costs only the field's suggestions."""
+        try:
+            info = await self._client.get_server_info() or {}
+        except Exception as exc:
+            sys.stderr.write("warning: could not list the claude models: %r\n" % (exc,))
+            return
+        entries = info.get("models")
+        models = [
+            entry["value"]
+            for entry in (entries if isinstance(entries, list) else ())
+            if isinstance(entry, dict) and isinstance(entry.get("value"), str) and entry["value"]
+        ]
+        if models:
+            self._emit(AgentModelsAvailable(models=models))
 
     async def close(self) -> None:
         self._closing = True

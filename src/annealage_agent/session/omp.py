@@ -221,6 +221,7 @@ from .base import (
     AGENT_UNAVAILABLE,
     AgentError,
     AgentModelChanged,
+    AgentModelsAvailable,
     AgentStatus,
     SandboxStatus,
     SessionReset,
@@ -753,6 +754,26 @@ class OmpSession:
         if self._usage is not None and any(self._usage.values()):
             await self._emit_usage(self._usage, state)
         self._set_status(AGENT_READY)
+        # After READY: the list only feeds suggestions, so a slow listing
+        # must not hold the session at connecting.
+        await self._emit_available_models()
+
+    async def _emit_available_models(self) -> None:
+        """Publish ``get_available_models`` as the strings ``set_model``
+        takes: ``provider/model``, or the bare model id of this run's own
+        provider when ``omp_base_url`` pins one. A failure costs only the
+        field's suggestions."""
+        try:
+            infos = await self._run_blocking(self._client.get_available_models)
+        except Exception as exc:
+            sys.stderr.write("warning: could not list the omp models: %r\n" % (exc,))
+            return
+        if self._base_url:
+            models = [info.id for info in infos if info.provider == _provider_id()]
+        else:
+            models = ["%s/%s" % (info.provider, info.id) for info in infos]
+        if models:
+            self._emit(AgentModelsAvailable(models=models))
 
     def _configuration_refusal(self) -> Optional[str]:
         """Why this session's configuration cannot start, or None."""

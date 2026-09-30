@@ -43,6 +43,7 @@ from annealage_agent.session.base import (
     AGENT_UNAVAILABLE,
     AgentError,
     AgentModelChanged,
+    AgentModelsAvailable,
     AgentStatus,
     PermissionRequest,
     PermissionResolved,
@@ -68,6 +69,9 @@ from annealage_agent.viewers import ViewerBus
 class FakeRpcClient:
     """Stands in for ``omp_rpc.RpcClient``. See module docstring for why
     this, not a hand-rolled stdio transport, is the fake seam."""
+
+    # What get_available_models reports: omp_rpc ModelInfo stand-ins.
+    available_models = ()
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -134,6 +138,9 @@ class FakeRpcClient:
     def set_model(self, provider, model_id):
         self.set_model_calls.append((provider, model_id))
         return SimpleNamespace(provider=provider, model_id=model_id)
+
+    def get_available_models(self):
+        return self.available_models
 
     def on_message_update(self, listener):
         self._listeners["message_update"] = listener
@@ -262,14 +269,14 @@ class EventRecorder:
                 return event
 
 
-async def _started_session(*, viewer_count=1, tool_table=None, **kwargs):
+async def _started_session(*, viewer_count=1, tool_table=None, client_class=None, **kwargs):
     """A ready ``OmpSession`` over a fresh ``FakeRpcClient``, plus the
     recorder and the fake client itself (for assertions and for driving
     events/confirms)."""
     holder = {}
 
     def _client_factory(**client_kwargs):
-        fake = FakeRpcClient(**client_kwargs)
+        fake = (client_class or FakeRpcClient)(**client_kwargs)
         holder["fake"] = fake
         return fake
 
@@ -480,6 +487,53 @@ async def test_set_model_without_base_url_passes_a_bare_model_id_straight_throug
         event = await recorder.next()
         assert isinstance(event, AgentModelChanged)
         assert event.model == "qwen3.9-70b"
+    finally:
+        await session.close()
+
+
+def _listing(*pairs):
+    """A FakeRpcClient class whose get_available_models reports ``pairs``."""
+    infos = tuple(SimpleNamespace(provider=provider, id=model_id) for provider, model_id in pairs)
+    return type("ListingRpcClient", (FakeRpcClient,), {"available_models": infos})
+
+
+async def _models_published(client_class, **kwargs):
+    session, fake, recorder, broker = await _started_session(client_class=client_class, **kwargs)
+    await session.close()
+    return [e.models for e in recorder.all if isinstance(e, AgentModelsAvailable)]
+
+
+@pytest.mark.asyncio
+async def test_available_models_are_published_as_provider_model_references():
+    """Without ``omp_base_url`` the list is what the model field sends back
+    to ``set_model``: ``provider/model``, every provider omp knows."""
+    client = _listing(("titan", "qwen3.9-70b"), ("anthropic", "claude-opus-4"))
+    published = await _models_published(client, model="titan/qwen3.9-70b", base_url=None)
+    assert published == [["titan/qwen3.9-70b", "anthropic/claude-opus-4"]]
+
+
+@pytest.mark.asyncio
+async def test_available_models_with_base_url_are_this_runs_provider_only():
+    """With ``omp_base_url`` ``set_model`` takes a bare id under the run's
+    own provider, so only that provider's models, bare, are offered."""
+    client = _listing((_provider_id(), "llama-70b"), ("anthropic", "claude-opus-4"))
+    published = await _models_published(client, model="llama-70b")
+    assert published == [["llama-70b"]]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_model_listing_still_leaves_the_session_ready():
+    """The list only feeds suggestions: ``get_available_models`` failing
+    costs those and nothing else."""
+
+    class FailingRpcClient(FakeRpcClient):
+        def get_available_models(self):
+            raise RuntimeError("get_available_models unavailable")
+
+    session, fake, recorder, broker = await _started_session(client_class=FailingRpcClient)
+    try:
+        assert session.agent_status() == AGENT_READY
+        assert not [e for e in recorder.all if isinstance(e, AgentModelsAvailable)]
     finally:
         await session.close()
 

@@ -150,6 +150,8 @@ def test_build_hello_round_trips():
             "usage": None,
             # Empty unless the product offers something to do with an upload.
             "upload_actions": [],
+            # Empty until the backend lists the models it can switch to.
+            "models": [],
         },
         "protocol": PROTOCOL_VERSION,
     }

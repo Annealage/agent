@@ -318,6 +318,18 @@ async def test_a_fresh_connection_after_a_live_model_switch_sees_the_new_model(s
     assert hello["session"]["agent"] == "unavailable"
 
 
+async def test_a_fresh_connection_gets_the_models_the_backend_listed(served_dir):
+    """The list is published once, at session start, usually before any tab
+    is open, so a later tab takes it from the hello, not from the replay."""
+    from annealage_agent.session.base import AgentModelsAvailable
+
+    app, session = _app_with_fake_session(served_dir)
+    session.emit(AgentModelsAvailable(models=["titan/qwen3.9-70b", "anthropic/claude-opus-4"]))
+
+    hello = await _hello_of(app)
+    assert hello["session"]["models"] == ["titan/qwen3.9-70b", "anthropic/claude-opus-4"]
+
+
 async def test_a_page_opened_while_the_agent_is_down_is_told_why(served_dir):
     """The page raises no banner from a replayed ``agent_error``, so a tab
     opened after the agent failed to start (omp not logged in) would show an

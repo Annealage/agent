@@ -58,6 +58,7 @@ from annealage_agent.session.base import (
     AGENT_UNAVAILABLE,
     AgentError,
     AgentModelChanged,
+    AgentModelsAvailable,
     AgentStatus,
     PermissionRequest,
     PermissionResolved,
@@ -110,6 +111,12 @@ class FakeCodexClient:
     def thread_start(self, params):
         self.thread_start_params = params
         return SimpleNamespace(thread=SimpleNamespace(id="thread-1"))
+
+    # What model/list reports: openai_codex Model stand-ins.
+    models = ()
+
+    def model_list(self, include_hidden=False):
+        return SimpleNamespace(data=list(self.models))
 
     def thread_resume(self, thread_id, params=None):
         return SimpleNamespace(thread=SimpleNamespace(id=thread_id))
@@ -314,6 +321,50 @@ async def test_no_account_configured_fails_closed_without_starting_a_thread():
     assert fake.thread_start_params is None
     error = next(e for e in recorder.all if isinstance(e, AgentError))
     assert "codex login" in error.remediation
+
+
+@pytest.mark.asyncio
+async def test_listed_models_are_published_without_the_hidden_ones():
+    """``model/list``'s slugs are what a turn's ``model`` override takes, so
+    they are what the field suggests; a hidden one is not offered."""
+    fake = FakeCodexClient(config=None, approval_handler=None)
+    fake.models = (
+        SimpleNamespace(model="gpt-5", hidden=False),
+        SimpleNamespace(model="internal-eval", hidden=True),
+        SimpleNamespace(model="o3-mini", hidden=False),
+    )
+    recorder = EventRecorder()
+    session = CodexSession(
+        recorder, cwd="/proj/root", session_id="s", client_factory=lambda **kw: fake
+    )
+    await session.start()
+    try:
+        published = [e.models for e in recorder.all if isinstance(e, AgentModelsAvailable)]
+        assert published == [["gpt-5", "o3-mini"]]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_model_listing_still_leaves_the_session_ready():
+    """The list only feeds suggestions: ``model/list`` failing costs those
+    and nothing else."""
+    fake = FakeCodexClient(config=None, approval_handler=None)
+
+    def fail(include_hidden=False):
+        raise RuntimeError("model/list unavailable")
+
+    fake.model_list = fail
+    recorder = EventRecorder()
+    session = CodexSession(
+        recorder, cwd="/proj/root", session_id="s", client_factory=lambda **kw: fake
+    )
+    await session.start()
+    try:
+        assert session.agent_status() == AGENT_READY
+        assert not [e for e in recorder.all if isinstance(e, AgentModelsAvailable)]
+    finally:
+        await session.close()
 
 
 # ---------------------------------------------------------------------------

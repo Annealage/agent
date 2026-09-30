@@ -52,6 +52,7 @@ from .session.base import (
     AGENT_UNAVAILABLE,
     AgentError,
     AgentModelChanged,
+    AgentModelsAvailable,
     AgentStatus,
     PermissionResolved,
     SessionReset,
@@ -912,6 +913,10 @@ def _event_publisher(registry, event_log, session_info=None):
             _journal_agent_error(event, journaled)
         if session_info is not None and isinstance(event, AgentModelChanged):
             session_info["model"] = event.model
+        # The latest model list the same way as the model: a tab opened after
+        # the event left the replay ring still gets the field's suggestions.
+        if session_info is not None and isinstance(event, AgentModelsAvailable):
+            session_info["models"] = list(event.models)
         if session_info is not None and isinstance(event, AgentError):
             session_info["agent_error"] = {
                 "remediation": event.remediation,

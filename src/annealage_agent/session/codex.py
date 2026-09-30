@@ -107,6 +107,7 @@ from .base import (
     AGENT_UNAVAILABLE,
     AgentError,
     AgentModelChanged,
+    AgentModelsAvailable,
     AgentStatus,
     SandboxStatus,
     SessionReset,
@@ -472,6 +473,22 @@ class CodexSession:
             return
         self._remember_thread_id(thread_id)
         self._set_status(AGENT_READY)
+        # After READY: the list only feeds suggestions, so a slow listing
+        # must not hold the session at connecting.
+        await self._emit_available_models()
+
+    async def _emit_available_models(self) -> None:
+        """Publish the app-server's ``model/list`` (hidden models left out) as
+        the model slugs a turn's ``model`` override takes. A failure costs
+        only the field's suggestions."""
+        try:
+            listing = await self._run_blocking(self._client.model_list)
+        except Exception as exc:
+            sys.stderr.write("warning: could not list the codex models: %r\n" % (exc,))
+            return
+        models = [entry.model for entry in listing.data if not entry.hidden]
+        if models:
+            self._emit(AgentModelsAvailable(models=models))
 
     async def close(self) -> None:
         self._closing = True

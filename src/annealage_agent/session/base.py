@@ -417,6 +417,22 @@ class AgentModelChanged(AgentEvent):
 
 
 @dataclasses.dataclass(frozen=True)
+class AgentModelsAvailable(AgentEvent):
+    """The models the backend says this conversation can switch to, as the
+    strings ``set_model`` accepts (omp's ``provider/model``).
+
+    Emitted once a session has started and asked its backend. It is a list of
+    suggestions for the model field, not a limit on it: a backend may accept
+    a model it did not list, so the field stays free text. A backend with no
+    way to list its models never emits it.
+    """
+
+    kind: ClassVar[str] = "agent_models_available"
+    models: list
+    viewer: Optional[str] = None
+
+
+@dataclasses.dataclass(frozen=True)
 class SessionReset(AgentEvent):
     """Emitted when a requested resume (``-c``/``-r``) fails and the
     session falls back to starting fresh instead (plan section 3.4)."""
@@ -517,6 +533,7 @@ GENERIC_EVENTS = (
     ViewerPrimary,
     AgentStatus,
     AgentModelChanged,
+    AgentModelsAvailable,
     SessionReset,
     AgentError,
     ReviewChanged,

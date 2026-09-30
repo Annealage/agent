@@ -146,6 +146,7 @@ def build_hello(
     agent_error: Optional[dict] = None,
     usage: Optional[dict] = None,
     upload_actions: Optional[list] = None,
+    models: Optional[list] = None,
 ) -> dict:
     """The greeting sent once, immediately after a successful upgrade.
 
@@ -188,6 +189,10 @@ def build_hello(
     ``upload_actions`` are what the human can do with a document they upload
     (``uploads.UploadAction.to_wire``: ``name``, ``label``, ``accepts``), so
     the pane's attach button takes a PDF only when some action does.
+
+    ``models`` are the models the backend listed for the model field to
+    suggest, as the last ``AgentModelsAvailable`` said (empty before then, or
+    when the backend cannot list them).
     """
     return {
         "v": PROTOCOL_VERSION,
@@ -204,6 +209,7 @@ def build_hello(
             "steers": bool(steers),
             "usage": usage,
             "upload_actions": list(upload_actions or ()),
+            "models": list(models or ()),
         },
         "protocol": PROTOCOL_VERSION,
     }
