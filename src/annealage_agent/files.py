@@ -753,7 +753,17 @@ def safe_join(base, rel):
 # map's ".map", a stray ".py") is simply invisible to the scan and therefore
 # unreachable over HTTP, regardless of what it contains, so dropping a file
 # into that directory can never make it servable by accident.
-STATIC_EXTENSIONS = {".html", ".css", ".js", ".json"}
+#
+# ".svg" and ".woff2" are for a product's brand fonts, icons and marks (the
+# shared Workbench style, pulled in as lib/style and served from the
+# product's /static/style/). They are allowed here, in packaged static trees
+# (build_static_index), and nowhere else. A user's served directory reaches
+# the browser through ASSET_CONTENT_TYPES above, which names neither, so an
+# SVG dropped into images/ goes out as application/octet-stream; and through
+# a product's model index, which admits only its model extensions (Mesh's
+# MODEL_EXTENSIONS, .stl). That extension set is the guard there, not the
+# product's content-type table, which may well name ".svg".
+STATIC_EXTENSIONS = {".html", ".css", ".js", ".json", ".svg", ".woff2"}
 
 # A vendored dependency's licence ships as a bare "LICENSE" with no extension
 # (Mesh's vendored renderer licence, inside its static/js/vendor/). It is
@@ -782,6 +792,8 @@ STATIC_CONTENT_TYPES = {
     ".js": "text/javascript; charset=utf-8",
     ".css": "text/css; charset=utf-8",
     ".json": "application/json",
+    ".svg": "image/svg+xml",
+    ".woff2": "font/woff2",
 }
 
 

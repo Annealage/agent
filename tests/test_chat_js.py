@@ -6,8 +6,11 @@ What these pin is what the human sees at the edges of a connection: why the
 agent is down, for a page opened after it went down (the hello, since a
 replayed ``agent_error`` raises no banner); and a message that will not
 appear, refused or lost in a dropped connection, going back into the
-composer in front of whatever was typed since, with a toast saying so. The
-same harness shape as ``test_review_js.py``.
+composer in front of whatever was typed since, with a toast saying so. And the
+state a stylesheet reads off the pane element (``data-working``,
+``data-turn-started``, ``data-pending``) through a turn, its permission
+requests, a reconnect, a steer and a mid-turn connect; and a finished turn's
+meta line. The same harness shape as ``test_review_js.py``.
 """
 
 import json
@@ -186,6 +189,71 @@ out.cardAfterReconnect = pendingOf();
 chat.handleHello({ id: "another", agent: "ready" });
 out.cardsAfterNewSession = pendingOf();
 
+// The pane's state attributes, through a turn and its permission requests.
+let clock = 1000;
+Date.now = () => clock;
+const paneData = () => ({ ...el("chat").dataset });
+const live = { replayed: false };
+const replay = { replayed: true };
+out.paneIdle = paneData();
+chat.handleEvent({ kind: "user_turn", turn: 1, blocks: [{ type: "text", text: "go" }] }, live);
+out.paneStarted = paneData();
+clock = 2000;
+chat.handleEvent({ kind: "text_delta", turn: 1, text: "working" }, live);
+out.paneLater = paneData();
+chat.handleEvent({ kind: "permission_request", request_id: "pr_b_1", tool: "t", input: {} }, live);
+chat.handleEvent({ kind: "permission_request", request_id: "pr_b_2", tool: "t", input: {} }, live);
+out.paneTwoOpen = paneData();
+chat.handleEvent({ kind: "permission_resolved", request_id: "pr_b_1", outcome: "allow" }, live);
+out.paneOneOpen = paneData();
+chat.handleEvent({ kind: "permission_resolved", request_id: "pr_b_2", outcome: "deny" }, live);
+// A reconnect mid-turn: the replay repeats the turn, which keeps its start.
+clock = 3000;
+chat.handleHello({ id: "another", agent: "ready" });
+chat.handleEvent({ kind: "user_turn", turn: 1, blocks: [{ type: "text", text: "go" }] }, replay);
+out.paneAfterReconnect = paneData();
+chat.handleEvent({ kind: "turn_end", turn: 1, stop_reason: "end_turn", cost_usd: 0 }, live);
+out.paneEnded = paneData();
+// A turn the server ended as interrupted (an interrupt, or the agent gone).
+clock = 4000;
+chat.handleEvent({ kind: "user_turn", turn: 2, blocks: [{ type: "text", text: "again" }] }, live);
+out.paneSecondStarted = paneData();
+chat.handleEvent({ kind: "turn_end", turn: 2, stop_reason: "interrupted", cost_usd: 0 }, live);
+out.paneInterrupted = paneData();
+// An omp steer: the new turn is logged, then the running one ends "steered".
+clock = 10000;
+chat.handleEvent({ kind: "user_turn", turn: 3, blocks: [{ type: "text", text: "do x" }] }, live);
+clock = 70000;
+chat.handleEvent({ kind: "user_turn", turn: 4, blocks: [{ type: "text", text: "y too" }] }, live);
+chat.handleEvent({ kind: "turn_end", turn: 3, stop_reason: "steered", cost_usd: 0 }, live);
+out.paneSteered = paneData();
+chat.handleEvent({ kind: "turn_end", turn: 4, stop_reason: "end_turn", cost_usd: 0.0412,
+                   tokens: { input: 6120, output: 814 } }, live);
+out.paneSteerEnded = paneData();
+// The finished turns' meta lines: one span per part that is known.
+const metaEls = [];
+const collectMeta = (node) => {
+  for (const c of node.children || []) {
+    if (typeof c !== "object") continue;
+    if (c.className === "turnmeta") metaEls.push(c);
+    collectMeta(c);
+  }
+};
+collectMeta(el("chatLog"));
+const metaParts = (m) => m.children.map((c) => (typeof c === "string" ? c : [c.className, c.textContent]));
+out.metaSteered = metaParts(metaEls[metaEls.length - 2]);
+out.metaFull = metaParts(metaEls[metaEls.length - 1]);
+// A page that connects mid-turn: the replay is the first it hears of it.
+clock = 90000;
+chat.handleHello({ id: "third", agent: "ready" });
+chat.handleEvent({ kind: "user_turn", turn: 1, blocks: [{ type: "text", text: "hi" }] }, replay);
+chat.handleEvent({ kind: "text_delta", turn: 1, text: "on it" }, replay);
+chat.handleEvent({ kind: "permission_request", request_id: "pr_c_1", tool: "t", input: {} }, replay);
+out.paneMidTurnConnect = paneData();
+chat.handleEvent({ kind: "permission_resolved", request_id: "pr_c_1", outcome: "allow" }, replay);
+chat.handleEvent({ kind: "session_reset", reason: "new" }, live);
+out.paneAfterReset = paneData();
+
 console.log(JSON.stringify(out));
 process.exit(0);
 """
@@ -280,3 +348,40 @@ def test_a_new_connection_reconciles_the_cards_shown(observed):
     assert observed["cardAfterReconnect"] == [["pr_a_1", None]]
     # Another conversation: its cards are not this one's.
     assert observed["cardsAfterNewSession"] == []
+
+
+def test_the_pane_root_says_whether_a_turn_runs_since_when_and_what_waits(observed):
+    idle = {"pending": "0"}
+    running = {"working": "", "turnStarted": "1000", "pending": "0"}
+    assert observed["paneIdle"] == idle
+    # The start is when the live user_turn arrived, and stays put.
+    assert observed["paneStarted"] == running
+    assert observed["paneLater"] == running
+    assert observed["paneTwoOpen"] == {**running, "pending": "2"}
+    assert observed["paneOneOpen"] == {**running, "pending": "1"}
+    assert observed["paneAfterReconnect"] == running
+    assert observed["paneEnded"] == idle
+    assert observed["paneSecondStarted"] == {**running, "turnStarted": "4000"}
+    assert observed["paneInterrupted"] == idle
+    # A steer carries on the work the steered turn started.
+    assert observed["paneSteered"] == {**running, "turnStarted": "10000"}
+    assert observed["paneSteerEnded"] == idle
+    # Connected mid-turn: the start is when this page first saw the turn.
+    assert observed["paneMidTurnConnect"] == {
+        "working": "",
+        "turnStarted": "90000",
+        "pending": "1",
+    }
+    assert observed["paneAfterReset"] == idle
+
+
+def test_a_finished_turn_s_meta_is_a_span_per_known_part(observed):
+    assert observed["metaFull"] == [
+        ["turnstop", "end_turn"],
+        ", ",
+        ["turncost", "$0.0412"],
+        ", ",
+        ["turntokens", "6,120 in, 814 out"],
+    ]
+    # No tokens reported: no tokens part.
+    assert observed["metaSteered"] == [["turnstop", "steered"], ", ", ["turncost", "$0.0000"]]

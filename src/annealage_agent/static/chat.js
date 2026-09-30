@@ -354,6 +354,21 @@ function dollars(cost) {
   return "$" + cost.toFixed(cost < 1 ? 3 : 2);
 }
 
+// A finished turn's meta line as `[class, text]` parts, each only when known:
+// how it stopped (`turnstop`), what it cost (`turncost`) and its tokens
+// (`turntokens`). Drawn as one span per part, joined by ", ".
+function turnMeta(t) {
+  const parts = [];
+  if (t.stopReason) parts.push(["turnstop", t.stopReason]);
+  if (typeof t.costUsd === "number") parts.push(["turncost", "$" + t.costUsd.toFixed(4)]);
+  const tokens = t.tokens || {};
+  const counts = [];
+  if (typeof tokens.input === "number") counts.push(tokenCount(tokens.input) + " in");
+  if (typeof tokens.output === "number") counts.push(tokenCount(tokens.output) + " out");
+  if (counts.length) parts.push(["turntokens", counts.join(", ")]);
+  return parts;
+}
+
 /**
  * The conversation's usage (the hello's `session.usage`, or a live `usage`
  * event's figures) as the header shows it: `text`, how full the context
@@ -764,13 +779,20 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
       }
     }
 
-    if (t.complete) {
-      const tokens = t.tokens
-        ? " · " + t.tokens.input + " in / " + t.tokens.output + " out"
-        : "";
-      rec.metaEl.textContent = "Stop: " + t.stopReason + " · $" + t.costUsd.toFixed(4) + tokens;
-    } else {
-      rec.metaEl.textContent = "";
+    // Rebuilt only when it changes, since every render passes every turn.
+    const meta = t.complete ? turnMeta(t) : [];
+    const metaKey = meta.map(([cls, text]) => cls + ":" + text).join("\n");
+    if (rec.metaKey !== metaKey) {
+      rec.metaKey = metaKey;
+      const nodes = [];
+      meta.forEach(([cls, text], i) => {
+        if (i) nodes.push(", ");
+        const span = document.createElement("span");
+        span.className = cls;
+        span.textContent = text;
+        nodes.push(span);
+      });
+      rec.metaEl.replaceChildren(...nodes);
     }
   }
 
@@ -817,6 +839,9 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     actions.className = "pactions";
     const allowBtn = document.createElement("button");
     allowBtn.type = "button";
+    // A class of its own, like Deny's, so a page's theme can style Allow
+    // without depending on the order the buttons are appended in.
+    allowBtn.className = "allow";
     allowBtn.textContent = "Allow";
     const allowAlwaysBtn = document.createElement("button");
     allowAlwaysBtn.type = "button";
@@ -1074,6 +1099,53 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     chatInterruptBtn.disabled = !busy;
   }
 
+  // When each running turn started, in epoch ms, by turn number. The event
+  // log carries no times, so a turn's start is when this page first saw it
+  // running: for a live user_turn that is the moment it arrived, which is
+  // when the server began the turn. A page that connects mid-turn first sees
+  // it in the replay, so there the time is when this page connected, later
+  // than the true start by however long the turn had already run. A page
+  // that reconnects keeps the time it recorded before the drop, since the
+  // turn keeps its number.
+  const turnStarts = new Map();
+
+  // The pane's state for a stylesheet, on the pane element: `data-working`
+  // while a turn runs, `data-turn-started` its start (turnStarts above), and
+  // `data-pending` the count of open permission requests. Derived from the
+  // store like everything else here, so a replay, a reconnect, a session
+  // reset and a turn the server ended as interrupted (the agent stopped or
+  // went down) all leave them right without a case of their own.
+  function renderPaneState(chat) {
+    const running = chat.turns.filter((t) => !t.complete);
+    const now = Date.now();
+    for (const t of running) {
+      if (!turnStarts.has(t.turn)) turnStarts.set(t.turn, now);
+    }
+    // A steer does not restart the work. omp's steer logs the new turn first
+    // and then ends the running one as "steered", so the steered turn's start
+    // passes to the next running turn before the ended one is forgotten.
+    for (const t of chat.turns) {
+      if (t.stopReason !== "steered" || !turnStarts.has(t.turn)) continue;
+      const next = running.find((r) => r.turn > t.turn);
+      if (next) {
+        turnStarts.set(next.turn, Math.min(turnStarts.get(next.turn), turnStarts.get(t.turn)));
+      }
+    }
+    for (const turn of turnStarts.keys()) {
+      if (!running.some((t) => t.turn === turn)) turnStarts.delete(turn);
+    }
+    const data = chatPaneEl.dataset;
+    if (running.length) {
+      data.working = "";
+      // The earliest running turn, should more than one be open at once.
+      data.turnStarted = String(turnStarts.get(running[0].turn));
+    } else {
+      delete data.working;
+      delete data.turnStarted;
+    }
+    data.pending = String(chat.pending.length);
+  }
+
   function render() {
     const chat = store.getState().chat;
     renderTurns(chat);
@@ -1085,6 +1157,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     renderModel(chat);
     renderBanner(chat);
     renderInterrupt(chat);
+    renderPaneState(chat);
     renderAttachStrip(chat);
     renderSendButton(chat);
   }

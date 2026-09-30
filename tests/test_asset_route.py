@@ -145,13 +145,15 @@ async def test_asset_route_serves_non_image_extensions_as_octet_stream(client, s
     # file saved with an ".html" or ".svg" extension must never be labelled
     # as active content on this server's own origin, regardless of what it
     # actually contains, since that label is what would let a browser run
-    # it as script.
+    # it as script. That the packaged static trees serve ".svg" and ".woff2"
+    # (files.STATIC_CONTENT_TYPES) changes nothing here.
     images = served_dir / "images"
     images.mkdir()
     (images / "evil.html").write_text("<script>alert(1)</script>")
     (images / "evil.svg").write_text("<svg onload='alert(1)'></svg>")
+    (images / "font.woff2").write_bytes(b"wOF2\x00\x01\x00\x00")
 
-    for name in ("evil.html", "evil.svg"):
+    for name in ("evil.html", "evil.svg", "font.woff2"):
         res = await client.get("/asset/" + name)
         assert res.status_code == 200
         assert res.headers.get("Content-Type") == "application/octet-stream"

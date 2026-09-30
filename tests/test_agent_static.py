@@ -20,6 +20,8 @@ tree where a test has to plant or change a file.
 """
 
 import asyncio
+import base64
+import hashlib
 import os
 import time
 from pathlib import Path
@@ -123,6 +125,47 @@ async def test_the_agent_tree_and_the_products_never_answer_for_each_other(two_t
     # And a name only one tree has is reachable only under that tree's prefix.
     assert (await client.get("/static/chat.js")).status_code == 404
     assert (await client.get("/agent/static/viewer.html")).status_code == 404
+
+
+async def test_a_products_style_fonts_and_marks_are_served_under_the_apps_policy(tmp_path):
+    # A product's brand fonts, icons and marks (lib/style, under its
+    # /static/style/): typed so the page may load them, and under the same
+    # policy as every other response, so an SVG opened directly as a page is
+    # never sniffed into something else and its inline script does not run.
+    product_dir = tmp_path / "product_static"
+    (product_dir / "style").mkdir(parents=True)
+    inline = "alert(document.cookie)"
+    (product_dir / "style" / "mark.svg").write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg"><script>%s</script></svg>' % inline
+    )
+    (product_dir / "style" / "sans.woff2").write_bytes(b"wOF2\x00\x01\x00\x00")
+    served = tmp_path / "served"
+    served.mkdir()
+    app = agent_app.create_app(
+        served,
+        page_html=TOY_PAGE,
+        host=TEST_HOST,
+        port=DEFAULT_PORT,
+        register_routes=_toy_routes_with_a_static_tree(product_dir),
+    )
+    client = make_test_client(app)
+
+    for name, ctype in (("mark.svg", "image/svg+xml"), ("sans.woff2", "font/woff2")):
+        res = await client.get("/static/style/" + name)
+        assert res.status_code == 200, name
+        assert res.headers.get("Content-Type") == ctype, name
+        assert res.headers.get("X-Content-Type-Options") == "nosniff", name
+        policy = dict(
+            d.strip().split(" ", 1) for d in res.headers["Content-Security-Policy"].split(";")
+        )
+        assert policy["font-src"].split() == ["'self'"], name
+        assert "'self'" in policy["img-src"].split(), name
+        # Only the page's own inline scripts are hashed; nothing lets an
+        # arbitrary inline one run.
+        script_src = policy["script-src"].split()
+        assert "'unsafe-inline'" not in script_src, name
+        digest = hashlib.sha256(inline.encode("utf-8")).digest()
+        assert "'sha256-%s'" % base64.b64encode(digest).decode("ascii") not in script_src
 
 
 async def test_no_file_outside_the_agent_tree_is_reachable_through_it(two_trees):

@@ -21,12 +21,15 @@ def test_scan_static_indexes_only_allowed_extensions(tmp_path):
     (tmp_path / "main.js").write_text("console.log(1);")
     (tmp_path / "data.json").write_text("{}")
     (tmp_path / "index.html").write_text("<html></html>")
+    (tmp_path / "mark.svg").write_text("<svg></svg>")
+    (tmp_path / "sans.woff2").write_bytes(b"wOF2")
     (tmp_path / "notes.bak").write_text("not servable")
     (tmp_path / "source.map").write_text("not servable either")
+    (tmp_path / "sans.ttf").write_bytes(b"not servable: only woff2 is")
 
     entries, truncated = files.scan_static(tmp_path)
     rels = {e["rel"] for e in entries}
-    assert rels == {"app.css", "main.js", "data.json", "index.html"}
+    assert rels == {"app.css", "main.js", "data.json", "index.html", "mark.svg", "sans.woff2"}
     assert truncated is False
 
 
