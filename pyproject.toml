@@ -93,6 +93,10 @@ dependencies = [
     # tomli is the package it was vendored from, so the two parse identically;
     # this only backfills the gap on 3.10, which this project still supports.
     "tomli>=2;python_version<\"3.11\"",
+    # guides.py reads a skill's description out of its SKILL.md front matter,
+    # which is YAML (usually a folded scalar), so it is parsed rather than
+    # matched by hand. safe_load only; the `<7` cap is the usual next-major one.
+    "pyyaml>=6,<7",
 ]
 
 [project.optional-dependencies]

@@ -407,6 +407,20 @@ A packaged static tree (the agent layer's and a product's own `/static/`) serves
 
 The product can move comments itself: `store.update_anchors(move)` calls `move(comment)` for each comment, which returns its new anchor or `None` to leave it, and writes every move at once under the file's lock, announcing the change once. The anchors are stored as `move` gives them, not validated again. Loom uses it to keep a pin on the part it was placed on when a build moves the part. `JsonReviewStore` supports it (`Capabilities.can_update_anchors`); a store over a product's own format refuses it.
 
+## Guides
+
+`annealage_agent.guides` serves a product's long-form guidance to the agent on demand, so the system prompt only has to name it. `GuideSet(skills_dir, names=(...), extra={name: (description, loader)})` is the product's set: each of `names` is a skill at `<skills_dir>/<name>/SKILL.md` (its description is the `description` key of the file's YAML front matter, folded to one line), and each extra is a guide that isn't a file of that shape, a rules document or a module's docstring, with its one-line description and a `loader()` that returns the text. The text is read from the product's own install, never from the served directory, so a project can't plant its own.
+
+- `guides.index()` lists every installed guide with its description and its `##` sections. A guide whose file is missing is left out rather than failing the listing.
+- `guides.read(name)` is one guide whole and `guides.read(name, part)` one `##` section, found by exact title, else by prefix, else by substring. Headings inside code fences don't count. An unknown guide, an unknown or ambiguous section and a missing file each raise a `ValueError` that says what does exist, and `read()` with no name is the index.
+- `read_guide_tool(guides, description=None)` is the `@tool` to register in `build_tools` (`guides.TOOL_NAME`, `read_guide`) and grade read. It takes `name` (one of the guides) and `section`, reads the file off the event loop, and passes the `ValueError` messages to the model. `description` is the product's own wording for what its guides are.
+
+## Annealage Datum
+
+`annealage_agent.datum` is Annealage Datum (datasheets, application notes and the imported boards that use them) as a remote MCP server, with the grading every product shares because it is a fact about Datum's tools. `datum.remote(url)` returns the `RemoteServer` named `datum.SERVER` (`ds-wiki`, the key a repository's `.mcp.json` gives it): the lookups are read grade, `submit_datasheet` is write and so a card, `publish_reference`, `relate_documents` and `unrelate_documents` change what Datum holds for everyone and are excluded (absent, with no startup warning), and `getting_started` is the `prime` call, since Datum lists most of its tools only after it. A tool Datum adds that isn't graded here is left out with the remote's usual warning. `datum.DEFAULT_URL` is the hosted server.
+
+`datum.upload_action(project_tag)` is the chat pane's "Submit to Datum" button for an attached PDF (see Upload actions): `submit_datasheet` filing it as a datasheet under `project_tag`, the tag Datum lists a product's documents by.
+
 ## An agent in another process
 
 An agent that isn't embedded (another Claude Code session, say) reaches the product's tools through the stdio MCP bridge:
