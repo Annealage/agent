@@ -28,6 +28,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -499,6 +500,8 @@ def _listing(*pairs):
 
 async def _models_published(client_class, **kwargs):
     session, fake, recorder, broker = await _started_session(client_class=client_class, **kwargs)
+    # Listed after READY, beside the start rather than inside it.
+    await session._models_task
     await session.close()
     return [e.models for e in recorder.all if isinstance(e, AgentModelsAvailable)]
 
@@ -532,10 +535,54 @@ async def test_a_failed_model_listing_still_leaves_the_session_ready():
 
     session, fake, recorder, broker = await _started_session(client_class=FailingRpcClient)
     try:
+        await session._models_task
         assert session.agent_status() == AGENT_READY
         assert not [e for e in recorder.all if isinstance(e, AgentModelsAvailable)]
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_model_listing_omp_never_answers_holds_up_no_message_and_no_close():
+    """The listing waits beside the session's own calls, never ahead of them:
+    with omp not answering it (omp_rpc would wait out its 30 s request
+    timeout), a message sent the moment the page sees the agent ready still
+    reaches omp at once, and the session still closes at once."""
+    answer = threading.Event()
+
+    class SilentListingRpcClient(FakeRpcClient):
+        def get_available_models(self):
+            answer.wait()
+            return ()
+
+    fakes = []
+
+    def _client_factory(**client_kwargs):
+        fakes.append(SilentListingRpcClient(**client_kwargs))
+        return fakes[-1]
+
+    recorder = EventRecorder()
+    session = OmpSession(
+        recorder,
+        cwd="/proj/root",
+        session_id="toy-sess-1",
+        tool_table=_tool_table(),
+        client_factory=_client_factory,
+    )
+    start = asyncio.ensure_future(session.start())
+    try:
+        event = None
+        while not (isinstance(event, AgentStatus) and event.status == AGENT_READY):
+            event = await recorder.next(include_status=True)
+        await asyncio.wait_for(session.submit_turn(_text("hello")), 1.0)
+        assert [c.message for c in fakes[0].prompt_calls] == ["hello"]
+        await asyncio.wait_for(start, 1.0)
+        await asyncio.wait_for(session.close(), 1.0)
+        assert fakes[0].stopped
+    finally:
+        # Only now: the thread the listing holds is released, as omp_rpc's
+        # stop or its own request timeout would release it.
+        answer.set()
 
 
 def test_build_custom_provider_writes_the_given_env_var_name_as_apikey():

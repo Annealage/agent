@@ -142,6 +142,12 @@ _APPROVAL_METHOD_TOOL = {
     "item/fileChange/requestApproval": _TOOL_FILE_CHANGE,
 }
 
+# How long model/list after READY is waited for before the field's
+# suggestions are given up on. It is asked on a thread of its own, beside the
+# session's control calls rather than ahead of them (`_emit_available_models`),
+# so this bounds nothing a turn waits on, only a wait nothing else needs.
+_MODEL_LIST_TIMEOUT = 10.0
+
 
 class CodexSession:
     """An ``AgentSession`` driving a real ``openai_codex.client.CodexClient``.
@@ -241,6 +247,12 @@ class CodexSession:
         # short.
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="codex-session")
         self._drain_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="codex-drain")
+        # model/list's own pool and the task waiting on it, which close()
+        # cancels: an app-server slow to list its models must not queue a
+        # turn, an interrupt or the close behind that listing on the first
+        # pool (see _emit_available_models).
+        self._models_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="codex-models")
+        self._models_task: Optional[asyncio.Future] = None
 
     # -- AgentSession surface ------------------------------------------------
 
@@ -473,18 +485,35 @@ class CodexSession:
             return
         self._remember_thread_id(thread_id)
         self._set_status(AGENT_READY)
-        # After READY: the list only feeds suggestions, so a slow listing
-        # must not hold the session at connecting.
-        await self._emit_available_models()
+        # After READY, and not waited for: the list only feeds suggestions,
+        # so a slow listing holds up neither the start nor what is sent once
+        # the session is ready.
+        self._models_task = asyncio.ensure_future(self._emit_available_models())
 
     async def _emit_available_models(self) -> None:
         """Publish the app-server's ``model/list`` (hidden models left out) as
-        the model slugs a turn's ``model`` override takes. A failure costs
-        only the field's suggestions."""
+        the model slugs a turn's ``model`` override takes.
+
+        Asked on ``self._models_executor``, beside the calls on
+        ``self._executor`` rather than queued ahead of them: ``CodexClient``
+        sends each request under its own id and its one reader thread hands
+        each response to the waiter registered for that id, so a second
+        thread's request waits on nothing but its own answer. A listing that
+        fails, or has not answered within ``_MODEL_LIST_TIMEOUT``, costs only
+        the field's suggestions, so it is dropped without a word; a thread
+        still waiting on one (the client's own wait has no timeout) is
+        released when close() closes the client (its reader, seeing the
+        app-server's stdout end, fails every waiter), and close() does not
+        wait for it. A session closed meanwhile publishes nothing."""
+        loop = asyncio.get_running_loop()
         try:
-            listing = await self._run_blocking(self._client.model_list)
-        except Exception as exc:
-            sys.stderr.write("warning: could not list the codex models: %r\n" % (exc,))
+            listing = await asyncio.wait_for(
+                loop.run_in_executor(self._models_executor, self._client.model_list),
+                _MODEL_LIST_TIMEOUT,
+            )
+        except Exception:
+            return
+        if self._closing:
             return
         models = [entry.model for entry in listing.data if not entry.hidden]
         if models:
@@ -492,6 +521,8 @@ class CodexSession:
 
     async def close(self) -> None:
         self._closing = True
+        if self._models_task is not None:
+            self._models_task.cancel()
         if self._broker is not None:
             # Before the client goes, while there is still a socket to carry
             # the denial event and while the RPC it belongs to can still get
@@ -505,6 +536,10 @@ class CodexSession:
         self._client = None
         self._executor.shutdown(wait=True)
         self._drain_executor.shutdown(wait=True)
+        # Not waited for: a listing the app-server never answered holds its
+        # thread until the close above fails it, and nothing needs that
+        # answer now.
+        self._models_executor.shutdown(wait=False)
         self._set_status(AGENT_UNAVAILABLE)
 
     def _mcp_config_overrides(self) -> tuple:
@@ -681,6 +716,8 @@ class CodexSession:
         ``turn_start``, ``turn_interrupt``, ``close`` and the login calls.
         Turn-notification draining deliberately does NOT use this helper;
         see the module docstring for why it has its own executor instead.
+        Nor does ``model/list``, for the same reason on a smaller scale (see
+        ``_emit_available_models``).
         """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, functools.partial(func, *args, **kwargs))

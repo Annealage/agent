@@ -53,7 +53,10 @@ guarantee the wire protocol doc does not mention: ``RpcClient`` spawns a
 *fresh daemon thread per host-tool call* (`client.py`'s
 ``_handle_host_tool_call``), so blocking one tool's ``execute`` callback on a
 human decision never blocks the shared reader thread or any other concurrent
-tool call the way it would if execution ran inline.
+tool call the way it would if execution ran inline. The one request kept off
+``self._executor`` is the model listing after READY, on a pool of its own
+(``_emit_available_models``): the suggestions it fetches are worth no wait,
+so an omp slow to answer it must not queue a prompt or an abort behind it.
 
 **Permission design -- two independent, broker-backed gates, not one.** The
 ticket's approach sketch flags ``extension_ui_request{method:"confirm"}`` as
@@ -263,6 +266,12 @@ _DEFAULT_MODEL_ID = "default"
 # comment because the next reader of `start()` should not have to check
 # `omp_rpc.client` to learn there is no override happening.
 
+# How long the model listing after READY is waited for before the field's
+# suggestions are given up on. It is asked on a thread of its own, beside the
+# session's control calls rather than ahead of them (`_emit_available_models`),
+# so this bounds nothing a turn waits on, only a wait nothing else needs.
+_MODEL_LIST_TIMEOUT = 10.0
+
 
 class OmpSession:
     """An ``AgentSession`` driving a real ``omp_rpc.RpcClient``.
@@ -400,6 +409,12 @@ class OmpSession:
         # (start/stop/prompt/abort/get_state); see this module's docstring
         # on why no second "drain" pool is needed the way Codex's is.
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omp-session")
+        # The model listing's own pool and the task waiting on it, which
+        # close() cancels: an omp slow to list its models must not queue a
+        # prompt, an abort or the stop behind that listing on the pool above
+        # (see _emit_available_models).
+        self._models_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omp-models")
+        self._models_task: Optional[asyncio.Future] = None
 
     # -- AgentSession surface -------------------------------------------------
 
@@ -754,19 +769,35 @@ class OmpSession:
         if self._usage is not None and any(self._usage.values()):
             await self._emit_usage(self._usage, state)
         self._set_status(AGENT_READY)
-        # After READY: the list only feeds suggestions, so a slow listing
-        # must not hold the session at connecting.
-        await self._emit_available_models()
+        # After READY, and not waited for: the list only feeds suggestions,
+        # so a slow listing holds up neither the start nor what is sent once
+        # the session is ready.
+        self._models_task = asyncio.ensure_future(self._emit_available_models())
 
     async def _emit_available_models(self) -> None:
         """Publish ``get_available_models`` as the strings ``set_model``
         takes: ``provider/model``, or the bare model id of this run's own
-        provider when ``omp_base_url`` pins one. A failure costs only the
-        field's suggestions."""
+        provider when ``omp_base_url`` pins one.
+
+        Asked on ``self._models_executor``, beside the calls on
+        ``self._executor`` rather than queued ahead of them: ``RpcClient``
+        sends each request under its own id and its one reader thread hands
+        each response to the request with that id, so a second thread's
+        request waits on nothing but its own answer. A listing that fails, or
+        has not answered within ``_MODEL_LIST_TIMEOUT``, costs only the
+        field's suggestions, so it is dropped without a word; a thread still
+        waiting on one is released when close() stops the client
+        (``RpcClient.stop`` fails every pending request), and close() does
+        not wait for it. A session closed meanwhile publishes nothing."""
+        loop = asyncio.get_running_loop()
         try:
-            infos = await self._run_blocking(self._client.get_available_models)
-        except Exception as exc:
-            sys.stderr.write("warning: could not list the omp models: %r\n" % (exc,))
+            infos = await asyncio.wait_for(
+                loop.run_in_executor(self._models_executor, self._client.get_available_models),
+                _MODEL_LIST_TIMEOUT,
+            )
+        except Exception:
+            return
+        if self._closing:
             return
         if self._base_url:
             models = [info.id for info in infos if info.provider == _provider_id()]
@@ -832,6 +863,8 @@ class OmpSession:
 
     async def close(self) -> None:
         self._closing = True
+        if self._models_task is not None:
+            self._models_task.cancel()
         if self._broker is not None:
             # Before the client goes, while there is still a socket to carry
             # the denial event and while the RPC it belongs to can still get
@@ -844,6 +877,9 @@ class OmpSession:
                 sys.stderr.write("warning: agent client did not close cleanly: %r\n" % (exc,))
         self._client = None
         self._executor.shutdown(wait=True)
+        # Not waited for: a listing omp never answered holds its thread until
+        # the stop above fails it, and nothing needs that answer now.
+        self._models_executor.shutdown(wait=False)
         self._discard_agent_dir()
         self._set_status(AGENT_UNAVAILABLE)
 
@@ -1126,7 +1162,8 @@ class OmpSession:
 
     async def _run_blocking(self, func, *args, **kwargs):
         """Run one blocking ``RpcClient`` call on ``self._executor``. The one
-        helper every one-shot call in this file uses, mirroring
+        helper every one-shot call in this file but the model listing
+        (``_emit_available_models``) uses, mirroring
         ``CodexSession._run_blocking``."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, functools.partial(func, *args, **kwargs))

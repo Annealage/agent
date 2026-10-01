@@ -330,6 +330,26 @@ async def test_a_fresh_connection_gets_the_models_the_backend_listed(served_dir)
     assert hello["session"]["models"] == ["titan/qwen3.9-70b", "anthropic/claude-opus-4"]
 
 
+async def test_a_reload_replacing_a_session_that_went_down_offers_none_of_its_models(served_dir):
+    """The list is the session's own: the reload that replaces a session that
+    went down is greeted before the new one has listed anything, so its hello
+    offers no models rather than the old session's, and the new session's
+    own list reaches the next one."""
+    from annealage_agent.session.base import AgentModelsAvailable, AgentStatus
+
+    app, session = _app_with_fake_session(served_dir)
+    session.emit(AgentModelsAvailable(models=["titan/qwen3.9-70b"]))
+    session.set_status("unavailable")
+    session.emit(AgentStatus(status="unavailable"))
+
+    reload = await _hello_of(app)
+    replacement = app.agent_session
+    assert replacement is not session and reload["session"]["models"] == []
+
+    replacement.emit(AgentModelsAvailable(models=["anthropic/claude-opus-4"]))
+    assert (await _hello_of(app))["session"]["models"] == ["anthropic/claude-opus-4"]
+
+
 async def test_a_page_opened_while_the_agent_is_down_is_told_why(served_dir):
     """The page raises no banner from a replayed ``agent_error``, so a tab
     opened after the agent failed to start (omp not logged in) would show an

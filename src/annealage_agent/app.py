@@ -897,7 +897,9 @@ def _event_publisher(registry, event_log, session_info=None):
     The latest ``Usage`` is kept as ``session_info["usage"]`` for the same
     reason: the page takes its usage from the ``hello`` and live events only;
     a ``SessionReset`` clears it, since the new conversation has used nothing
-    the backend has reported yet.
+    the backend has reported yet. The latest ``AgentModelsAvailable`` is kept
+    as ``session_info["models"]`` likewise, until ``AgentHolder.install``
+    drops it with the session that listed it.
 
     Every ``AgentError`` is also written to this process's stderr
     (``_journal_agent_error``), so a service's journal says why its agent is
@@ -915,6 +917,8 @@ def _event_publisher(registry, event_log, session_info=None):
             session_info["model"] = event.model
         # The latest model list the same way as the model: a tab opened after
         # the event left the replay ring still gets the field's suggestions.
+        # It belongs to the session that listed it (AgentHolder.install drops
+        # it with that session), not to the conversation.
         if session_info is not None and isinstance(event, AgentModelsAvailable):
             session_info["models"] = list(event.models)
         if session_info is not None and isinstance(event, AgentError):
@@ -928,7 +932,9 @@ def _event_publisher(registry, event_log, session_info=None):
         if session_info is not None and isinstance(event, Usage):
             session_info["usage"] = event.snapshot()
         if session_info is not None and isinstance(event, SessionReset):
-            # A new conversation: the old one's usage is not its.
+            # A new conversation: the old one's usage is not its. The model
+            # list stays: the same session, on the same backend, can switch
+            # to the same models whichever conversation it is in.
             session_info["usage"] = None
         seq = event_log.append(event)
         frame = protocol.build_event(seq, event.to_wire())
@@ -1158,6 +1164,11 @@ class AgentHolder:
         self.session = session
         self._down = False
         self._app.agent_session = session
+        # The session gone (if any) takes the models it listed with it, so the
+        # hello of the reload that replaced it does not offer them: the new
+        # session publishes its own once started, and until then there are
+        # none (the hello's empty list), as at startup.
+        self._session_info["models"] = None
         if session is None:
             self._session_info["agent"] = AGENT_UNAVAILABLE
             return

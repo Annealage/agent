@@ -339,6 +339,8 @@ async def test_listed_models_are_published_without_the_hidden_ones():
     )
     await session.start()
     try:
+        # Listed after READY, beside the start rather than inside it.
+        await session._models_task
         published = [e.models for e in recorder.all if isinstance(e, AgentModelsAvailable)]
         assert published == [["gpt-5", "o3-mini"]]
     finally:
@@ -361,10 +363,46 @@ async def test_a_failed_model_listing_still_leaves_the_session_ready():
     )
     await session.start()
     try:
+        await session._models_task
         assert session.agent_status() == AGENT_READY
         assert not [e for e in recorder.all if isinstance(e, AgentModelsAvailable)]
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_model_listing_codex_never_answers_holds_up_no_turn_and_no_close():
+    """The listing waits beside the session's own calls, never ahead of them:
+    with the app-server not answering ``model/list`` (CodexClient's own wait
+    for an answer has no timeout), a turn sent the moment the page sees the
+    agent ready still reaches Codex at once, and the session still closes at
+    once."""
+    answer = threading.Event()
+    fake = FakeCodexClient(config=None, approval_handler=None)
+
+    def never_answers(include_hidden=False):
+        answer.wait()
+        return SimpleNamespace(data=[])
+
+    fake.model_list = never_answers
+    recorder = EventRecorder()
+    session = CodexSession(
+        recorder, cwd="/proj/root", session_id="s", client_factory=lambda **kw: fake
+    )
+    start = asyncio.ensure_future(session.start())
+    try:
+        event = None
+        while not (isinstance(event, AgentStatus) and event.status == AGENT_READY):
+            event = await recorder.next(include_status=True)
+        await asyncio.wait_for(session.submit_turn([{"type": "text", "text": "hello"}]), 1.0)
+        assert [call.turn_id for call in fake.turn_start_calls] == ["turn-1"]
+        await asyncio.wait_for(start, 1.0)
+        await asyncio.wait_for(session.close(), 1.0)
+        assert fake.closed
+    finally:
+        # Only now: the thread the listing holds is released, as the real
+        # client's close (its reader failing every waiter) would release it.
+        answer.set()
 
 
 # ---------------------------------------------------------------------------
