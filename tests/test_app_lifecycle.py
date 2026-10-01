@@ -170,9 +170,12 @@ async def test_an_idle_app_closes_and_a_page_connecting_resumes_a_new_session(se
         assert app.agent_status()["agent"] == AGENT_READY
         await app.agent_registry.remove(conn)
 
+        # The status reads closed from the moment the sweep takes the session
+        # away; the close itself runs in a task of its own, so wait for it.
         await _until(lambda: app.agent_status()["agent"] == agent_app.AGENT_CLOSED)
         first = built[0]
-        assert first.closed == 1 and app.agent_session is None
+        await _until(lambda: first.closed == 1)
+        assert app.agent_session is None
         denied = await first.broker.ask("mcp__toy__add_note", {"text": "late"}, None)
         assert not denied.allow and "shutting down" in denied.message
 
@@ -290,7 +293,7 @@ async def test_a_turn_the_agent_that_went_down_left_running_ends_when_it_is_repl
         ended = [(e["turn"], e["stop_reason"]) for e in _logged(app, "turn_end")]
         assert ended == [(1, "interrupted")]
         await _until(lambda: app.agent_status()["agent"] == agent_app.AGENT_CLOSED)
-        assert second.closed == 1
+        await _until(lambda: second.closed == 1)
     finally:
         await app.agent_stop()
 
