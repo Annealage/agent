@@ -266,6 +266,9 @@ class SdkSession:
         # model interrupts the turn, and that turn ends as ended_by_tool.
         self._end_turn_pending = False
         self._stop_reason = None
+        # Set by ``interrupt`` until the turn's result arrives: that result is
+        # marked an error, but one this side asked for.
+        self._interrupted = False
         # The model and prompt size (tokens) of the last main-conversation API
         # call, which is how full the context window is (``_usage``).
         self._last_call: Optional[Tuple[str, int]] = None
@@ -368,6 +371,7 @@ class SdkSession:
             )
             return
         self._turn += 1
+        self._interrupted = False
         try:
             loop = asyncio.get_running_loop()
             expanded = await loop.run_in_executor(
@@ -410,6 +414,7 @@ class SdkSession:
     async def interrupt(self) -> None:
         if self._client is None:
             return
+        self._interrupted = True
         try:
             await self._client.interrupt()
         except Exception as exc:
@@ -803,6 +808,19 @@ class SdkSession:
         if isinstance(message, ResultMessage):
             self._remember_sdk_session(getattr(message, "session_id", None))
             cost, tokens = self._turn_figures(message)
+            reason = message.result or "\n".join(message.errors or ()) or message.subtype or ""
+            interrupted = self._interrupted or getattr(message, "terminal_reason", None) in (
+                "aborted_streaming",
+                "aborted_tools",
+            )
+            self._interrupted = False
+            if message.is_error and not interrupted:
+                # The CLI ends a failed turn (an expired login, an API error,
+                # the turn limit) with an ordinary result whose text is the
+                # only reason given, so without this the chat sees a turn end
+                # and nothing else. An interrupted turn also ends as an error,
+                # but it is one the human or a tool asked for.
+                self._emit(AgentError(stderr=reason, remediation=_result_remediation(reason)))
             self._emit(
                 TurnEnd(
                     turn=self._turn,
@@ -1177,6 +1195,17 @@ def _context_window(model_usage, model: str) -> Optional[int]:
             None,
         )
     return _count(entry.get("contextWindow")) if isinstance(entry, dict) else None
+
+
+def _result_remediation(text: str) -> str:
+    """What to do about a turn the CLI ended as an error, given its text."""
+    lowered = text.lower()
+    if "authenticate" in lowered or "login" in lowered or "oauth" in lowered:
+        return (
+            "Claude is not logged in, or its login has expired: run `claude /login` "
+            "in a terminal, then send the message again"
+        )
+    return "the Claude CLI ended this turn with an error; the session otherwise remains ready"
 
 
 def _remediation_for(exc: BaseException) -> str:
