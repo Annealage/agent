@@ -692,11 +692,11 @@ async def test_result_message_becomes_turn_end_with_its_cost():
 
 
 @pytest.mark.asyncio
-async def test_a_failed_result_is_still_a_plain_turn_end_but_the_session_keeps_why():
+async def test_a_failed_result_is_reported_and_the_session_keeps_why():
     """A result with ``is_error`` (an API failure the CLI reports with subtype
-    ``success``) reaches pages as the same ``TurnEnd`` as ever, with no extra
-    event; ``last_result_error`` is where a headless run reads the failure,
-    and the next clean result clears it."""
+    ``success``) raises an ``AgentError`` with the CLI's words ahead of its
+    ``TurnEnd``; ``last_result_error`` is where a headless run reads the
+    failure, and the next clean result clears it."""
     session, transport, recorder = await _started_session()
     try:
         session._turn = 1
@@ -723,10 +723,12 @@ async def test_a_failed_result_is_still_a_plain_turn_end_but_the_session_keeps_w
 
         session._emit = emit
         transport.push(failed)
+        error = await recorder.next()
+        assert isinstance(error, AgentError)
+        assert error.stderr == "API Error: overloaded (API status 529)"
         end = await recorder.next()
         assert isinstance(end, TurnEnd) and end.stop_reason == "end_turn"
         assert seen_at_turn_end == ["API Error: overloaded (API status 529)"]
-        assert not any(isinstance(event, AgentError) for event in recorder.all)
 
         transport.push(dict(failed, is_error=False, total_cost_usd=0.1))
         while True:
@@ -734,6 +736,68 @@ async def test_a_failed_result_is_still_a_plain_turn_end_but_the_session_keeps_w
             if isinstance(event, TurnEnd) and event.cost_usd > 0:
                 break
         assert session.last_result_error is None
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_error_result_raises_agent_error_with_the_cli_text():
+    """A turn the CLI ends as an error (here an expired login, as the CLI
+    reports it) tells the chat why, then still ends the turn."""
+    session, transport, recorder = await _started_session()
+    try:
+        session._turn = 1
+        message = _result(0.0)
+        message.update(
+            is_error=True,
+            stop_reason="stop_sequence",
+            result="Failed to authenticate: OAuth session expired and could not be refreshed",
+        )
+        transport.push(message)
+        error = await recorder.next()
+        assert isinstance(error, AgentError)
+        assert "OAuth session expired" in error.stderr
+        assert "claude /login" in error.remediation
+        end = await recorder.next()
+        assert isinstance(end, TurnEnd)
+        assert end.turn == 1
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_error_result_without_text_reports_its_errors():
+    """The CLI's error subtypes give their reason in ``errors``, not ``result``."""
+    session, transport, recorder = await _started_session()
+    try:
+        session._turn = 1
+        message = _result(0.0)
+        message.update(
+            subtype="error_max_turns", is_error=True, errors=["Reached maximum number of turns (3)"]
+        )
+        transport.push(message)
+        error = await recorder.next()
+        assert isinstance(error, AgentError)
+        assert "maximum number of turns" in error.stderr
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_turn_raises_no_agent_error():
+    """A turn this side interrupted (Stop, or a tool ending the turn) ends as
+    an error result, but it is no failure to report."""
+    session, transport, recorder = await _started_session()
+    try:
+        session._turn = 1
+        await session.interrupt()
+        message = _result(0.0)
+        message.update(
+            subtype="error_during_execution", is_error=True, errors=["[ede_diagnostic] aborted"]
+        )
+        transport.push(message)
+        assert isinstance(await recorder.next(), TurnEnd)
+        assert not any(isinstance(event, AgentError) for event in recorder.all)
     finally:
         await session.close()
 

@@ -293,11 +293,13 @@ class _Run:
             self.stop_reason = event.stop_reason
             self.cost_usd = event.cost_usd
             self.tokens = event.tokens
-            # A Claude result that said it failed (an API error, say) is still a
-            # TurnEnd on the wire; the session keeps why, read here.
+            # A Claude result that said it failed (an API error, say) ends with
+            # a TurnEnd like any other; the session keeps why, read here. Its
+            # AgentError has usually added the same text already.
             failure = getattr(self.session, "last_result_error", None)
             if failure:
-                self.errors.append(failure)
+                if failure not in self.errors:
+                    self.errors.append(failure)
                 self.stop_reason = "error"
             self.done.set()
 
