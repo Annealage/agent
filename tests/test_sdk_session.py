@@ -691,6 +691,53 @@ async def test_result_message_becomes_turn_end_with_its_cost():
         await session.close()
 
 
+@pytest.mark.asyncio
+async def test_a_failed_result_is_still_a_plain_turn_end_but_the_session_keeps_why():
+    """A result with ``is_error`` (an API failure the CLI reports with subtype
+    ``success``) reaches pages as the same ``TurnEnd`` as ever, with no extra
+    event; ``last_result_error`` is where a headless run reads the failure,
+    and the next clean result clears it."""
+    session, transport, recorder = await _started_session()
+    try:
+        session._turn = 1
+        failed = {
+            "type": "result",
+            "subtype": "success",
+            "duration_ms": 1,
+            "duration_api_ms": 1,
+            "is_error": True,
+            "num_turns": 1,
+            "session_id": "sdk-sess-1",
+            "stop_reason": "end_turn",
+            "total_cost_usd": 0.0,
+            "result": "API Error: overloaded",
+            "api_error_status": 529,
+        }
+        seen_at_turn_end = []
+        real_emit = session._emit
+
+        def emit(event):
+            if isinstance(event, TurnEnd):
+                seen_at_turn_end.append(session.last_result_error)
+            real_emit(event)
+
+        session._emit = emit
+        transport.push(failed)
+        end = await recorder.next()
+        assert isinstance(end, TurnEnd) and end.stop_reason == "end_turn"
+        assert seen_at_turn_end == ["API Error: overloaded (API status 529)"]
+        assert not any(isinstance(event, AgentError) for event in recorder.all)
+
+        transport.push(dict(failed, is_error=False, total_cost_usd=0.1))
+        while True:
+            event = await recorder.next()
+            if isinstance(event, TurnEnd) and event.cost_usd > 0:
+                break
+        assert session.last_result_error is None
+    finally:
+        await session.close()
+
+
 def _result(total_cost_usd, model_usage=None):
     message = {
         "type": "result",

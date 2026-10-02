@@ -15,6 +15,8 @@ Layout:
     app.py         generic app assembly (routes, CSP, security headers, event
                    publisher, tool server, session) and serve()
     launch.py      the backend switch: one broker, one session per run
+    headless.py    run_prompt: one prompt as one turn of a private session
+                   with no human, for a product's batch sub-agents
     tools.py       ToolSpec, READ/VIEW/WRITE Grading, ok/fail, the pause gate,
                    failure mapping, ToolServer (SDK server, pre-allowed list,
                    tool_table)
@@ -47,3 +49,21 @@ This code was developed inside Annealage Mesh and extracted from it (Mesh
 commit 59036ba). Comments that cite "plan section N", a ``planning/`` file or
 ``docs/agent-chat-plan.md`` refer to that repository's design records.
 """
+
+# ``run_prompt``, ``RunResult`` and ``ToolSet`` (``headless.py``) are the
+# package's one public import path for a headless run. They resolve on first
+# use, because ``headless`` imports the Claude SDK and a viewer-only run, or
+# anything else that only imports a submodule, must not pay for that.
+_HEADLESS = ("run_prompt", "RunResult", "ToolSet")
+
+
+def __getattr__(name):
+    if name in _HEADLESS:
+        from . import headless
+
+        return getattr(headless, name)
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_HEADLESS))

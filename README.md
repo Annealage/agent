@@ -429,6 +429,32 @@ An agent that isn't embedded (another Claude Code session, say) reaches the prod
 
 with the run's agent token in its environment as `ANNEALAGE_AGENT_TOKEN`. Build the app with `create_app(external_agents=True)` and this works in viewer-only mode too: the run then has no conversation, but its write-grade calls still reach the page as cards.
 
+## A prompt with no human
+
+For a batch step that wants a sub-agent (review a sheet, summarise a file) and has no page, `run_prompt` runs one prompt as one turn of a private session and returns the result:
+
+```python
+from annealage_agent import RunResult, ToolSet, run_prompt
+from annealage_agent.tools import Grading
+
+result: RunResult = await run_prompt(
+    "Check the sheet against the datasheet, then call submit_result.",
+    tools=ToolSet(tools=[...], grading=Grading(read=(...), view=(), write=("submit_result",)),
+                  grant=("submit_result",)),
+    backend="omp",            # "omp" or "claude"; "codex" is refused
+    model="provider/model",   # required: there is no default for a batch run
+    cwd=scratch_dir,          # an empty directory you own; only the backend's working directory
+    timeout=300,              # seconds for the whole run
+    system="Be terse.",       # optional, appended to the backend's system prompt
+)
+```
+
+`ToolSet` is built per call (handlers close over your per-run data) and checked like a product's tool server. A tool marked `asks_the_human` is refused, since there is nobody to ask. Grading decides everything: read and view tools are pre-allowed, and a write-grade tool is refused with a reason the model reads unless its name is in `grant`, which holds for this run only and is never remembered. On Claude the session has no built-in tools (no Bash or Write), loads no settings files, runs no sandbox and passes `--no-session-persistence`, so the conversation is not written under `~/.claude/projects`; on omp every built-in is already off. A product must be installed, as for a tool server.
+
+`RunResult` has `text` (what the model said after its last tool result, so the narration before and between tool calls is dropped), `stop_reason`, `cost_usd`, `tokens`, `error` and `calls`, the `(tool name, ok)` pairs of the tools it called, with no arguments or results. A model or backend failure (a Claude result that reports an API error included), a timeout included (`error="timeout"`), or a backend that cannot be built (omp_rpc not installed), comes back as `error`; `run_prompt` raises only `ValueError` for a bad argument, and `CancelledError` if you cancel it, after closing the session. Session state lives in a temporary directory that is removed afterwards.
+
+When a run ends early (timeout or cancel), further tool calls are refused, handlers still running are cancelled and waited for (up to 5 seconds, so their cleanup is done before `run_prompt` returns), the backend process is killed and the close is bounded at 10 seconds. A handler blocked inside a synchronous call cannot be stopped and finishes on its own thread, so keep per-run handlers free of that. `omp_agent_dir`, `omp_binary` and `omp_config_dir` take the omp profile, executable and config root, as `launch.build_session` does.
+
 ## Signing in by tailnet login
 
 Behind `tailscale serve`, the human can be a person rather than whoever holds the link. Serve adds `Tailscale-User-Login` and `Tailscale-User-Name` to every request it proxies from a tailnet device, WebSocket upgrades included, and replaces any copy the browser sent. Give `create_app` (and `FrontDoor`) an `identity`, and a login on it is the human, by name, beside the token:

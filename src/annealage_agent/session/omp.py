@@ -883,6 +883,24 @@ class OmpSession:
         self._discard_agent_dir()
         self._set_status(AGENT_UNAVAILABLE)
 
+    async def kill(self) -> None:
+        """Stop `omp`'s process now, off the session's worker thread.
+
+        ``close`` stops the client on that one worker, behind whatever
+        blocking call it is running, which for a ``start`` still waiting on
+        omp's ready signal is up to ``RpcClient``'s startup timeout. A caller
+        giving up on a session (``headless.run_prompt``'s timeout) calls this
+        first: ending the process fails the blocked call, so ``close`` then
+        has nothing left to wait for. Safe to call at any point, and before
+        ``close``, which still runs as usual."""
+        client = self._client
+        if client is None:
+            return
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, client.stop)
+        except Exception as exc:
+            sys.stderr.write("warning: could not stop the omp process: %r\n" % (exc,))
+
     def _discard_agent_dir(self) -> None:
         if self._temp_agent_dir is not None:
             shutil.rmtree(self._temp_agent_dir, ignore_errors=True)

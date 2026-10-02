@@ -195,6 +195,17 @@ class SdkSession:
     silently remove the human's approval card. Empty (the default) pre-allows
     nothing, so every tool call reaches the broker.
 
+    ``setting_sources`` is which of the CLI's settings files it loads
+    (``SETTING_SOURCES``, all three, by default); a headless run passes none,
+    so nothing in the working directory or the user's own configuration can
+    add a rule, a hook or a tool. ``builtin_tools`` is the CLI's built-in
+    tool set: ``None`` (the default) leaves the CLI's own, a list names the
+    only ones available, and an empty one removes every built-in (Bash,
+    Write and the rest), leaving the MCP tools alone. ``persist_session``
+    false passes the CLI's ``--no-session-persistence``, so the conversation
+    (prompt, replies, tool arguments and results) is not written under
+    ``~/.claude/projects`` and cannot be resumed; a headless run uses it.
+
     ``usage`` is what a resumed conversation had used before this session,
     in ``Usage.snapshot()``'s shape (launch passes the event log's last
     ``usage``), or None. The CLI's results carry the conversation's running
@@ -223,6 +234,9 @@ class SdkSession:
         write_protected=None,
         turn: int = 0,
         usage: Optional[dict] = None,
+        setting_sources=SETTING_SOURCES,
+        builtin_tools=None,
+        persist_session=True,
     ):
         self._on_event = on_event
         self.cwd = str(cwd)
@@ -234,6 +248,9 @@ class SdkSession:
         self._permission_mode = permission_mode
         self._resume = resume
         self._sandbox_requested = bool(sandbox)
+        self._setting_sources = tuple(setting_sources)
+        self._builtin_tools = list(builtin_tools) if builtin_tools is not None else None
+        self._persist_session = bool(persist_session)
         self._mcp_servers = mcp_servers or {}
         self._allowed_tools = tuple(allowed_tools)
         self._transport = transport
@@ -266,6 +283,11 @@ class SdkSession:
         # model interrupts the turn, and that turn ends as ended_by_tool.
         self._end_turn_pending = False
         self._stop_reason = None
+        # Why the last result said it failed (``ResultMessage.is_error``: an API
+        # error, say, which the CLI reports with subtype ``success``), or None
+        # for a clean one. Set before that result's ``TurnEnd`` is emitted, which
+        # is no different on the wire; ``headless.run_prompt`` reads it there.
+        self.last_result_error: Optional[str] = None
         # The model and prompt size (tokens) of the last main-conversation API
         # call, which is how full the context window is (``_usage``).
         self._last_call: Optional[Tuple[str, int]] = None
@@ -519,7 +541,7 @@ class SdkSession:
         allowed = list(self._allowed_tools)
         kwargs = {
             "cwd": self.cwd,
-            "setting_sources": list(SETTING_SOURCES),
+            "setting_sources": list(self._setting_sources),
             "allowed_tools": allowed,
             # Token-level streaming. Without this only whole assistant
             # messages arrive, which is not a chat pane.
@@ -534,6 +556,10 @@ class SdkSession:
         }
         if self._sandbox_requested:
             kwargs["sandbox"] = dict(SANDBOX_SETTINGS)
+        if self._builtin_tools is not None:
+            kwargs["tools"] = list(self._builtin_tools)
+        if not self._persist_session:
+            kwargs["extra_args"] = {"no-session-persistence": None}
         # The credential refusal is unconditional, and the configuration
         # tripwire joins it only when there is an accepted digest to compare
         # against. Both are PreToolUse because that is the only event upstream
@@ -803,6 +829,7 @@ class SdkSession:
         if isinstance(message, ResultMessage):
             self._remember_sdk_session(getattr(message, "session_id", None))
             cost, tokens = self._turn_figures(message)
+            self.last_result_error = _result_error(message)
             self._emit(
                 TurnEnd(
                     turn=self._turn,
@@ -1060,6 +1087,21 @@ async def _one_message(message: dict):
     failed rather than as a turn never having been sent.
     """
     yield message
+
+
+def _result_error(message: ResultMessage) -> Optional[str]:
+    """Why ``message`` is a failed result, or None for a clean one: the CLI's
+    own words (``errors``, else ``result``), with the API's HTTP status when it
+    gave one. A failure with nothing to say still reads as one."""
+    if not getattr(message, "is_error", False):
+        return None
+    errors = message.errors if isinstance(message.errors, (list, tuple)) else ()
+    said = "; ".join(str(e) for e in errors if e) or (
+        message.result if isinstance(message.result, str) else ""
+    )
+    status = message.api_error_status
+    text = said.strip() or "the request failed (%s)" % (message.subtype or "error")
+    return "%s (API status %s)" % (text, status) if status else text
 
 
 def _is_parse_error(exc: BaseException) -> bool:

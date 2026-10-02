@@ -576,6 +576,49 @@ class PermissionBroker:
                 future.set_result(Decision(allow=False, message=message))
 
 
+class HeadlessBroker(PermissionBroker):
+    """The broker of a run with no human (``headless.run_prompt``): it never
+    opens a request, so nothing ever waits on a card.
+
+    A call whose name is in ``granted`` is allowed, once and without being
+    remembered; every other call is denied at once with a message saying
+    that the run is unattended and what it may use. ``granted`` holds the
+    names the run pre-grants, in every form a backend asks under (bare for
+    omp's host-tool gate, ``mcp__<server>__<tool>`` for Claude's
+    ``can_use_tool``). It reads and writes no ``permissions.toml``, and
+    viewer presence is irrelevant, so those methods stay inherited and
+    inert. ``never_remembered`` is not taken: nothing is remembered.
+    """
+
+    def __init__(self, on_event: Callable[[AgentEvent], None], *, granted=()):
+        super().__init__(on_event)
+        self._fixed_grants: FrozenSet[str] = frozenset(granted)
+
+    async def ask(
+        self,
+        tool_name: str,
+        input_data: dict,
+        context: Any,
+        *,
+        action: Optional[str] = None,
+        by: Optional[str] = None,
+    ) -> Decision:
+        if self._shutdown:
+            # The run is over (a timeout, a cancel, or the session closing), so
+            # even a granted call must not start.
+            return Decision(allow=False, message=_deny_message(_DENY_SHUTDOWN_TEMPLATE))
+        if tool_name in self._fixed_grants:
+            return Decision(allow=True)
+        return Decision(
+            allow=False,
+            message=(
+                "%s was not permitted: this is an unattended run with no human to approve "
+                "it, so only the tools granted for the run can be used. Carry on without "
+                "it." % tool_name
+            ),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Decision application, pure and synchronous (see decide()'s docstring for
 # why this must never await).
