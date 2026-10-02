@@ -344,11 +344,29 @@ async def test_the_claude_session_has_no_builtin_tools_and_no_settings(monkeypat
     assert Path(options.cwd) == tmp_path
     # Read, view and the one grant; the ungranted write tool is absent.
     assert options.allowed_tools == ["mcp__toy__lookup", "mcp__toy__pan", "mcp__toy__save"]
+    assert options.effort is None
     assert list(options.mcp_servers) == ["toy"]
     assert options.sandbox is None
     # No transcript of the run is left under ~/.claude/projects.
     assert options.extra_args == {"no-session-persistence": None}
     assert session.sandbox_status().requested is False
+
+
+async def test_thinking_is_passed_as_claude_effort(monkeypatch, tmp_path):
+    real = headless._build_session
+    sessions = {}
+
+    def build(backend, on_event, **kwargs):
+        sessions["session"] = real(backend, on_event, **kwargs)
+        return Scripted(on_event, script)
+
+    async def script(session):
+        await finish(session)
+
+    monkeypatch.setattr(headless, "_build_session", build)
+    result = await run_prompt("go", **make_args(tmp_path, backend="claude", thinking="medium"))
+    assert result.error is None
+    assert sessions["session"]._build_options().effort == "medium"
 
 
 async def test_the_claude_broker_decides_a_builtin_a_grant_and_an_ungranted_write(
@@ -411,6 +429,12 @@ async def test_codex_is_refused_with_a_reason(tmp_path):
 async def test_bad_arguments_raise_value_error(tmp_path, overrides, message):
     with pytest.raises(ValueError, match=message):
         await run_prompt("go", **make_args(tmp_path, **overrides))
+
+
+@pytest.mark.parametrize("thinking", ["", "auto", "xhigh", "HIGH", 1])
+async def test_invalid_thinking_level_is_rejected(tmp_path, thinking):
+    with pytest.raises(ValueError, match="thinking must be"):
+        await run_prompt("go", **make_args(tmp_path, thinking=thinking))
 
 
 async def test_a_missing_cwd_raises_value_error(tmp_path):

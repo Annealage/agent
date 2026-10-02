@@ -154,6 +154,7 @@ async def test_omp_run_end_to_end_with_a_read_view_and_ungranted_write_tool(omp_
     (client,) = omp_client.instances
     assert client.kwargs["model"] == "prov/model"
     assert client.kwargs["tools"] == ()
+    assert client.kwargs["extra_args"] == ("--auto-approve", "--no-extensions")
     assert "--no-extensions" in client.kwargs["extra_args"]
     assert "ctx" in client.kwargs["append_system_prompt"]
     assert Path(client.kwargs["cwd"]) == tmp_path
@@ -161,6 +162,19 @@ async def test_omp_run_end_to_end_with_a_read_view_and_ungranted_write_tool(omp_
     # The conversation file went under the run's own state, which is gone.
     assert not Path(client.kwargs["session_dir"]).exists()
     assert tmp_path not in Path(client.kwargs["session_dir"]).parents
+
+
+async def test_thinking_is_passed_to_omp(omp_client, tmp_path):
+    omp_client.script = lambda client: client.end()
+    result = await run_prompt("do it", **make_args(tmp_path, thinking="high"))
+    assert result.error is None
+    (client,) = omp_client.instances
+    assert client.kwargs["extra_args"] == (
+        "--auto-approve",
+        "--no-extensions",
+        "--thinking",
+        "high",
+    )
 
 
 async def test_a_granted_write_tool_runs_and_nothing_is_remembered(omp_client, tmp_path):

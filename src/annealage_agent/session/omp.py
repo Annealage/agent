@@ -333,6 +333,7 @@ class OmpSession:
         on_session_file=None,
         turn: int = 0,
         login_command: Optional[str] = None,
+        thinking: Optional[str] = None,
     ):
         self._on_event = on_event
         self.cwd = str(cwd)
@@ -359,6 +360,7 @@ class OmpSession:
         self._session_dir = Path(session_dir) if session_dir is not None else None
         self._resume = resume or None
         self._on_session_file = on_session_file
+        self._thinking = thinking
         self._login_command = login_command or None
         self.session_file: Optional[str] = None
         # For backend_logs: the client whose stderr omp_rpc keeps (bounded, and
@@ -726,7 +728,11 @@ class OmpSession:
                 # docstring on the permission design this makes possible.
                 tools=(),
                 custom_tools=self._build_host_tools(),
-                extra_args=("--auto-approve", "--no-extensions"),
+                extra_args=(
+                    "--auto-approve",
+                    "--no-extensions",
+                    *(("--thinking", self._thinking) if self._thinking else ()),
+                ),
             )
             self._stderr_client = self._client
             self._register_listeners()

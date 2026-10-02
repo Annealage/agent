@@ -98,6 +98,9 @@ from .viewers import ViewerBus, ViewerRegistry
 #: The backends ``run_prompt`` can drive.
 BACKENDS = ("omp", "claude")
 
+#: The common thinking levels supported by both backends.
+THINKING_LEVELS = ("low", "medium", "high")
+
 #: What a pause-gated tool answers while the view is paused. A headless run has
 #: no human to pause it, so it is never said; ``ToolServer`` requires it.
 _PAUSED_MESSAGE = "this run has no human and cannot be paused"
@@ -321,7 +324,7 @@ class _Run:
         )
 
 
-def _check_arguments(prompt, tools, backend, model, cwd, timeout):
+def _check_arguments(prompt, tools, backend, model, cwd, timeout, thinking):
     if backend == "codex":
         raise ValueError(
             "run_prompt does not support the codex backend: it reaches its tools "
@@ -336,6 +339,10 @@ def _check_arguments(prompt, tools, backend, model, cwd, timeout):
         raise ValueError("prompt must be a non-empty string")
     if not isinstance(model, str) or not model.strip():
         raise ValueError("model must be a non-empty string: a headless run has no default")
+    if thinking is not None and thinking not in THINKING_LEVELS:
+        raise ValueError(
+            "thinking must be one of %s or None, not %r" % (", ".join(THINKING_LEVELS), thinking)
+        )
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not timeout > 0:
         raise ValueError("timeout must be a number of seconds greater than 0, not %r" % (timeout,))
     # A str or path only: os.path.isdir takes an int for a file descriptor.
@@ -355,6 +362,7 @@ def _build_session(
     server,
     allowed_tools,
     model,
+    thinking,
     cwd,
     state_dir,
     instructions,
@@ -378,6 +386,7 @@ def _build_session(
             broker=broker,
             model=model,
             tool_table=server.host_tool_table(),
+            thinking=thinking,
             instructions=instructions,
             agent_dir=omp_agent_dir,
             config_dir=omp_config_dir,
@@ -395,6 +404,7 @@ def _build_session(
         session_id=session_id,
         broker=broker,
         model=model,
+        effort=thinking,
         mcp_servers=server.mcp_servers,
         allowed_tools=allowed_tools,
         instructions=instructions,
@@ -455,6 +465,7 @@ async def run_prompt(
     cwd,
     timeout,
     system=None,
+    thinking=None,
     omp_agent_dir=None,
     omp_binary=None,
     omp_config_dir=None,
@@ -467,14 +478,18 @@ async def run_prompt(
     directory, the caller's scratch space, used only as the backend's working
     directory. ``timeout`` is seconds for the whole run, start included: when it
     passes the session is closed and the result is ``error="timeout"``.
-    ``system`` is appended to the backend's system prompt. ``omp_agent_dir``,
-    ``omp_binary`` and ``omp_config_dir`` are ``launch.build_session``'s omp
-    profile, executable and config root, ``None`` for omp as installed.
+    ``system`` is appended to the backend's system prompt. ``thinking`` is
+    ``low``, ``medium`` or ``high``; ``None`` leaves the backend's own default
+    unchanged. OMP receives ``--thinking`` and Claude receives the SDK's
+    ``effort`` option. These are backend-native settings, not calibrated levels
+    across providers. ``omp_agent_dir``, ``omp_binary`` and ``omp_config_dir``
+    are ``launch.build_session``'s omp profile, executable and config root,
+    ``None`` for omp as installed.
 
     Raises ``ValueError`` for a bad argument, ``CancelledError`` if cancelled
     (the session closed first); never for a model or backend failure.
     """
-    _check_arguments(prompt, tools, backend, model, cwd, timeout)
+    _check_arguments(prompt, tools, backend, model, cwd, timeout, thinking)
 
     with tempfile.TemporaryDirectory(prefix="annealage-headless-") as state_dir:
         bus = ViewerBus(ViewerRegistry(), url="")
@@ -500,6 +515,7 @@ async def run_prompt(
                     server=server,
                     allowed_tools=server.pre_allowed + claude_grants,
                     model=model,
+                    thinking=thinking,
                     cwd=cwd,
                     state_dir=state_dir,
                     instructions=system or None,
