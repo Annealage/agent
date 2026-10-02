@@ -798,6 +798,7 @@ async def test_interrupted_turn_raises_no_agent_error():
         transport.push(message)
         assert isinstance(await recorder.next(), TurnEnd)
         assert not any(isinstance(event, AgentError) for event in recorder.all)
+        assert session.last_result_error is None
     finally:
         await session.close()
 

@@ -834,18 +834,19 @@ class SdkSession:
         if isinstance(message, ResultMessage):
             self._remember_sdk_session(getattr(message, "session_id", None))
             cost, tokens = self._turn_figures(message)
-            self.last_result_error = _result_error(message)
+            # An interrupted turn also ends as an error result, but one the
+            # human or a tool asked for, so it is no failure.
             interrupted = self._interrupted or getattr(message, "terminal_reason", None) in (
                 "aborted_streaming",
                 "aborted_tools",
             )
             self._interrupted = False
-            if self.last_result_error and not interrupted:
+            self.last_result_error = None if interrupted else _result_error(message)
+            if self.last_result_error:
                 # The CLI ends a failed turn (an expired login, an API error,
                 # the turn limit) with an ordinary result whose text is the
                 # only reason given, so without this the chat sees a turn end
-                # and nothing else. An interrupted turn also ends as an error,
-                # but it is one the human or a tool asked for.
+                # and nothing else.
                 self._emit(
                     AgentError(
                         stderr=self.last_result_error,
