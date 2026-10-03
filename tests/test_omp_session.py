@@ -146,6 +146,9 @@ class FakeRpcClient:
     def on_message_update(self, listener):
         self._listeners["message_update"] = listener
 
+    def on_message_end(self, listener):
+        self._listeners["message_end"] = listener
+
     def on_tool_execution_start(self, listener):
         self._listeners["tool_execution_start"] = listener
 
@@ -176,6 +179,9 @@ class FakeRpcClient:
         self._listeners["message_update"](
             SimpleNamespace(assistant_message_event=assistant_message_event)
         )
+
+    def push_message_end(self, message):
+        self._listeners["message_end"](SimpleNamespace(message=message))
 
     def push_tool_execution_start(self, tool_call_id, tool_name, args):
         self._listeners["tool_execution_start"](
@@ -1279,6 +1285,101 @@ async def test_a_turn_end_reports_that_turn_s_cost_and_tokens_from_the_session_s
         # This turn's share, not the session's running total.
         assert second.cost_usd == pytest.approx(0.15)
         assert second.tokens == {"input": 600, "output": 60, "cache_read": 900, "cache_write": 0}
+    finally:
+        await session.close()
+
+
+def _assistant(usage=None, response_id=None, **extra):
+    message = {"role": "assistant", "provider": "titan", "model": "qwen3-27b", **extra}
+    if usage is not None:
+        message["usage"] = usage
+    if response_id is not None:
+        message["responseId"] = response_id
+    return message
+
+
+@pytest.mark.asyncio
+async def test_each_provider_request_reports_its_own_tokens_with_a_deterministic_id():
+    """An assistant message ends once per provider request, so a turn that calls a
+    tool is two requests, each reported with the figures of that request alone;
+    messages that are not the model's own are not requests."""
+    reported = []
+    session, fake, recorder, broker = await _started_session(on_request_usage=reported.append)
+    try:
+        await session.submit_turn(_text("one"))
+        fake.push_message_end({"role": "user", "content": "one"})
+        fake.push_message_end(
+            _assistant(
+                {"input": 900, "output": 40, "cacheRead": 0, "cacheWrite": 120},
+                response_id="resp-a",
+            )
+        )
+        fake.push_message_end({"role": "toolResult", "toolCallId": "t1"})
+        fake.push_message_end(
+            _assistant({"input": 30, "output": 75, "cacheRead": 1020, "cacheWrite": 0})
+        )
+        await session.submit_turn(_text("two"))
+        fake.push_message_end(
+            _assistant({"input": 5, "output": 6, "cacheRead": 7, "cacheWrite": 8})
+        )
+        await asyncio.sleep(0.01)
+
+        assert [e["event_id"] for e in reported] == [
+            "toy-sess-1:1:1",
+            "toy-sess-1:1:2",
+            "toy-sess-1:2:1",
+        ]
+        first = reported[0]
+        assert {k: v for k, v in first.items() if k != "ts"} == {
+            "event_id": "toy-sess-1:1:1",
+            "session_id": "toy-sess-1",
+            "turn_index": 1,
+            "backend": "omp",
+            "model": "qwen3-27b",
+            "provider": "titan",
+            "provider_request_id": "resp-a",
+            "tokens_input": 900,
+            "tokens_output": 40,
+            "tokens_cache_read": 0,
+            "tokens_cache_write": 120,
+            "tokens_reasoning": None,
+        }
+        assert first["ts"].endswith("Z")
+        assert reported[1]["provider_request_id"] is None
+        assert (reported[1]["tokens_input"], reported[1]["tokens_cache_read"]) == (30, 1020)
+        assert not any("cost" in key for event in reported for key in event)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_request_whose_usage_omp_did_not_report_is_null_not_zero():
+    reported = []
+    session, fake, recorder, broker = await _started_session(on_request_usage=reported.append)
+    try:
+        await session.submit_turn(_text("one"))
+        fake.push_message_end(_assistant({"input": 12, "output": True, "cacheRead": -1}))
+        fake.push_message_end(_assistant())
+        await asyncio.sleep(0.01)
+        (partial, missing) = reported
+        assert (partial["tokens_input"], partial["tokens_output"]) == (12, None)
+        assert (partial["tokens_cache_read"], partial["tokens_cache_write"]) == (None, None)
+        assert {k: v for k, v in missing.items() if k.startswith("tokens_")} == {
+            "tokens_input": None,
+            "tokens_output": None,
+            "tokens_cache_read": None,
+            "tokens_cache_write": None,
+            "tokens_reasoning": None,
+        }
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_without_a_usage_consumer_omp_is_listened_to_exactly_as_before():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        assert "message_end" not in fake._listeners
     finally:
         await session.close()
 

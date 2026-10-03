@@ -510,6 +510,12 @@ async def _serve_connection(
                 bus.hosted_turn_exp = claims.exp
                 bus.hosted_turn_secret = secrets.token_urlsafe(32)
                 bus.hosted_turn_live = True
+                events = getattr(bus, "session_events", None)
+                if events is not None:
+                    # The principal this session now runs for: the one a
+                    # session event nobody caused (an idle close, a backend
+                    # failure) is attributed to.
+                    events.note(human)
             elif kind == "interrupt":
                 bus.hosted_turn_live = False
                 bus.hosted_turn_ops = ()

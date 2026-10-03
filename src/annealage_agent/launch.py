@@ -194,6 +194,9 @@ def build_session(
             resume=info.omp_session_file if info is not None else None,
             on_session_file=_record_session_file,
             login_command=omp_login_command,
+            # Set by create_app only when a hosted usage_sink was given; a
+            # stand-in bus has none, and omp then registers nothing extra.
+            on_request_usage=getattr(bus, "request_usage", None),
         )
 
     from .session.sdk import SdkSession

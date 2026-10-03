@@ -215,7 +215,7 @@ from typing import Any, Callable, Optional
 
 from omp_rpc import RpcClient, host_tool
 
-from .. import product
+from .. import hosted_state, product
 from ..tools import host_tool_name
 from . import logfiles, turn_images
 from .base import (
@@ -335,7 +335,11 @@ class OmpSession:
         login_command: Optional[str] = None,
         thinking: Optional[str] = None,
         request_timeout: Optional[float] = None,
+        on_request_usage: Optional[Callable[[dict], None]] = None,
     ):
+        # Called on the session's loop with one ``hosted_state.usage_event`` per
+        # provider request; ``None`` (the default) registers nothing extra.
+        self._on_request_usage = on_request_usage
         self._on_event = on_event
         self.cwd = str(cwd)
         self.session_id = session_id
@@ -399,6 +403,9 @@ class OmpSession:
         # The session's cumulative cost and tokens at the last turn end (or
         # at start), which the next turn's figures are the difference from.
         self._usage: Optional[dict] = None
+        # (turn, provider requests seen in it), written only on the reader
+        # thread, in wire order: the n of the deterministic usage event id.
+        self._request_count: tuple = (None, 0)
         self._closing = False
         self._viewers_seen = 0
         # tool_call_id -> tool_name for whichever host-tool calls are
@@ -981,11 +988,57 @@ class OmpSession:
     def _register_listeners(self) -> None:
         client = self._client
         client.on_message_update(self._on_message_update)
+        if self._on_request_usage is not None:
+            client.on_message_end(self._on_message_end)
         client.on_tool_execution_start(self._on_tool_execution_start)
         client.on_tool_execution_end(self._on_tool_execution_end)
         client.on_agent_end(self._on_agent_end)
         client.on_ui_request(self._on_ui_request)
         client.on_protocol_error(self._on_protocol_error)
+
+    def _on_message_end(self, event) -> None:
+        """Runs on `omp_rpc`'s reader thread. An assistant message ends once
+        per provider request (a turn that calls tools makes several), and it
+        carries that request's own token counts and the provider's response id:
+        the only per-request figures omp gives (``get_session_stats``, which
+        ``TurnEnd`` is built from, is a running total). Registered only when a
+        ``on_request_usage`` consumer was given."""
+        message = event.message
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            return
+        turn = self._turn
+        counted_turn, counted = self._request_count
+        request_n = counted + 1 if counted_turn == turn else 1
+        self._request_count = (turn, request_n)
+        usage = message.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        response_id = message.get("responseId")
+        report = hosted_state.usage_event(
+            session_id=self.session_id,
+            turn_index=turn,
+            request_n=request_n,
+            backend="omp",
+            model=message.get("model") or self._model,
+            provider=message.get("provider") or None,
+            provider_request_id=response_id
+            if isinstance(response_id, str) and response_id
+            else None,
+            tokens={
+                "input": _token_count(usage.get("input")),
+                "output": _token_count(usage.get("output")),
+                "cache_read": _token_count(usage.get("cacheRead")),
+                "cache_write": _token_count(usage.get("cacheWrite")),
+                # omp's usage has no separate reasoning count.
+                "reasoning": None,
+            },
+        )
+        self._loop.call_soon_threadsafe(self._report_request_usage, report)
+
+    def _report_request_usage(self, report: dict) -> None:
+        try:
+            self._on_request_usage(report)
+        except Exception as exc:
+            sys.stderr.write("warning: could not report request usage: %r\n" % (exc,))
 
     def _on_message_update(self, event) -> None:
         """Runs on `omp_rpc`'s reader thread; every emit crosses back onto
@@ -1269,6 +1322,15 @@ class OmpSession:
 #: The token counts a turn's ``TurnEnd`` reports, as ``omp_rpc``'s
 #: ``TokenUsage`` names them.
 _TOKEN_KEYS = ("input", "output", "cache_read", "cache_write")
+
+
+def _token_count(value) -> Optional[int]:
+    """A token count omp reported, or ``None`` for anything else: an unknown
+    figure is never turned into 0."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
 
 #: `omp`'s own tool names (its built-in and hidden tools, 18.2, plus
 #: ``search``, which it reads as ``grep``). `omp` keys behaviour on some of

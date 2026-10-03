@@ -71,6 +71,7 @@ def create_toy_app(
     hosted_tool_ops=None,
     hosted_frame_ops=None,
     state_sink=None,
+    usage_sink=None,
 ):
     """The toy product's app over ``serve_dir``: ``agent_app.create_app`` with
     the toy page, whose inline script the Content-Security-Policy hashes, and
@@ -105,6 +106,7 @@ def create_toy_app(
         hosted_tool_ops=hosted_tool_ops,
         hosted_frame_ops=hosted_frame_ops,
         state_sink=state_sink,
+        usage_sink=usage_sink,
     )
 
 

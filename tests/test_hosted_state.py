@@ -365,3 +365,52 @@ async def test_no_sink_means_no_records_and_no_noise(capsys):
         SimpleNamespace(id=1, anchor={}, text="t", author="human", ref=None, extra={}),
     )
     assert capsys.readouterr().err == ""
+
+
+# --- the usage sink -----------------------------------------------------------------
+
+
+async def test_request_usage_reaches_the_usage_sink_and_a_failure_is_retried_once_not_twice(
+    served_dir, tmp_path_factory, capsys
+):
+    delivered, failures = [], [1]
+
+    def usage_sink(event):
+        if failures:
+            failures.pop()
+            raise RuntimeError("meter down")
+        delivered.append(event)
+
+    app = create_toy_app(
+        served_dir,
+        hosted_mode=True,
+        hosted_verifier=_Verifier(),
+        hosted_state_dir=tmp_path_factory.mktemp("worker-state"),
+        settings=settings.resolve(tmp_path_factory.mktemp("service")),
+        usage_sink=usage_sink,
+    )
+    first = hosted_state.usage_event(
+        session_id="s",
+        turn_index=1,
+        request_n=1,
+        backend="omp",
+        model="m",
+        provider=None,
+        provider_request_id=None,
+        tokens={"input": 3},
+    )
+    second = dict(first, event_id="s:1:2")
+    report = app.agent_bus.request_usage
+    report(first)
+    await asyncio.sleep(0.05)
+    assert delivered == []  # the meter was down
+    report(first)  # re-offered while undelivered: retried, and not queued twice
+    await asyncio.sleep(0.05)
+    report(second)
+    await asyncio.sleep(0.05)
+    assert [e["event_id"] for e in delivered] == ["s:1:1", "s:1:2"]
+    assert capsys.readouterr().err.count("usage sink failed for s:1:1") == 1
+
+
+async def test_no_usage_sink_leaves_the_bus_without_a_consumer(served_dir):
+    assert create_toy_app(served_dir, token="t").agent_bus.request_usage is None

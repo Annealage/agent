@@ -38,12 +38,13 @@ from microdot import Microdot, Request
 
 from . import files, net, product, protocol, sessions, uploads
 from . import settings as settings_module
-from .hosted_state import StateRecorder
+from .hosted_state import SessionEvents, StateRecorder, UsageRecorder
 from .http.routes_chat import register_chat_routes, register_upload_action_route
 from .http.routes_login import LoginNonces, register_login_routes, register_whoami_route
 from .http.routes_logs import register_log_routes
 from .http.routes_mcp import register_mcp_routes
 from .http.routes_review import register_review_routes
+from .http.routes_session import register_session_routes
 from .http.routes_settings import register_settings_routes
 from .http.static import register_agent_static_routes
 from .http.ws import host_is_allowed, ping_forever, refusal, register_ws
@@ -247,6 +248,7 @@ def create_app(
     hosted_tool_ops=None,
     hosted_frame_ops=None,
     state_sink=None,
+    usage_sink=None,
 ):
     """Build a Microdot app serving ``serve_dir``, routes registered, not started.
 
@@ -348,7 +350,19 @@ def create_app(
     user turn, a permission decision), shaped and described in
     ``hosted_state.py``. It must be thread-safe and idempotent by
     ``record_id``; a failure is logged and never fails the request. ``None``
-    (the default) records nothing.
+    (the default) records nothing. In hosted agent mode the session's own
+    lifecycle (launch, cancel, end, error) goes to the same sink as
+    ``session_event`` records.
+
+    ``usage_sink(event: dict) -> None`` (hosted mode only, omp) receives one
+    event per provider request, with that request's token counts
+    (``hosted_state.usage_event``); best-effort telemetry, since the
+    inference proxy is the authoritative meter. Same thread-safety,
+    idempotence (by ``event_id``) and failure policy as ``state_sink``.
+
+    In hosted agent mode the app also serves the session control routes
+    (``http/routes_session.py``): ``GET /agent/session`` (status),
+    ``POST /agent/session`` (launch) and ``POST /agent/session/cancel``.
 
     ``resume_session`` is a factory shaped like ``build_session``
     (``(on_event, *, bus) -> session``) for the session an idle-closed app
@@ -394,6 +408,8 @@ def create_app(
         )
     if state_sink is not None and not hosted_mode:
         raise ValueError("state_sink records hosted principals, so it requires hosted mode")
+    if usage_sink is not None and not hosted_mode:
+        raise ValueError("usage_sink reports a hosted session's usage, so it requires hosted mode")
     if hosted_mode:
         if hosted_state_dir is None:
             raise ValueError("hosted mode requires an external hosted_state_dir")
@@ -609,6 +625,15 @@ def create_app(
     bus.hosted_turn_exp = 0
     bus.hosted_turn_live = False
     bus.hosted_turn_secret = None
+    # Hosted telemetry and lifecycle sinks (hosted_state.py). The omp session
+    # reads ``request_usage`` through launch.py; the publisher and the
+    # WebSocket handler read ``session_events`` off the bus.
+    usage_recorder = UsageRecorder(usage_sink)
+    bus.request_usage = usage_recorder.report if usage_recorder.enabled else None
+    session_events = (
+        SessionEvents(recorder, session_id) if recorder.enabled and agent_mode else None
+    )
+    bus.session_events = session_events
     if agent_mode:
         tools = installed.build_tools(bus, serve_dir, session_id)
         uploads.check_upload_actions(upload_actions, tools)
@@ -719,6 +744,7 @@ def create_app(
         idle_timeout=idle_timeout,
     )
     app.agent_holder = holder
+    holder.session_events = session_events
     app.agent_start = holder.start
     app.agent_stop = holder.stop
     app.agent_on_stop = holder.on_stop
@@ -769,6 +795,8 @@ def create_app(
     # Listed from whatever session is live; a viewer-only run still answers,
     # with nothing to list.
     register_log_routes(app, current_session=lambda: holder.session, auth=auth)
+    if hosted_mode and agent_mode:
+        register_session_routes(app, auth=auth, holder=holder, events=session_events)
 
     if upload_actions:
         publish_action = _event_publisher(registry, event_log)
@@ -1025,6 +1053,9 @@ def _event_publisher(registry, event_log, session_info=None, bus=None):
                 bus.hosted_turn_secret = None
         if isinstance(event, AgentError):
             _journal_agent_error(event, journaled)
+            session_events = getattr(bus, "session_events", None)
+            if session_events is not None:
+                session_events.emit("error", {"message": (event.remediation or "")[:500]})
         if session_info is not None and isinstance(event, AgentModelChanged):
             session_info["model"] = event.model
         # The latest model list the same way as the model: a tab opened after
@@ -1243,6 +1274,11 @@ class AgentHolder:
         # The live session announced it is unavailable (its start failed, or
         # its backend is gone); ``ensure(retry=True)`` replaces it.
         self._down = False
+        # Hosted: ``cancel`` ended the session on purpose, so nothing but
+        # ``launch`` reopens it (``ensure`` leaves it closed).
+        self._cancelled = False
+        #: The hosted ``hosted_state.SessionEvents``, or ``None``.
+        self.session_events = None
         self._started = False
         self._stopped = False
         self._tasks = []
@@ -1316,7 +1352,7 @@ class AgentHolder:
         backend does not relaunch it on every call."""
         if self._stopped:
             return self.session
-        if self.closed or (retry and self._down):
+        if (self.closed and not self._cancelled) or (retry and self._down):
             async with self._lock:
                 if self._stopped:
                     pass
@@ -1384,7 +1420,78 @@ class AgentHolder:
             # rather than abandoning it halfway (a backend's child left behind).
             self._closing = asyncio.ensure_future(_end_session(start, session))
             await asyncio.shield(self._closing)
+            if self.session_events is not None:
+                await self.session_events.emit_async("end", {"reason": "idle"})
         self._note_change()
+
+    # -- hosted session control (routes_session.py) ------------------------------
+
+    async def launch(self):
+        """Open the agent session if there is none live; ``True`` when one was
+        opened (the app was idle-closed, cancelled, or its session had gone
+        down), ``False`` when a session was already running or the app has
+        stopped. Lifts a ``cancel``: only this reopens a cancelled session. A
+        factory that raises leaves the app closed (``session`` stays ``None``),
+        reported on stderr like any other failed open."""
+        if self._stopped:
+            return False
+        async with self._lock:
+            self._cancelled = False
+            if self._stopped:
+                return False
+            if self.closed:
+                self._resume()
+                return self.session is not None
+            if self._down and self._retry_with is not None:
+                await self._replace_down()
+                return self.session is not None
+            return False
+
+    async def cancel(self):
+        """End the session now and keep it ended: a turn still running is ended
+        as interrupted, the backend is closed (its broker denies every open
+        permission request), and neither a page connecting nor a tool call
+        reopens it; only ``launch`` does. Returns the turns it interrupted
+        (possibly none), or ``None`` when there was no live session to end."""
+        async with self._lock:
+            self._cancelled = True
+            if self._stopped or self.closed or self.session is None:
+                return None
+            session, start = self.session, self._start_task
+            self._start_task = None
+            # Closed before the session is, as for an idle close, so a request
+            # arriving meanwhile waits on the lock and finds it cancelled.
+            self.closed = True
+            self._reopen_with = self._retry_with
+            self.install(None)
+            await _end_session(start, session)
+            interrupted = sorted(self._turns)
+            _end_unfinished_turns(self._publish, self._turns)
+            self._turns.clear()
+            bus = self.bus
+            if getattr(bus, "hosted_mode", False):
+                # The grant of the turn that was running ends with it.
+                bus.hosted_turn_live = False
+                bus.hosted_turn_ops = ()
+                bus.hosted_turn_exp = 0
+                bus.hosted_turn_secret = None
+        self._note_change()
+        return interrupted
+
+    def report(self):
+        """The session as the hosted front sees it: ``{"session_id", "agent",
+        "cancelled", "turn", "turn_running", "waiting", "last_activity"}``. No
+        backend, model or credential detail: hosted settings hide those."""
+        status = self.status()
+        return {
+            "session_id": self._session_info["id"],
+            "agent": status["agent"],
+            "cancelled": self._cancelled,
+            "turn": self.bus.turn,
+            "turn_running": status["turn_running"],
+            "waiting": status["waiting"],
+            "last_activity": status["last_activity"],
+        }
 
     # -- what reads the session at call time -------------------------------------
 
@@ -1494,6 +1601,8 @@ class AgentHolder:
                 else:
                     start, self._start_task = self._start_task, None
                     await _end_session(start, self.session)
+                    if self.session_events is not None and self.session is not None:
+                        await self.session_events.emit_async("end", {"reason": "shutdown"})
                 self._turns.clear()
             # Viewers are told before the listener closes, so a browser
             # reconnects or falls back at once instead of waiting out its

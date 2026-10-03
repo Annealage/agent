@@ -28,6 +28,11 @@ next record; after ``MAX_ATTEMPTS`` it is dropped with a warning. That retry
 is best effort (a restart forgets it), which is why the sink must be
 idempotent by ``record_id`` and the producer's file remains the source to
 reconcile from. With no sink every method here is a no-op.
+
+The session's own lifecycle (launch, cancel, end, error) goes to the same sink
+as ``session_event`` records (``SessionEvents``), and each provider request's
+token counts go to a second, telemetry-only ``usage_sink`` (``usage_event``,
+``UsageRecorder``) under the same delivery policy.
 """
 
 import asyncio
@@ -136,6 +141,7 @@ class Sink:
         self._label = label
         self._lock = threading.Lock()
         self._pending: Deque[List[Any]] = collections.deque()
+        self._tasks: set = set()
 
     @property
     def enabled(self) -> bool:
@@ -180,6 +186,20 @@ class Sink:
             await asyncio.wait_for(asyncio.shield(delivery), SINK_TIMEOUT)
         except asyncio.TimeoutError:
             _warn("%s sink still running after %ss; carrying on" % (self._label, SINK_TIMEOUT))
+
+    def emit_soon(self, item: dict, key: Optional[str] = None) -> None:
+        """``emit_async`` as a task, for synchronous code on the event loop
+        (or ``emit`` inline when there is no running loop)."""
+        if self._sink is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.emit(item, key)
+            return
+        task = loop.create_task(self.emit_async(item, key))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
 
 class StateRecorder:
@@ -293,14 +313,124 @@ class StateRecorder:
         )
 
 
+class SessionEvents:
+    """The ``session_event`` records of one hosted app's agent session.
+
+    A launch or a cancel is made by a human, who is named. How a session ends
+    by itself (idle close, shutdown) or fails has no human, so it is
+    attributed to the principal that last launched, cancelled or sent a turn
+    to it (``actor``): the delegation the session runs under, never a name
+    invented here. With no actor known nothing is recorded (warned).
+    Record ids are ``session_event:<session id>:<event>:<microsecond>``.
+    """
+
+    def __init__(self, recorder: StateRecorder, session_id):
+        self._recorder = recorder
+        self._session_id = session_id
+        self.actor = None
+
+    def note(self, human) -> None:
+        """``human`` is the principal now driving the session."""
+        if attribution(human) is not None:
+            self.actor = human
+
+    def _record(self, event: str, detail: Optional[dict], human) -> Optional[dict]:
+        if not self._recorder.enabled:
+            return None
+        when = now()
+        rid = record_id("session_event", self._session_id, event, int(when.timestamp() * 1_000_000))
+        payload = {"session_id": str(self._session_id), "event": event}
+        payload.update(detail or {})
+        return self._recorder.build(
+            "session_event", rid, human if human is not None else self.actor, payload, when=when
+        )
+
+    def emit(self, event: str, detail: Optional[dict] = None, human=None) -> None:
+        """Record ``event`` without waiting for the sink (from synchronous code
+        on the event loop)."""
+        record = self._record(event, detail, human)
+        if record is not None:
+            self._recorder._sink.emit_soon(record, record["record_id"])
+
+    async def emit_async(self, event: str, detail: Optional[dict] = None, human=None) -> None:
+        """Record ``event``, waiting (bounded) for the sink."""
+        await self._recorder._send_async(self._record(event, detail, human))
+
+
+def usage_event(
+    *,
+    session_id,
+    turn_index: int,
+    request_n: int,
+    backend: str,
+    model: Optional[str],
+    provider: Optional[str],
+    provider_request_id: Optional[str],
+    tokens: dict,
+    when: Optional[datetime] = None,
+) -> dict:
+    """One provider request's usage, as ``usage_sink`` receives it::
+
+        {"event_id": "<session>:<turn>:<request n>", "session_id": ..,
+         "turn_index": .., "backend": "omp", "model": .., "provider": ..,
+         "provider_request_id": null or the provider's own id,
+         "tokens_input": .., "tokens_output": .., "tokens_cache_read": ..,
+         "tokens_cache_write": .., "tokens_reasoning": .., "ts": ".."}
+
+    Token fields are this request's counts, never running totals, and ``None``
+    where the backend did not say (never 0). There is no cost field: the agent
+    does not price anything. ``event_id`` is always the position of the
+    request in the conversation (a provider's own id is not trusted to be
+    unique: some OpenAI-compatible servers repeat one), so a redelivery of this
+    event is recognised, and an event without a provider id is still
+    identified; ``provider_request_id`` is carried beside it for the meter to
+    cross-check against.
+    """
+    return {
+        "event_id": "%s:%s:%s" % (session_id, turn_index, request_n),
+        "session_id": str(session_id),
+        "turn_index": turn_index,
+        "backend": backend,
+        "model": model,
+        "provider": provider,
+        "provider_request_id": provider_request_id,
+        "tokens_input": tokens.get("input"),
+        "tokens_output": tokens.get("output"),
+        "tokens_cache_read": tokens.get("cache_read"),
+        "tokens_cache_write": tokens.get("cache_write"),
+        "tokens_reasoning": tokens.get("reasoning"),
+        "ts": timestamp(when or now()),
+    }
+
+
+class UsageRecorder:
+    """Hands per-request usage events (``usage_event``) to the injected
+    ``usage_sink``, with the same failure policy as the state sink. Telemetry
+    and attribution only: the inference proxy is the authoritative meter."""
+
+    def __init__(self, sink: Optional[Callable[[dict], None]]):
+        self._sink = Sink(sink, label="usage")
+
+    @property
+    def enabled(self) -> bool:
+        return self._sink.enabled
+
+    def report(self, event: dict) -> None:
+        """Deliver ``event`` from the event loop without waiting for the sink."""
+        self._sink.emit_soon(event, event["event_id"])
+
+
 __all__ = [
     "DISPLAY_LIMIT",
     "KINDS",
     "PUBLIC_PRINCIPAL_ID",
+    "SessionEvents",
     "Sink",
     "StateRecorder",
+    "UsageRecorder",
     "attribution",
     "claim_rev",
     "clean_display",
     "record_id",
+    "usage_event",
 ]
