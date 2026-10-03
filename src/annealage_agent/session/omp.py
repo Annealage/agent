@@ -259,12 +259,9 @@ def _provider_id() -> str:
 # rather than a required-but-undocumented one.
 _DEFAULT_MODEL_ID = "default"
 
-# Startup and per-request timeouts long enough for a slow local model on
-# modest hardware to answer a "start"/"prompt" round trip. `RpcClient`'s own
-# defaults (30s startup, 30s request) are already generous enough for
-# ordinary use, so kept as-is rather than overridden here; recorded as a
-# comment because the next reader of `start()` should not have to check
-# `omp_rpc.client` to learn there is no override happening.
+# `RpcClient` keeps its 30-second startup and request defaults unless explicitly
+# overridden. `run_prompt` exposes an opt-in per-request override for OMP's
+# headless batch calls; interactive sessions retain the default.
 
 # How long the model listing after READY is waited for before the field's
 # suggestions are given up on. It is asked on a thread of its own, beside the
@@ -306,6 +303,9 @@ class OmpSession:
     ``login_command`` is the shell command, shown verbatim, that logs the
     profile in when a start fails for want of a model login; without it the
     session names `omp`'s own.
+
+    ``request_timeout`` optionally overrides ``RpcClient``'s per-request wait;
+    ``None`` leaves its 30-second default unchanged.
     """
 
     #: A message sent while a turn runs redirects it (``hello``'s ``steers``).
@@ -334,6 +334,7 @@ class OmpSession:
         turn: int = 0,
         login_command: Optional[str] = None,
         thinking: Optional[str] = None,
+        request_timeout: Optional[float] = None,
     ):
         self._on_event = on_event
         self.cwd = str(cwd)
@@ -361,6 +362,7 @@ class OmpSession:
         self._resume = resume or None
         self._on_session_file = on_session_file
         self._thinking = thinking
+        self._request_timeout = request_timeout
         self._login_command = login_command or None
         self.session_file: Optional[str] = None
         # For backend_logs: the client whose stderr omp_rpc keeps (bounded, and
@@ -713,6 +715,8 @@ class OmpSession:
                 client_kwargs["session_dir"] = str(self._session_dir)
             else:
                 client_kwargs["no_session"] = True
+            if self._request_timeout is not None:
+                client_kwargs["request_timeout"] = self._request_timeout
             self._client = self._client_factory(
                 **client_kwargs,
                 executable=self._binary or "omp",

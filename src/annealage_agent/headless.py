@@ -75,6 +75,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import math
 import os
 import sys
 import tempfile
@@ -324,7 +325,7 @@ class _Run:
         )
 
 
-def _check_arguments(prompt, tools, backend, model, cwd, timeout, thinking):
+def _check_arguments(prompt, tools, backend, model, cwd, timeout, thinking, omp_request_timeout):
     if backend == "codex":
         raise ValueError(
             "run_prompt does not support the codex backend: it reaches its tools "
@@ -345,6 +346,24 @@ def _check_arguments(prompt, tools, backend, model, cwd, timeout, thinking):
         )
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not timeout > 0:
         raise ValueError("timeout must be a number of seconds greater than 0, not %r" % (timeout,))
+    if omp_request_timeout is not None:
+        if backend != "omp":
+            raise ValueError("omp_request_timeout is only supported with backend='omp'")
+        invalid_request_timeout = (
+            isinstance(omp_request_timeout, bool)
+            or not isinstance(omp_request_timeout, (int, float))
+            or omp_request_timeout <= 0
+        )
+        if not invalid_request_timeout:
+            try:
+                invalid_request_timeout = not math.isfinite(omp_request_timeout)
+            except OverflowError:
+                invalid_request_timeout = True
+        if invalid_request_timeout:
+            raise ValueError(
+                "omp_request_timeout must be a finite number of seconds greater than 0, "
+                "not %r" % (omp_request_timeout,)
+            )
     # A str or path only: os.path.isdir takes an int for a file descriptor.
     try:
         is_directory = isinstance(cwd, (str, os.PathLike)) and os.path.isdir(cwd)
@@ -369,6 +388,7 @@ def _build_session(
     omp_agent_dir,
     omp_binary,
     omp_config_dir,
+    omp_request_timeout,
 ):
     """The session ``backend`` names, built and not started. ``launch.build_session``
     is the app's: it is made of the served directory (the working directory and
@@ -391,6 +411,7 @@ def _build_session(
             agent_dir=omp_agent_dir,
             config_dir=omp_config_dir,
             binary=omp_binary,
+            request_timeout=omp_request_timeout,
             # The conversation file goes under the run's own state, and goes
             # with it.
             session_dir=os.path.join(state_dir, "omp"),
@@ -469,7 +490,8 @@ async def run_prompt(
     omp_agent_dir=None,
     omp_binary=None,
     omp_config_dir=None,
-) -> RunResult:
+    omp_request_timeout=None,
+):
     """Run ``prompt`` as one turn of a fresh agent session with ``tools``, and
     return its ``RunResult``. See the module docstring.
 
@@ -478,6 +500,9 @@ async def run_prompt(
     directory, the caller's scratch space, used only as the backend's working
     directory. ``timeout`` is seconds for the whole run, start included: when it
     passes the session is closed and the result is ``error="timeout"``.
+    ``omp_request_timeout`` is an optional per-request wait for OMP RPC calls,
+    including the prompt acknowledgement. ``None`` leaves ``omp_rpc``'s 30-second
+    default unchanged; it is separate from the whole-run ``timeout``.
     ``system`` is appended to the backend's system prompt. ``thinking`` is
     ``low``, ``medium`` or ``high``; ``None`` leaves the backend's own default
     unchanged. OMP receives ``--thinking`` and Claude receives the SDK's
@@ -489,7 +514,7 @@ async def run_prompt(
     Raises ``ValueError`` for a bad argument, ``CancelledError`` if cancelled
     (the session closed first); never for a model or backend failure.
     """
-    _check_arguments(prompt, tools, backend, model, cwd, timeout, thinking)
+    _check_arguments(prompt, tools, backend, model, cwd, timeout, thinking, omp_request_timeout)
 
     with tempfile.TemporaryDirectory(prefix="annealage-headless-") as state_dir:
         bus = ViewerBus(ViewerRegistry(), url="")
@@ -522,6 +547,7 @@ async def run_prompt(
                     omp_agent_dir=omp_agent_dir,
                     omp_binary=omp_binary,
                     omp_config_dir=omp_config_dir,
+                    omp_request_timeout=omp_request_timeout,
                 )
             except Exception as exc:
                 # The backend's package missing (omp_rpc is installed apart), say.

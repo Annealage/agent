@@ -415,6 +415,20 @@ async def test_codex_is_refused_with_a_reason(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "request_timeout",
+    [0, -1, True, float("nan"), float("inf"), 10**400, "180"],
+)
+async def test_invalid_omp_request_timeout_is_rejected(tmp_path, request_timeout):
+    with pytest.raises(ValueError, match="omp_request_timeout must be a finite number"):
+        await run_prompt("go", **make_args(tmp_path, omp_request_timeout=request_timeout))
+
+
+async def test_omp_request_timeout_is_rejected_for_claude(tmp_path):
+    with pytest.raises(ValueError, match="only supported with backend='omp'"):
+        await run_prompt("go", **make_args(tmp_path, backend="claude", omp_request_timeout=180))
+
+
+@pytest.mark.parametrize(
     "overrides, message",
     [
         ({"backend": "gpt"}, "backend must be one of omp, claude"),

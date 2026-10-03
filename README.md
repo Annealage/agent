@@ -445,6 +445,7 @@ result: RunResult = await run_prompt(
     model="provider/model",   # required: there is no default for a batch run
     cwd=scratch_dir,          # an empty directory you own; only the backend's working directory
     timeout=300,              # seconds for the whole run
+    omp_request_timeout=180,   # optional OMP RPC wait, separate from the whole-run timeout
     system="Be terse.",       # optional, appended to the backend's system prompt
 )
 ```

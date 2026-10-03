@@ -11,6 +11,7 @@ The rest of ``run_prompt``'s tests, which need neither, are in
 """
 
 import asyncio
+import sys
 import threading
 import time
 from pathlib import Path
@@ -213,6 +214,68 @@ async def test_omp_overrides_reach_the_session(omp_client, tmp_path):
     (client,) = omp_client.instances
     assert client.kwargs["executable"] == str(binary)
     assert client.kwargs["env"]["PI_CODING_AGENT_DIR"] == str(tmp_path / "agent")
+
+
+async def test_run_prompt_omp_request_timeout_controls_the_rpc_ack_deadline(tmp_path):
+    binary = tmp_path / "fake-omp-rpc"
+    binary.write_text(
+        "#!" + sys.executable + "\n"
+        "import json\n"
+        "import sys\n"
+        "import time\n"
+        "print(json.dumps({'type': 'ready'}), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    request = json.loads(line)\n"
+        "    command = request['type']\n"
+        "    if command == 'prompt':\n"
+        "        time.sleep(1.2)\n"
+        "    data = {}\n"
+        "    if command == 'set_host_tools':\n"
+        "        data = {'toolNames': [tool['name'] for tool in request.get('tools', [])]}\n"
+        "    elif command == 'get_state':\n"
+        "        data = {'sessionId': 'timeout-test'}\n"
+        "    elif command == 'get_session_stats':\n"
+        "        data = {'tokens': {}, 'cost': 0.0}\n"
+        "    elif command == 'get_available_models':\n"
+        "        data = {'models': []}\n"
+        "    print(json.dumps({'type': 'response', 'id': request['id'], "
+        "'success': True, 'data': data}), flush=True)\n"
+        "    if command == 'prompt':\n"
+        "        print(json.dumps({'type': 'agent_end', 'isTerminal': True}), flush=True)\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+
+    rejected = await run_prompt(
+        "go",
+        **make_args(
+            tmp_path,
+            timeout=4,
+            omp_binary=str(binary),
+            omp_request_timeout=0.8,
+        ),
+    )
+    assert rejected.stop_reason == "rejected"
+    assert "Timed out waiting for response to prompt" in rejected.error
+
+    accepted = await run_prompt(
+        "go",
+        **make_args(
+            tmp_path,
+            timeout=4,
+            omp_binary=str(binary),
+            omp_request_timeout=180,
+        ),
+    )
+    assert accepted.stop_reason == "end"
+    assert accepted.error is None
+
+    defaulted = await run_prompt(
+        "go",
+        **make_args(tmp_path, timeout=4, omp_binary=str(binary)),
+    )
+    assert defaulted.stop_reason == "end"
+    assert defaulted.error is None
 
 
 async def test_a_tool_call_after_a_timeout_is_refused_and_a_running_one_is_cancelled(
