@@ -81,7 +81,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import McpError
 
 from . import product
-from .tools import Grading, _wrap, fail
+from .tools import Grading, _wrap, fail, namespaced
 
 #: How long connecting, ``initialize``, the ``prime`` call and ``list_tools``
 #: may take together for one remote at startup. Remotes are reached
@@ -176,6 +176,7 @@ def connect(servers, *, product_server, bus, paused_message, retry=False):
                 bus=bus,
                 gated=name in gated,
                 paused_message=paused_message,
+                hosted_key=namespaced(server.name, name),
             )
             for name in grading.read + grading.view + grading.write
         )

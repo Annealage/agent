@@ -31,6 +31,7 @@ import inspect
 import re
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
 from microdot import Microdot, Request
@@ -45,7 +46,7 @@ from .http.routes_review import register_review_routes
 from .http.routes_settings import register_settings_routes
 from .http.static import register_agent_static_routes
 from .http.ws import host_is_allowed, ping_forever, refusal, register_ws
-from .identity import BrowserAuth, HostedVerifier, check_bind
+from .identity import HOSTED_OPERATIONS, BrowserAuth, HostedVerifier, check_bind
 from .review.watcher import ReviewWatcher
 from .session import secret_paths
 from .session.base import (
@@ -240,6 +241,10 @@ def create_app(
     upload_actions=(),
     hosted_mode=False,
     hosted_verifier: Optional[HostedVerifier] = None,
+    hosted_state_dir=None,
+    hosted_upload_dir=None,
+    hosted_tool_ops=None,
+    hosted_frame_ops=None,
 ):
     """Build a Microdot app serving ``serve_dir``, routes registered, not started.
 
@@ -330,6 +335,12 @@ def create_app(
     so an app at the root answers exactly as it did before prefixes existed.
     A mounted app refuses to save ``host`` and ``port`` from its settings
     window, since the front door owns the bind (``http/routes_settings.py``).
+    ``hosted_state_dir`` and ``hosted_upload_dir`` are writable cache paths
+    outside the published source snapshot. Hosted mode requires trusted
+    service ``settings`` and never resolves user/project settings from the
+    worker's ambient home. Session state and uploads go to those paths; the
+    served source remains the agent's working directory.
+
 
     ``resume_session`` is a factory shaped like ``build_session``
     (``(on_event, *, bus) -> session``) for the session an idle-closed app
@@ -373,6 +384,33 @@ def create_app(
             "processes beside the agent's shell, and the browser token approves "
             "permission requests"
         )
+    if hosted_mode:
+        if hosted_state_dir is None:
+            raise ValueError("hosted mode requires an external hosted_state_dir")
+        if settings is None:
+            raise ValueError("hosted mode requires trusted service settings")
+        serve_root = Path(serve_dir).resolve()
+        state_project_dir = Path(hosted_state_dir).resolve()
+        if (
+            state_project_dir == serve_root
+            or state_project_dir.is_relative_to(serve_root)
+            or serve_root.is_relative_to(state_project_dir)
+        ):
+            raise ValueError("hosted_state_dir must be separate from the source snapshot")
+        upload_dir = (
+            Path(hosted_upload_dir).resolve()
+            if hosted_upload_dir is not None
+            else state_project_dir / "uploads"
+        )
+        if (
+            upload_dir == serve_root
+            or upload_dir.is_relative_to(serve_root)
+            or serve_root.is_relative_to(upload_dir)
+        ):
+            raise ValueError("hosted_upload_dir must be separate from the source snapshot")
+    else:
+        state_project_dir = serve_dir
+        upload_dir = Path(hosted_upload_dir) if hosted_upload_dir is not None else None
     check_url_prefix(url_prefix)
     if idle_timeout is not None and not idle_timeout > 0:
         # Zero would make the idle sweep spin the event loop every other app
@@ -399,10 +437,33 @@ def create_app(
         hosted_verifier=hosted_verifier,
     )
     agent_mode = session_id is not None or external_agents
+    if hosted_mode and agent_mode:
+        if external_agents:
+            raise ValueError("hosted agent mode cannot expose tools to an external agent")
+        if settings["backend"] != "omp":
+            raise ValueError("hosted agent mode requires the omp backend")
+    if hosted_mode:
+        for label, declaration in (
+            ("hosted_tool_ops", hosted_tool_ops),
+            ("hosted_frame_ops", hosted_frame_ops),
+        ):
+            if declaration is None:
+                declaration = {}
+            if not isinstance(declaration, dict) or any(
+                not isinstance(key, str)
+                or not isinstance(operation, str)
+                or operation not in HOSTED_OPERATIONS
+                for key, operation in declaration.items()
+            ):
+                raise ValueError("%s must map names to canonical project operations" % label)
+        if agent_mode and not hosted_tool_ops:
+            raise ValueError("hosted agent mode requires the declared hosted_tool_ops map")
     upload_actions = uploads.check_upload_actions(upload_actions) if agent_mode else ()
-    # The documents uploaded for them, outside the served tree; building it
-    # removes what an earlier run left more than a day ago.
-    documents = uploads.Documents(uploads.documents_dir(serve_dir)) if upload_actions else None
+    documents = (
+        uploads.Documents(upload_dir or uploads.documents_dir(serve_dir))
+        if upload_actions
+        else None
+    )
     installed = product.current()
     server_header = installed.server_header
     if (session_id is not None or external_agents) and installed.build_tools is None:
@@ -415,20 +476,32 @@ def create_app(
     app.agent_url_prefix = url_prefix
     app.agent_auth = auth
     install_host_check(app, allowed_hosts)
-
+    app.agent_state_dir = state_project_dir
+    app.agent_upload_dir = upload_dir
     if settings is None:
-        settings = settings_module.resolve(serve_dir)
+        settings = settings_module.resolve(state_project_dir)
     app.agent_settings = settings
 
     if register_routes is not None:
         register_routes(app, allowed_origins)
     app.agent_documents = documents
     register_chat_routes(
-        app, serve_dir, auth=auth, upload_actions=upload_actions, documents=documents
+        app,
+        serve_dir,
+        auth=auth,
+        upload_actions=upload_actions,
+        documents=documents,
+        asset_dir=state_project_dir if hosted_mode else None,
+        state_dir=state_project_dir,
     )
     register_agent_static_routes(app)
     app.agent_login = login if login is not None else LoginNonces()
-    register_login_routes(app, token=token, nonces=app.agent_login, allowed_origins=allowed_origins)
+    register_login_routes(
+        app,
+        token=None if hosted_mode else token,
+        nonces=app.agent_login,
+        allowed_origins=allowed_origins,
+    )
     register_whoami_route(app, auth=auth)
     register_settings_routes(
         app,
@@ -438,6 +511,8 @@ def create_app(
         session_id=session_id,
         bind=bind.address,
         port=port,
+        state_dir=state_project_dir,
+        hosted_mode=hosted_mode,
         mounted=bool(url_prefix),
     )
     register_review_routes(app, store=review_store, auth=auth)
@@ -454,7 +529,7 @@ def create_app(
     # which read it back off disk. Viewer-only mode has no session and no
     # conversation, so it gets a ring and nothing on disk.
     event_log = EventLog(
-        str(sessions.events_path(serve_dir, session_id)) if session_id is not None else None
+        str(sessions.events_path(state_project_dir, session_id)) if session_id is not None else None
     )
     # A resumed session's history already holds turns 1..N. The next turn is
     # N+1 on every backend (launch.build_session passes bus.turn on), so the
@@ -484,6 +559,7 @@ def create_app(
         publish=_event_publisher(registry, event_log),
         turn=event_log.last_turn,
     )
+    bus.agent_state_project_dir = state_project_dir
     bus.write_protected = write_protected
     # The product's tool server, built once, here, whether or not this backend
     # is Claude: both the in-process driver's own ``.mcp_servers`` (Claude,
@@ -515,9 +591,13 @@ def create_app(
     # for the tools, the routes and the watcher is what makes a tool's write
     # notify the watcher directly rather than wait for its next sample.
     bus.review_store = review_store
-    # The run's settings reach it the same way, so a product key can shape
-    # the tools (Annealage Loom's remote MCP server URL, say).
     bus.settings = settings
+    bus.hosted_mode = hosted_mode
+    bus.hosted_tool_ops = dict(hosted_tool_ops or {})
+    bus.hosted_turn_ops = ()
+    bus.hosted_turn_exp = 0
+    bus.hosted_turn_live = False
+    bus.hosted_turn_secret = None
     if agent_mode:
         tools = installed.build_tools(bus, serve_dir, session_id)
         uploads.check_upload_actions(upload_actions, tools)
@@ -593,22 +673,21 @@ def create_app(
         bus.usage = session_info["usage"]
         session = None
         if factory is not None:
-            session = factory(_event_publisher(registry, event_log, session_info), bus=bus)
+            session = factory(_event_publisher(registry, event_log, session_info, bus), bus=bus)
         if session is None and external_agents:
             # Imported here, like the backends' own sessions: a product that
             # never asks for this pays nothing for it.
             from .session.external import ExternalAgentSession
             from .session.permissions import PermissionBroker
 
-            publish = _event_publisher(registry, event_log, session_info)
+            publish = _event_publisher(registry, event_log, session_info, bus)
             # The broker a real session's factory would have built
             # (launch.py), over the same grants file, and set on the bus for
             # the same reason: /mcp below and a review tool that asks the
             # human read it there.
             bus.broker = PermissionBroker(
                 publish,
-                permissions_path=sessions.state_dir(serve_dir) / "permissions.toml",
-                viewer_url=bus.url,
+                permissions_path=sessions.state_dir(state_project_dir) / "permissions.toml",
                 timeout=float(settings["approval_timeout"]),
                 never_remembered=tools.never_remembered,
             )
@@ -671,6 +750,9 @@ def create_app(
             current_broker=_current_broker,
             agent_token=agent_token,
             allowed_origins=allowed_origins,
+            hosted_mode=hosted_mode,
+            hosted_bus=bus,
+            hosted_tool_ops=hosted_tool_ops or {},
         )
 
     # Listed from whatever session is live; a viewer-only run still answers,
@@ -723,12 +805,13 @@ def create_app(
     register_ws(
         app,
         auth=auth,
-        token=token,
+        token=None if hosted_mode else token,
         allowed_hosts=allowed_hosts,
         registry=registry,
         event_log=event_log,
         session_info=session_info,
         holder=holder,
+        hosted_frame_ops=hosted_frame_ops,
     )
 
     install_response_handlers(app, csp_value, server_header)
@@ -875,7 +958,7 @@ def install_response_handlers(app, csp_value, server_header, *, front_door=False
     app.after_error_request(_security_headers)
 
 
-def _event_publisher(registry, event_log, session_info=None):
+def _event_publisher(registry, event_log, session_info=None, bus=None):
     """Return the ``on_event`` callback a session publishes through.
 
     Appending to the log and broadcasting are one action, not two, and the
@@ -919,6 +1002,15 @@ def _event_publisher(registry, event_log, session_info=None):
     journaled = [None]
 
     def publish(event):
+        if bus is not None and getattr(bus, "hosted_mode", False):
+            ended = isinstance(event, (AgentError, SessionReset)) or (
+                isinstance(event, TurnEnd) and event.stop_reason != "steered"
+            )
+            if ended:
+                bus.hosted_turn_live = False
+                bus.hosted_turn_ops = ()
+                bus.hosted_turn_exp = 0
+                bus.hosted_turn_secret = None
         if isinstance(event, AgentError):
             _journal_agent_error(event, journaled)
         if session_info is not None and isinstance(event, AgentModelChanged):
@@ -1120,7 +1212,7 @@ class AgentHolder:
         self._session_info = session_info
         # What ends the turns a replaced session left running (_replace_down),
         # so the pages stop showing them as running too.
-        self._publish = _event_publisher(registry, event_log, session_info)
+        self._publish = _event_publisher(registry, event_log, session_info, bus)
         self._tools = tools
         self._review_watcher = review_watcher
         self._make_session = make_session

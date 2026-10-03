@@ -78,6 +78,8 @@ history, from before this layer was extracted from it.
 import asyncio
 import json
 import struct
+import time
+from types import SimpleNamespace
 
 import pytest
 from conftest import create_toy_app
@@ -87,6 +89,7 @@ from microdot.test_client import TestClient
 from microdot.websocket import WebSocket
 
 from annealage_agent import protocol
+from annealage_agent.http import ws as ws_module
 
 pytestmark = pytest.mark.asyncio
 
@@ -764,3 +767,62 @@ async def test_a_single_token_parameter_still_works(make_client):
     client = make_client()
     res = await client.get(_ws_query(), headers=_ws_headers())
     _assert_accepted(res)
+
+
+class _HostedFrameWs(_FakeWs):
+    def __init__(self, frame):
+        super().__init__()
+        self.frames = [json.dumps(frame)]
+
+    async def receive(self):
+        if self.frames:
+            return self.frames.pop(0)
+        raise ConnectionError("end test connection")
+
+
+async def test_hosted_ws_denies_undeclared_generic_frame_even_if_map_names_it():
+    frame = {
+        "v": protocol.PROTOCOL_VERSION,
+        "type": "set_model",
+        "model": "untrusted/model",
+    }
+    ws = _HostedFrameWs(frame)
+    human = SimpleNamespace(hosted_claims=SimpleNamespace(exp=int(time.time()) + 30))
+    auth = SimpleNamespace(
+        hosted_mode=True,
+        expired=lambda _human: False,
+        permits=lambda _human, operation: operation == "project.write",
+    )
+
+    with pytest.raises(ConnectionError, match="end test connection"):
+        await ws_module._serve_connection(
+            ws,
+            None,
+            None,
+            None,
+            None,
+            None,
+            auth,
+            human,
+            {"set_model": "project.write"},
+        )
+
+    refused = json.loads(ws.sent[0][1])
+    assert refused["type"] == "refused"
+    assert "not granted" in refused["reason"]
+
+
+async def test_hosted_ws_closes_when_delegation_expires():
+    class WaitingWs(_FakeWs):
+        async def receive(self):
+            await asyncio.Future()
+
+    ws = WaitingWs()
+    human = SimpleNamespace(hosted_claims=SimpleNamespace(exp=int(time.time()) - 1))
+    auth = SimpleNamespace(hosted_mode=True)
+
+    await ws_module._serve_connection(ws, None, None, None, None, None, auth, human, {})
+
+    opcode, payload = ws.sent[0]
+    assert opcode == WebSocket.CLOSE
+    assert struct.unpack("!H", payload[:2])[0] == ws_module.HOSTED_AUTH_EXPIRED

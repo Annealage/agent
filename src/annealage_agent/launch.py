@@ -17,14 +17,9 @@ from . import product, sessions
 from . import settings as settings_module
 
 
-def _resumable_sdk_id(serve_dir, session_id):
-    """The SDK conversation id recorded for ``session_id``, or None.
-
-    None is an ordinary outcome, not an error: a session whose client never
-    connected has no conversation to resume, and it is still resumable as a
-    session, just as a fresh conversation in the same folder.
-    """
-    info = sessions.get_session_info(serve_dir, session_id)
+def _resumable_sdk_id(state_project_dir, session_id):
+    """The SDK conversation id recorded for ``session_id``, or None."""
+    info = sessions.get_session_info(state_project_dir, session_id)
     return info.sdk_session_id if info is not None else None
 
 
@@ -87,6 +82,7 @@ def build_session(
     The session's write-protected patterns are ``bus.write_protected``, the
     app's (``create_app``); a stand-in bus without them takes the product's.
     """
+    state_project_dir = getattr(bus, "agent_state_project_dir", serve_dir)
     if backend not in settings_module.BACKENDS:
         raise AssertionError("unreachable: settings.py validates backend's choices")
 
@@ -94,7 +90,7 @@ def build_session(
 
     broker = PermissionBroker(
         on_event,
-        permissions_path=sessions.state_dir(serve_dir) / "permissions.toml",
+        permissions_path=sessions.state_dir(state_project_dir) / "permissions.toml",
         viewer_url=bus.url,
         timeout=float(settings["approval_timeout"]),
         # The tools that ask the human themselves (tools.asks_the_human):
@@ -114,11 +110,11 @@ def build_session(
     bus.broker = broker
 
     def _record_sdk_id(sdk_id):
-        sessions.set_sdk_session_id(serve_dir, session_id, sdk_id)
+        sessions.set_sdk_session_id(state_project_dir, session_id, sdk_id)
 
     # The backend resumes only a conversation it already knows; a freshly
     # created session has no backend id to resume yet.
-    resume = _resumable_sdk_id(serve_dir, session_id) if resumed else None
+    resume = _resumable_sdk_id(state_project_dir, session_id) if resumed else None
 
     # What the product says this run is about (Product.session_context), added
     # to the backend's system prompt; None adds nothing. Followed by what each
@@ -171,9 +167,9 @@ def build_session(
         from .session.omp import OmpSession
 
         def _record_session_file(path):
-            sessions.set_omp_session_file(serve_dir, session_id, path)
+            sessions.set_omp_session_file(state_project_dir, session_id, path)
 
-        info = sessions.get_session_info(serve_dir, session_id) if resumed else None
+        info = sessions.get_session_info(state_project_dir, session_id) if resumed else None
         return OmpSession(
             on_event,
             cwd=serve_dir,
@@ -194,7 +190,7 @@ def build_session(
             agent_dir=omp_agent_dir,
             config_dir=omp_config_dir,
             binary=omp_binary,
-            session_dir=sessions.state_dir(serve_dir) / "omp",
+            session_dir=sessions.state_dir(state_project_dir) / "omp",
             resume=info.omp_session_file if info is not None else None,
             on_session_file=_record_session_file,
             login_command=omp_login_command,

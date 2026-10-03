@@ -223,12 +223,7 @@ def static_tree(static_dir):
 
 
 def register_agent_static_routes(app):
-    """Register ``GET /agent/static/<path:rel>`` on ``app``.
-
-    Reads ``AGENT_STATIC_DIR`` when called rather than at import, so a test
-    can point it at a throwaway tree. A fresh index cache per app, as for
-    every other route here: independent apps never share route state.
-    """
+    """Register ``GET /agent/static/<path:rel>`` on ``app``."""
     serve = static_tree(AGENT_STATIC_DIR)
 
     @app.get(AGENT_STATIC_PREFIX + "<path:rel>")

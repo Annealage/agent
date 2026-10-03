@@ -27,6 +27,7 @@ would answer questions an unauthenticated caller should not be able to ask.
 
 import asyncio
 import json
+import secrets
 import sys
 import time
 
@@ -58,6 +59,16 @@ from ..viewers import ViewerRegistry
 MAX_WS_MESSAGE = 4 * 1024 * 1024
 
 # How often every connected viewer is pinged.
+HOSTED_AUTH_EXPIRED = 4401
+_HOSTED_FRAME_OPS = {
+    "hello": "project.read",
+    "turn": "project.exec",
+    "interrupt": "project.exec",
+    "result": "project.exec",
+    "error": "project.exec",
+    "permission": "project.write",
+    "pause": "project.write",
+}
 #
 # This is what makes the browser's own liveness watchdog meaningful, and the
 # two numbers are a pair: static/ws.js closes a socket that has delivered
@@ -115,6 +126,7 @@ def register_ws(
     event_log,
     session_info,
     holder,
+    hosted_frame_ops=None,
 ):
     """Register ``/ws`` on ``app``.
 
@@ -148,7 +160,7 @@ def register_ws(
         # Host is enforced for every route by app.py's before_request hook and
         # so has already passed by here. The upgrade is not a plain read, so a
         # tailnet login counts only with an Origin this server serves.
-        human = auth.authenticate(req)
+        human = auth.authenticate(req, "project.read")
         if human is None:
             return refusal()
 
@@ -208,7 +220,17 @@ def register_ws(
                 return Response.already_handled
             viewer = hello.get("viewer") or {}
             conn = await registry.add(ws, tab_id=viewer.get("tab_id"), human=human)
-            await _serve_connection(ws, conn, registry, event_log, token, holder)
+            await _serve_connection(
+                ws,
+                conn,
+                registry,
+                event_log,
+                None if auth.hosted_mode else token,
+                holder,
+                auth,
+                human,
+                hosted_frame_ops or {},
+            )
         except (WebSocketError, ConnectionError, asyncio.IncompleteReadError):
             # The peer closed, vanished (a reset or broken pipe as this
             # sends or reads, or the stream ending mid-frame: a tab killed,
@@ -413,7 +435,9 @@ async def _parse(ws, raw):
 _AGENT_FRAMES = frozenset(("turn", "interrupt", "permission", "set_model"))
 
 
-async def _serve_connection(ws, conn, registry, event_log, token, holder):
+async def _serve_connection(
+    ws, conn, registry, event_log, token, holder, auth=None, human=None, frame_ops=None
+):
     """Read and dispatch frames until the peer goes away.
 
     Every frame this sends is either a ``refused``, which carries no seq, or a
@@ -428,16 +452,51 @@ async def _serve_connection(ws, conn, registry, event_log, token, holder):
     session resumed while this connection was open is the one it reaches.
     """
     while True:
-        raw = await ws.receive()
+        try:
+            timeout = None
+            if auth is not None and auth.hosted_mode and human is not None:
+                claims = human.hosted_claims
+                timeout = max(0, claims.exp - time.time()) if claims is not None else 0
+            raw = await asyncio.wait_for(ws.receive(), timeout=timeout)
+        except asyncio.TimeoutError:
+            await protocol.close_with_code(ws, HOSTED_AUTH_EXPIRED, "hosted delegation expired")
+            return
         frame = await _parse(ws, raw)
         if frame is None:
             continue
         if frame is _CLOSED:
             return
-        if frame["type"] in _AGENT_FRAMES:
+        kind = frame["type"]
+        hosted = auth is not None and auth.hosted_mode
+        if hosted:
+            operation = _HOSTED_FRAME_OPS.get(kind)
+            if operation is None and protocol.is_product_frame(kind):
+                operation = (frame_ops or {}).get(kind)
+            if operation is None or not auth.permits(human, operation):
+                if auth.expired(human):
+                    await protocol.close_with_code(
+                        ws, HOSTED_AUTH_EXPIRED, "hosted delegation expired"
+                    )
+                    return
+                await ws.send(
+                    json.dumps(protocol.build_refused("operation not granted for this frame"))
+                )
+                continue
+        if kind in _AGENT_FRAMES:
             await holder.ensure(retry=True)
         session = holder.session
         bus = holder.bus if session is not None else None
+        if hosted and bus is not None:
+            if kind == "turn":
+                claims = human.hosted_claims
+                bus.hosted_turn_ops = tuple(claims.ops)
+                bus.hosted_turn_exp = claims.exp
+                bus.hosted_turn_secret = secrets.token_urlsafe(32)
+                bus.hosted_turn_live = True
+            elif kind == "interrupt":
+                bus.hosted_turn_live = False
+                bus.hosted_turn_ops = ()
+                bus.hosted_turn_secret = None
         await _dispatch(ws, conn, registry, event_log, token, frame, session, bus)
 
 

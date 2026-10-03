@@ -15,6 +15,8 @@ its own write would be useless. Both are asserted below against a real write.
 """
 
 import json
+import time
+from types import SimpleNamespace
 
 import pytest
 from conftest import DEFAULT_PORT, TEST_HOST, create_toy_app, make_test_client
@@ -66,6 +68,38 @@ def body_of(res):
 def _put(client, changes, *, token=TOKEN, body=None):
     payload = json.dumps({"changes": changes} if body is None else body)
     return client.put("/settings?t=%s" % token, headers=json_headers(), body=payload)
+
+
+class _HostedVerifier:
+    def verify(self, token, operation):
+        if token != "delegation":
+            raise ValueError("invalid delegation")
+        return SimpleNamespace(
+            sub="usr_test",
+            wsp="wsp_test",
+            prj="prj_test",
+            ops=(operation,),
+            job="job_test",
+            rev="rev_test",
+            exp=int(time.time()) + 60,
+        )
+
+
+def _hosted_client(serve_dir, state_dir):
+    service_dir = state_dir.parent / "service-settings"
+    return make_test_client(
+        create_toy_app(
+            serve_dir,
+            hosted_mode=True,
+            hosted_verifier=_HostedVerifier(),
+            hosted_state_dir=state_dir,
+            settings=settings.resolve(service_dir),
+        )
+    )
+
+
+def _hosted_headers():
+    return {"Authorization": "Bearer delegation", "Content-Type": "application/json"}
 
 
 # --- the token gate, shared with /ws -----------------------------------------
@@ -352,3 +386,71 @@ async def test_a_mounted_app_neither_applies_nor_saves_a_bind_of_its_own(served_
     assert "front door" in body_of(res)["error"]
     saved = settings.resolve(served_dir)
     assert saved["port"] == 9000 and saved["units"] != "in"
+
+
+async def test_hosted_settings_reads_hide_backend_and_credentials(served_dir):
+    state_dir = served_dir.parent / "worker-state"
+    settings.apply(
+        state_dir,
+        {"backend": "omp", "omp_base_url": "https://private.example", "omp_api_key": "secret"},
+    )
+    client = _hosted_client(served_dir, state_dir)
+    payload = body_of(await client.get("/settings", headers=_hosted_headers()))
+    assert not {
+        "backend",
+        "model",
+        "omp_base_url",
+        "omp_api_key",
+        "host",
+        "port",
+        "open_browser",
+        "approval_timeout",
+    } & set(payload["settings"])
+    assert "pending" in payload
+    assert payload["diagnostics"] == {}
+    assert "secret" not in json.dumps(payload)
+    assert "private.example" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"backend": "omp"},
+        {"omp_base_url": "https://private.example"},
+        {"omp_api_key": "secret"},
+        {"provider_api_key": "secret"},
+        {"host": "0.0.0.0"},
+        {"model": "other/provider-model"},
+        {"open_browser": False},
+    ],
+)
+async def test_hosted_settings_reject_frozen_changes_atomically(served_dir, changes):
+    state_dir = served_dir.parent / "worker-state"
+    settings.apply(state_dir, {"model": "before"})
+    client = _hosted_client(served_dir, state_dir)
+    project_path = settings.project_config_path(state_dir)
+    user_path = settings.user_settings_path()
+    before_project = project_path.read_bytes()
+    before_user = user_path.read_bytes() if user_path.exists() else None
+
+    res = await client.put(
+        "/settings",
+        headers=_hosted_headers(),
+        body=json.dumps({"changes": {**changes, "model": "after"}}),
+    )
+    assert res.status_code == 400
+    assert project_path.read_bytes() == before_project
+    assert (user_path.read_bytes() if user_path.exists() else None) == before_user
+
+
+async def test_hosted_agent_refuses_backend_with_a_shell(served_dir):
+    with pytest.raises(ValueError, match="requires the omp backend"):
+        create_toy_app(
+            served_dir,
+            session_id="hosted-session",
+            hosted_mode=True,
+            hosted_verifier=_HostedVerifier(),
+            hosted_state_dir=served_dir.parent / "worker-state",
+            hosted_tool_ops={"mcp__toy__list_notes": "project.read"},
+            settings=settings.resolve(served_dir.parent / "service-settings"),
+        )

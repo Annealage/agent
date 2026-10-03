@@ -64,6 +64,12 @@ def create_toy_app(
     identity=None,
     start_closed=False,
     upload_actions=(),
+    hosted_mode=False,
+    hosted_verifier=None,
+    hosted_state_dir=None,
+    hosted_upload_dir=None,
+    hosted_tool_ops=None,
+    hosted_frame_ops=None,
 ):
     """The toy product's app over ``serve_dir``: ``agent_app.create_app`` with
     the toy page, whose inline script the Content-Security-Policy hashes, and
@@ -91,6 +97,12 @@ def create_toy_app(
         identity=identity,
         start_closed=start_closed,
         upload_actions=upload_actions,
+        hosted_mode=hosted_mode,
+        hosted_verifier=hosted_verifier,
+        hosted_state_dir=hosted_state_dir,
+        hosted_upload_dir=hosted_upload_dir,
+        hosted_tool_ops=hosted_tool_ops,
+        hosted_frame_ops=hosted_frame_ops,
     )
 
 

@@ -18,6 +18,7 @@ import dataclasses
 import os
 import re
 import stat
+import time
 import unicodedata
 from email.errors import HeaderParseError
 from email.header import decode_header, make_header
@@ -47,6 +48,17 @@ class HostedVerifier(Protocol):
 
 DELEGATION_HEADER = "Authorization"
 PRINCIPAL_DISPLAY_HEADER = "X-Annealage-Principal-Display"
+HOSTED_OPERATIONS = frozenset(
+    {
+        "project.read",
+        "project.comment",
+        "project.write",
+        "project.exec",
+        "project.delete",
+        "project.export",
+        "project.admin",
+    }
+)
 _DISPLAY_LIMIT = 120
 
 #: The header serve puts the tailnet login in (``andrew@example.com``, or
@@ -232,6 +244,25 @@ class BrowserAuth:
         self._allowed_origins = frozenset(allowed_origins)
         self._hosted_mode = hosted_mode
         self._hosted_verifier = hosted_verifier
+
+    @property
+    def hosted_mode(self) -> bool:
+        """Whether this auth object accepts only hosted delegation tokens."""
+        return self._hosted_mode
+
+    def expired(self, human: Human) -> bool:
+        """Whether a hosted delegation attached to ``human`` has expired."""
+        claims = human.hosted_claims
+        return bool(self._hosted_mode and (claims is None or time.time() >= claims.exp))
+
+    def permits(self, human: Human, requested_operation: str) -> bool:
+        """Check one further operation against a verified hosted grant."""
+        if not self._hosted_mode:
+            return True
+        claims = human.hosted_claims
+        return bool(
+            claims is not None and time.time() < claims.exp and requested_operation in claims.ops
+        )
 
     def authenticate(self, req, requested_operation: Optional[str] = None) -> Optional[Human]:
         """Return the authenticated author, or ``None`` to refuse the request.

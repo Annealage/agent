@@ -292,21 +292,24 @@ async def _file_or_same_404(target, ctype, method, request_key, expect_identity=
     return res
 
 
-def register_chat_routes(app, serve_dir, *, auth, upload_actions=(), documents=None):
-    """Register ``POST /upload``, ``GET /asset/<rel>`` and
-    ``POST /session/<sid>/export`` on ``app``, the two POSTs gated by ``auth``
-    (``identity.BrowserAuth``). ``upload_actions`` are the app's
-    ``uploads.UploadAction``s and ``documents`` its ``uploads.Documents``:
-    with actions, ``/upload`` also takes a document one of them accepts
-    (``DOCUMENT_UPLOAD_KIND``), kept and recorded there."""
+def register_chat_routes(
+    app, serve_dir, *, auth, upload_actions=(), documents=None, asset_dir=None, state_dir=None
+):
+    """Register the agent upload, asset and transcript routes.
+
+    ``asset_dir`` and ``state_dir`` default to the served directory. Hosted
+    workers pass writable cache paths outside the read-only source snapshot.
+    """
     serve_dir = files.resolve_serve_dir(serve_dir)
+    asset_dir = files.resolve_serve_dir(asset_dir or serve_dir)
+    state_dir = files.resolve_serve_dir(state_dir or serve_dir)
     kinds = upload_kinds() + ((DOCUMENT_UPLOAD_KIND,) if upload_actions else ())
 
     @app.post("/upload")
     async def upload(req):
         # The same check and the same opaque refusal /ws uses, so nothing
         # tells an unauthenticated caller which part of it failed.
-        if auth.authenticate(req) is None:
+        if auth.authenticate(req, "project.write") is None:
             return refusal()
 
         kind, error = _upload_kind(req, kinds)
@@ -363,7 +366,7 @@ def register_chat_routes(app, serve_dir, *, auth, upload_actions=(), documents=N
             create = functools.partial(documents.create, names[0] if names else "")
             where = "the documents directory"
         else:
-            create = functools.partial(files.create_unique_image_file, serve_dir, kind, suffix)
+            create = functools.partial(files.create_unique_image_file, asset_dir, kind, suffix)
             where = "%s/" % files.IMAGES_DIRNAME
         try:
             created = await loop.run_in_executor(None, create)
@@ -431,7 +434,9 @@ def register_chat_routes(app, serve_dir, *, auth, upload_actions=(), documents=N
 
     @app.get("/asset/<path:rel>")
     async def asset(req, rel):
-        found = files.resolve_asset(serve_dir, unquote(rel))
+        if auth.hosted_mode and auth.authenticate(req, "project.read") is None:
+            return refusal()
+        found = files.resolve_asset(asset_dir, unquote(rel))
         if found is None:
             return "not found: %s" % rel, 404
         target, identity = found
@@ -440,7 +445,10 @@ def register_chat_routes(app, serve_dir, *, auth, upload_actions=(), documents=N
 
     @app.post("/session/<sid>/export")
     async def export_session(req, sid):
-        if auth.authenticate(req) is None:
+        if (
+            auth.authenticate(req, "project.admin" if auth.hosted_mode else "project.export")
+            is None
+        ):
             return refusal()
 
         loop = asyncio.get_running_loop()
@@ -448,7 +456,7 @@ def register_chat_routes(app, serve_dir, *, auth, upload_actions=(), documents=N
         # records rather than the filesystem, so an id that names a session
         # belonging to some other directory is a 404 here rather than a path
         # this route then tries to read.
-        known = await loop.run_in_executor(None, sessions.get_session_info, serve_dir, sid)
+        known = await loop.run_in_executor(None, sessions.get_session_info, state_dir, sid)
         if known is None:
             return {"ok": False, "error": "no session %r in this project" % sid}, 404
 
@@ -465,7 +473,7 @@ def register_chat_routes(app, serve_dir, *, auth, upload_actions=(), documents=N
             target = await loop.run_in_executor(
                 None,
                 functools.partial(
-                    events.export_transcript, serve_dir, sid, fmt=fmt, include=include
+                    events.export_transcript, state_dir, sid, fmt=fmt, include=include
                 ),
             )
         except OSError as exc:
@@ -499,7 +507,7 @@ def register_upload_action_route(app, *, auth, actions, documents, begin):
 
     @app.post("/upload/action")
     async def upload_action(req):
-        human = auth.authenticate(req)
+        human = auth.authenticate(req, "project.exec")
         if human is None:
             return refusal()
         data, error = await read_json_body(req)
@@ -528,7 +536,7 @@ def register_upload_action_route(app, *, auth, actions, documents, begin):
 
     @app.delete("/upload/<upload_id>")
     async def discard_upload(req, upload_id):
-        if auth.authenticate(req) is None:
+        if auth.authenticate(req, "project.write") is None:
             return refusal()
         loop = asyncio.get_running_loop()
         if not await loop.run_in_executor(None, documents.discard, upload_id):

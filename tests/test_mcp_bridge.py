@@ -32,6 +32,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 
 import httpx
 import pytest
@@ -93,7 +94,9 @@ def _notes(project):
     return json.loads((project / NOTES_FILE).read_text(encoding="utf-8"))
 
 
-def _mcp_app(toy_tools, *, broker, token=TOKEN, allowed_origins=()):
+def _mcp_app(
+    toy_tools, *, broker, token=TOKEN, allowed_origins=(), hosted_mode=False, hosted_bus=None
+):
     async def current_broker():
         return broker
 
@@ -104,6 +107,9 @@ def _mcp_app(toy_tools, *, broker, token=TOKEN, allowed_origins=()):
         current_broker=current_broker,
         agent_token=token,
         allowed_origins=allowed_origins,
+        hosted_mode=hosted_mode,
+        hosted_bus=hosted_bus,
+        hosted_tool_ops=getattr(hosted_bus, "hosted_tool_ops", {}),
     )
     return app
 
@@ -743,3 +749,34 @@ async def test_what_the_model_reads_with_no_viewer_attached_never_carries_the_br
         text = result["content"][0]["text"]
         assert "http://127.0.0.1:8765/" in text, name
         assert BROWSER_TOKEN not in text, name
+
+
+async def test_hosted_mcp_requires_turn_secret_and_declared_tool_operation(project):
+    bus = FakeBus()
+    bus.hosted_mode = True
+    bus.hosted_tool_ops = {"mcp__toy__list_notes": "project.read"}
+    bus.hosted_turn_ops = ("project.read",)
+    bus.hosted_turn_exp = time.time() + 30
+    bus.hosted_turn_live = True
+    bus.hosted_turn_secret = "opaque-turn-secret"
+    tools = build_toy_tools(bus, project, "sess-hosted")
+    app = _mcp_app(tools, broker=None, hosted_mode=True, hosted_bus=bus)
+
+    denied = await make_test_client(app).post(
+        "/mcp",
+        headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"},
+        body=json.dumps({"method": "tools/call", "params": {"name": "list_notes"}}),
+    )
+    assert denied.status_code == 403
+
+    allowed = await make_test_client(app).post(
+        "/mcp",
+        headers={
+            "Authorization": "Bearer opaque-turn-secret",
+            "Content-Type": "application/json",
+        },
+        body=json.dumps({"method": "tools/call", "params": {"name": "list_notes"}}),
+    )
+    assert allowed.status_code == 200
+    result = json.loads(allowed.body)["result"]
+    assert not result["isError"]

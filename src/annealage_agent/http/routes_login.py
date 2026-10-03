@@ -115,7 +115,7 @@ def register_whoami_route(app, *, auth):
 
     @app.get("/whoami")
     async def whoami(req):
-        human = auth.authenticate(req)
+        human = auth.authenticate(req, "project.read")
         if human is None:
             return refusal()
         return {"login": human.login, "name": human.name, "via": identity.via(human)}, 200

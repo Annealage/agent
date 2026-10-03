@@ -67,6 +67,7 @@ import dataclasses
 import functools
 import json
 import sys
+import time
 from collections import namedtuple
 
 from claude_agent_sdk import create_sdk_mcp_server
@@ -241,7 +242,7 @@ def asks_the_human(tool_def):
     return tool_def
 
 
-def _wrap(tool_def, *, bus, gated, paused_message):
+def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None):
     """Apply the pause gate and the failure mapping to one tool.
 
     Both live here rather than in each handler, which is what lets the handler
@@ -267,6 +268,15 @@ def _wrap(tool_def, *, bus, gated, paused_message):
     name = product.current().name
 
     async def handler(args):
+        if getattr(bus, "hosted_mode", False):
+            operation = bus.hosted_tool_ops.get(hosted_key)
+            if (
+                operation is None
+                or not bus.hosted_turn_live
+                or time.time() >= bus.hosted_turn_exp
+                or operation not in bus.hosted_turn_ops
+            ):
+                return fail("hosted operation is not granted for this tool call")
         if gated and bus.paused:
             return fail(paused_message() if callable(paused_message) else paused_message)
         try:
@@ -393,7 +403,13 @@ class ToolServer:
         )
         gated = set(self.grading.pause_gated)
         self.tools = tuple(
-            _wrap(tool_def, bus=bus, gated=tool_def.name in gated, paused_message=paused_message)
+            _wrap(
+                tool_def,
+                bus=bus,
+                gated=tool_def.name in gated,
+                paused_message=paused_message,
+                hosted_key=namespaced(self.name, tool_def.name),
+            )
             for tool_def in tools
         )
         self.server = create_sdk_mcp_server(

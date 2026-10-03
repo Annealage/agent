@@ -65,6 +65,9 @@ carries (``ToolSpec.write``) to this particular driver's approval mechanism,
 exactly as ``session/sdk.py`` does for its own.
 """
 
+import hmac
+import time
+
 import mcp.types as types
 
 from ..tools import namespaced
@@ -145,7 +148,17 @@ async def _call_tool_result(tool_table, broker, name, arguments, *, server_name)
     )
 
 
-def register_mcp_routes(app, *, tools, current_broker, agent_token, allowed_origins=()):
+def register_mcp_routes(
+    app,
+    *,
+    tools,
+    current_broker,
+    agent_token,
+    allowed_origins=(),
+    hosted_mode=False,
+    hosted_bus=None,
+    hosted_tool_ops=None,
+):
     """Register ``POST /mcp``, and ``POST /mcp/<remote>`` for each remote MCP
     server the tool server reached, on ``app``.
 
@@ -180,6 +193,10 @@ def register_mcp_routes(app, *, tools, current_broker, agent_token, allowed_orig
     has gone. ``create_app`` registers these routes only once a real
     session exists; a viewer-only app has no ``/mcp`` at all.
     """
+    if hosted_mode:
+        if hosted_bus is None:
+            raise ValueError("hosted MCP routes require the hosted turn bus")
+        hosted_bus.hosted_tool_ops = dict(hosted_tool_ops or {})
     tool_table = tools.tool_table()
     # Rebuilt only when the reached remotes change (``ToolServer.reconnect``
     # replaces the tuple).
@@ -192,7 +209,18 @@ def register_mcp_routes(app, *, tools, current_broker, agent_token, allowed_orig
         return remote_cache["tables"].get(name)
 
     async def serve(req, table, server_name):
-        if not _token_is_allowed(req, agent_token):
+        if hosted_mode:
+            expected = getattr(hosted_bus, "hosted_turn_secret", None)
+            if (
+                expected is None
+                or not hosted_bus.hosted_turn_live
+                or time.time() >= hosted_bus.hosted_turn_exp
+                or not hmac.compare_digest(
+                    req.headers.get("Authorization", ""), "Bearer " + expected
+                )
+            ):
+                return refusal()
+        elif not _token_is_allowed(req, agent_token):
             return refusal()
         if not _origin_is_allowed(req, allowed_origins):
             return refusal()

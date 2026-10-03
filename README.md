@@ -496,6 +496,14 @@ The agent holds a shell in a directory whose contents may have come from anywher
 - **Review store locking is per process.** `JsonReviewStore` serialises writers inside one process, so two processes serving the same review file can lose each other's changes.
 - **A remote MCP server sees what its read-grade tools are called with.** Read and view run without a card, so whatever the agent passes a remote's pre-allowed tool leaves the machine unasked, and what comes back (results, descriptions, its `initialize` instructions) is text the model reads like any tool result. Declare only servers you trust with the project, and put any tool that sends something you'd want to see first in the write grade.
 
+### Hosted workers
+
+`create_app` has a hosted boundary for a worker reached only through an authorised front door. Pass `hosted_mode=True`, a `HostedVerifier`, trusted service `settings`, and writable `hosted_state_dir` / `hosted_upload_dir` paths outside the read-only source snapshot. The front must strip client identity headers and attach a short-lived `Authorization: Bearer ...` delegation for each worker request; the agent package verifies it but does not issue or parse the token.
+
+Agent-owned HTTP routes name their canonical `project.*` operation. WebSockets require `project.read` at upgrade and check every inbound frame against the verified grant, closing with 4401 at expiry. Product frame classes and MCP tools need explicit operation maps (`hosted_frame_ops` and `hosted_tool_ops`); the tool map uses `mcp__<server>__<tool>` names and is the authority, not the local read/view/write grade. Hosted MCP calls also require the opaque per-turn bridge secret, and a wrapped tool refuses a call outside the live turn's grant.
+
+Session files, event logs, settings and uploads use the external state paths as deletable worker cache, not as the project revision store. Hosted settings expose project-layer preferences, hide backend/model/provider/credential and user-only service fields, and reject writes to them. Agent mode is limited to the embedded `omp` backend; hosted mode refuses Claude/Codex sessions and external agents. Standalone token and Tailscale authentication are unchanged.
+
 ## Development
 
     uv sync --extra dev --extra codex

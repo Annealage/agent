@@ -651,3 +651,30 @@ def _importable(module):
     except ImportError:
         return False
     return True
+
+
+@pytest.mark.asyncio
+async def test_hosted_remote_calls_use_declared_operation_not_tool_grade(fake, bus, tmp_path):
+    bus.hosted_mode = True
+    bus.hosted_tool_ops = {
+        "mcp__fake__lookup": "project.read",
+        "mcp__fake__store": "project.write",
+    }
+    bus.hosted_turn_ops = ("project.read",)
+    bus.hosted_turn_exp = time.time() + 30
+    bus.hosted_turn_live = True
+    tools = _tools(bus, tmp_path, _fake(fake))
+    table = tools.remote_tables()["fake"]
+
+    result = await table["lookup"].handler({"query": "RP2040"})
+    assert result["content"][0]["text"] == "found RP2040"
+
+    refused = await table["store"].handler({"text": "must not reach remote"})
+    assert refused["is_error"] is True
+    assert "not granted" in _text(refused)
+    assert fake.stored == []
+
+    bus.hosted_turn_ops = ("project.read", "project.write")
+    stored = await table["store"].handler({"text": "allowed"})
+    assert stored["content"][0]["text"] == "stored"
+    assert fake.stored == ["allowed"]

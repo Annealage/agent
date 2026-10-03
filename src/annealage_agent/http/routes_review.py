@@ -58,7 +58,7 @@ def register_review_routes(app, *, store, auth):
 
     @app.get("/review")
     async def get_review(req):
-        if auth.authenticate(req) is None:
+        if auth.authenticate(req, "project.read") is None:
             return refusal()
         if store is None:
             return _no_review()
@@ -79,7 +79,7 @@ def register_review_routes(app, *, store, auth):
 
     @app.post("/review")
     async def add_review_comment(req):
-        human = auth.authenticate(req)
+        human = auth.authenticate(req, "project.comment")
         if human is None:
             return refusal()
         if store is None:
@@ -119,7 +119,7 @@ def register_review_routes(app, *, store, auth):
 
     @app.post("/review/<int:comment_id>")
     async def set_review_status(req, comment_id):
-        human = auth.authenticate(req)
+        human = auth.authenticate(req, "project.comment")
         if human is None:
             return refusal()
         if store is None:

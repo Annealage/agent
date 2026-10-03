@@ -58,7 +58,7 @@ def register_log_routes(app, *, current_session, auth):
 
     @app.get("/agent/logs")
     async def list_logs(req):
-        if auth.authenticate(req) is None:
+        if auth.authenticate(req, "project.admin" if auth.hosted_mode else "project.read") is None:
             return refusal()
         entries = await _entries()
         return {
@@ -69,7 +69,7 @@ def register_log_routes(app, *, current_session, auth):
 
     @app.get("/agent/logs/<path:name>")
     async def show_log(req, name):
-        if auth.authenticate(req) is None:
+        if auth.authenticate(req, "project.admin" if auth.hosted_mode else "project.read") is None:
             return refusal()
         # microdot hands the segment over still percent-encoded.
         name = unquote(name)

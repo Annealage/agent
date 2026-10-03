@@ -51,6 +51,24 @@ from .ws import refusal
 #: served under owns the process's one listening socket.
 BIND_KEYS = ("host", "port")
 
+# Hosted projects can tune project preferences; binding, model/provider selection
+# and credentials stay in trusted service configuration.
+HOSTED_FROZEN_KEYS = frozenset(("backend", "model", "omp_base_url", "omp_api_key", "datum_url"))
+
+
+def _hosted_frozen(name):
+    lowered = name.lower()
+    return name in HOSTED_FROZEN_KEYS or any(
+        part in lowered
+        for part in ("provider", "credential", "secret", "api_key", "password", "_token")
+    )
+
+
+def _hosted_visible(name):
+    key = settings_module.KEYS_BY_NAME.get(name)
+    return not _hosted_frozen(name) and key is not None and settings_module.PROJECT in key.layers
+
+
 #: Why, as the settings window shows it and a refused write says it.
 MOUNTED_BIND_REASON = (
     "this workspace is served by a front door that owns the address and port "
@@ -67,29 +85,18 @@ def register_settings_routes(
     session_id=None,
     bind=None,
     port=None,
+    state_dir=None,
+    hosted_mode=False,
     mounted=False,
 ):
-    """Register ``GET`` and ``PUT /settings`` on ``app``, gated by ``auth``
-    (``identity.BrowserAuth``).
+    """Register GET/PUT settings routes.
 
-    ``settings`` is the ``settings.Resolved`` this run started with, and the
-    flags that produced it travel on it, so a re-resolution here reports the
-    same layer as being in effect rather than promoting a file's value over a
-    flag that still outranks it.
-
-    ``session_id``, ``bind`` and ``port`` are passed straight through to the
-    diagnostics collector, which is the only consumer of them here, and so is
-    the running session's ``backend_logs``, read off ``app.agent_session`` per
-    request because the session is built after these routes are registered.
-
-    ``mounted`` is an app served under a front door's URL prefix
-    (``create_app(url_prefix=...)``). Its ``host`` and ``port`` (``BIND_KEYS``)
-    are reported as not in effect and not editable (``"in_effect": false``
-    with the reason beside it, and never ``pending``), and a ``PUT`` naming
-    either is refused whole, saying why.
+    Hosted mode filters service-controlled settings and writes only to the
+    supplied per-project cache directory. Standalone behaviour is unchanged.
     """
+    state_dir = state_dir or serve_dir
     if settings is None:
-        settings = settings_module.resolve(serve_dir)
+        settings = settings_module.resolve(state_dir)
 
     async def _payload():
         """The response body both routes return, built off the event loop.
@@ -107,16 +114,21 @@ def register_settings_routes(
             session_id=session_id,
             bind=bind,
             port=port,
-            backend=settings["backend"],
-            omp_base_url=settings["omp_base_url"],
-            omp_api_key=settings["omp_api_key"],
-            backend_logs=getattr(session, "backend_logs", None),
+            backend=None if hosted_mode else settings["backend"],
+            omp_base_url=None if hosted_mode else settings["omp_base_url"],
+            omp_api_key=None if hosted_mode else settings["omp_api_key"],
+            backend_logs=None if hosted_mode else getattr(session, "backend_logs", None),
         )
-        facts = await loop.run_in_executor(None, collect)
+        facts = {}
+        if not hosted_mode:
+            facts = await loop.run_in_executor(None, collect)
         wire = settings.to_wire()
+        if hosted_mode:
+            wire = {name: entry for name, entry in wire.items() if _hosted_visible(name)}
         if mounted:
             for name in BIND_KEYS:
-                wire[name].update(editable=False, in_effect=False, reason=MOUNTED_BIND_REASON)
+                if name in wire:
+                    wire[name].update(editable=False, in_effect=False, reason=MOUNTED_BIND_REASON)
         installed = product.current()
         body = {
             "ok": True,
@@ -124,7 +136,16 @@ def register_settings_routes(
             # How the window lays the keys out, from each key's own section
             # (``settings.sections``), so a product's key is shown where the
             # product declared it without the window naming it.
-            "sections": settings_module.sections(),
+            "sections": [
+                {
+                    "title": section["title"],
+                    "keys": [
+                        name for name in section["keys"] if not hosted_mode or _hosted_visible(name)
+                    ],
+                }
+                for section in settings_module.sections()
+                if not hosted_mode or any(_hosted_visible(name) for name in section["keys"])
+            ],
             # The names the window's prose needs and cannot know on its own:
             # which product's version the diagnostics block reports, and the
             # state directory the project config file lives in.
@@ -133,7 +154,7 @@ def register_settings_routes(
                 "version": installed.version,
                 "state_dirname": installed.state_dirname,
             },
-            "diagnostics": facts,
+            "diagnostics": {} if hosted_mode else facts,
         }
 
         # What is on disk now, which after a write is not what this run started
@@ -143,7 +164,7 @@ def register_settings_routes(
         # than raised.
         try:
             saved = await loop.run_in_executor(
-                None, functools.partial(settings_module.resolve, serve_dir, flags=settings.flags)
+                None, functools.partial(settings_module.resolve, state_dir, flags=settings.flags)
             )
         except settings_module.SettingsError as exc:
             body["pending"] = {}
@@ -171,13 +192,13 @@ def register_settings_routes(
 
     @app.get("/settings")
     async def get_settings(req):
-        if auth.authenticate(req) is None:
+        if auth.authenticate(req, "project.read" if hosted_mode else None) is None:
             return refusal()
         return await _payload(), 200
 
     @app.put("/settings")
     async def put_settings(req):
-        if auth.authenticate(req) is None:
+        if auth.authenticate(req, "project.write" if hosted_mode else None) is None:
             return refusal()
 
         data, error = await read_json_body(req)
@@ -197,7 +218,24 @@ def register_settings_routes(
             }, 400
         if not changes:
             return {"ok": False, "error": "changes is empty; nothing to write"}, 400
-        refused = sorted(name for name in BIND_KEYS if name in changes) if mounted else ()
+        if hosted_mode:
+            refused = sorted(
+                name
+                for name in changes
+                if name in BIND_KEYS
+                or _hosted_frozen(name)
+                or (
+                    name in settings_module.KEYS_BY_NAME
+                    and settings_module.PROJECT not in settings_module.KEYS_BY_NAME[name].layers
+                )
+            )
+            if refused:
+                return {
+                    "ok": False,
+                    "error": "service configuration cannot be set here: %s" % ", ".join(refused),
+                }, 400
+        else:
+            refused = sorted(name for name in BIND_KEYS if name in changes) if mounted else ()
         if refused:
             return {
                 "ok": False,
@@ -208,7 +246,13 @@ def register_settings_routes(
         try:
             _resolved, written = await loop.run_in_executor(
                 None,
-                functools.partial(settings_module.apply, serve_dir, changes, flags=settings.flags),
+                functools.partial(
+                    settings_module.apply,
+                    state_dir,
+                    changes,
+                    flags=settings.flags,
+                    layer="project" if hosted_mode else None,
+                ),
             )
         except settings_module.SettingsError as exc:
             # Every refusal this route makes past the body's shape comes from

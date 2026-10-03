@@ -639,3 +639,22 @@ async def test_hosted_mode_requires_a_verifier():
 
     with pytest.raises(ValueError, match="requires a delegation-token verifier"):
         BrowserAuth(None, hosted_mode=True)
+
+
+async def test_hosted_connection_rechecks_scope_and_expiry():
+    from types import SimpleNamespace
+
+    from annealage_agent.identity import BrowserAuth
+
+    claims = _HostedClaims()
+    auth = BrowserAuth(None, hosted_mode=True, hosted_verifier=_HostedVerifier(claims))
+    request = SimpleNamespace(headers={"Authorization": "Bearer signed-token"})
+    human = auth.authenticate(request, "project.read")
+
+    assert auth.permits(human, "project.read")
+    assert not auth.permits(human, "project.write")
+    assert not auth.expired(human)
+
+    claims.exp = 0
+    assert not auth.permits(human, "project.read")
+    assert auth.expired(human)
