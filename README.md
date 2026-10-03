@@ -505,6 +505,8 @@ Agent-owned HTTP routes name their canonical `project.*` operation. WebSockets r
 
 Session files, event logs, settings and uploads use the external state paths as deletable worker cache, not as the project revision store. Hosted settings expose project-layer preferences, hide backend/model/provider/credential and user-only service fields, and reject writes to them. Agent mode is limited to the embedded `omp` backend; hosted mode refuses Claude/Codex sessions and external agents. Standalone token and Tailscale authentication are unchanged.
 
+Human-authored acts are also handed, as they happen, to an injected `state_sink(record) -> None` (`create_app(..., state_sink=...)`, hosted mode only; no sink records nothing). A record is `{record_id, kind, principal_id, display, payload, rev?, ts}` with `kind` one of `comment`, `comment_status`, `user_turn`, `permission_decision`; `principal_id` is the delegated `usr_<uuid>` (or `usr_public`) and `display` the attribution snapshot, never an authorisation input. `record_id` is deterministic (`comment:<id>`, `comment_status:<id>:<µs>`, `user_turn:<session>:<turn>`, `permission_decision:<request>`), so the sink must be idempotent and thread-safe; a failing sink is logged, the local record is kept, and undelivered records are offered again before the next one (in memory, at most five attempts). A login-only record (anything written before hosted mode) is legacy attribution and is never emitted or treated as authorisation. See `hosted_state.py`.
+
 ## Development
 
     uv sync --extra dev --extra codex

@@ -505,7 +505,11 @@ class UserTurn(AgentEvent):
     ``blocks`` are the human's, never the product's notes ``begin_turn`` puts
     in front of them, and an image is its ``image_path`` block, a path under
     the served directory: the pixels stay in the file, out of the log. ``by``
-    is the sender's login, when they were signed in by one.
+    is the sender's login, when they were signed in by one. In hosted mode
+    ``principal_id`` is the sender's delegated id and ``display`` the label
+    snapshot taken with it (attribution only); a turn logged before they
+    existed has a login or nothing, which is legacy attribution and never
+    authorisation.
     """
 
     kind: ClassVar[str] = "user_turn"
@@ -514,6 +518,8 @@ class UserTurn(AgentEvent):
     client_id: Optional[str] = None
     viewer: Optional[str] = None
     by: Optional[str] = None
+    principal_id: Optional[str] = None
+    display: Optional[str] = None
 
 
 #: Every event kind the agent layer emits itself. A product's own event

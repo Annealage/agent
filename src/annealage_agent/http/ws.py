@@ -35,6 +35,7 @@ from microdot import Response
 from microdot.websocket import WebSocket, WebSocketError, websocket_upgrade
 
 from .. import protocol
+from ..hosted_state import attribution
 from ..session.base import AGENT_READY, PauseChanged, TurnEnd, UnknownRequest, UserTurn
 from ..viewers import ViewerRegistry
 
@@ -127,6 +128,7 @@ def register_ws(
     session_info,
     holder,
     hosted_frame_ops=None,
+    recorder=None,
 ):
     """Register ``/ws`` on ``app``.
 
@@ -153,6 +155,11 @@ def register_ws(
     and written by an inbound ``pause`` frame; this module never calls
     through it, because a ``call`` originates with a tool, never with a
     socket.
+
+    ``recorder`` is the hosted ``StateRecorder`` (``hosted_state.py``): a turn
+    the human sends and a permission decision they make are also given to its
+    injected sink, with their principal id and display snapshot. ``None``
+    records nothing.
     """
 
     @app.get("/ws")
@@ -230,6 +237,7 @@ def register_ws(
                 auth,
                 human,
                 hosted_frame_ops or {},
+                recorder,
             )
         except (WebSocketError, ConnectionError, asyncio.IncompleteReadError):
             # The peer closed, vanished (a reset or broken pipe as this
@@ -436,7 +444,16 @@ _AGENT_FRAMES = frozenset(("turn", "interrupt", "permission", "set_model"))
 
 
 async def _serve_connection(
-    ws, conn, registry, event_log, token, holder, auth=None, human=None, frame_ops=None
+    ws,
+    conn,
+    registry,
+    event_log,
+    token,
+    holder,
+    auth=None,
+    human=None,
+    frame_ops=None,
+    records=None,
 ):
     """Read and dispatch frames until the peer goes away.
 
@@ -497,10 +514,12 @@ async def _serve_connection(
                 bus.hosted_turn_live = False
                 bus.hosted_turn_ops = ()
                 bus.hosted_turn_secret = None
-        await _dispatch(ws, conn, registry, event_log, token, frame, session, bus)
+        await _dispatch(ws, conn, registry, event_log, token, frame, session, bus, records)
 
 
-async def _dispatch(ws, conn, registry, event_log, token, frame, session=None, bus=None):
+async def _dispatch(
+    ws, conn, registry, event_log, token, frame, session=None, bus=None, records=None
+):
     """Route one validated inbound frame."""
     kind = frame["type"]
     if kind == "hello":
@@ -578,7 +597,7 @@ async def _dispatch(ws, conn, registry, event_log, token, frame, session=None, b
         # blocking this connection's read loop on the whole turn would stop it
         # reading the interrupt frame that ends it.
         if kind == "turn":
-            await _submit_turn(ws, conn, registry, event_log, frame, session, bus)
+            await _submit_turn(ws, conn, registry, event_log, frame, session, bus, records)
             return
         try:
             if kind == "interrupt":
@@ -586,12 +605,22 @@ async def _dispatch(ws, conn, registry, event_log, token, frame, session=None, b
             elif kind == "set_model":
                 await session.set_model(frame["model"])
             else:
+                request_id = frame["request_id"]
+                tool = _pending_tool(bus, request_id) if records is not None else None
                 await session.decide_permission(
-                    frame["request_id"],
+                    request_id,
                     frame["decision"],
                     frame.get("message", ""),
                     by=_login(conn),
                 )
+                if records is not None:
+                    await records.permission_decision(
+                        conn.human,
+                        request_id,
+                        frame["decision"],
+                        frame.get("message", ""),
+                        tool=tool,
+                    )
         except UnknownRequest:
             # Ordinary, not a failure: two tabs held one card and this is the
             # one that lost, or the request expired before the click landed.
@@ -621,7 +650,7 @@ async def _dispatch(ws, conn, registry, event_log, token, frame, session=None, b
     await ws.send(json.dumps(protocol.build_refused("unhandled frame type: %s" % kind)))
 
 
-async def _submit_turn(ws, conn, registry, event_log, frame, session, bus):
+async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, records=None):
     """Hand one ``turn`` frame to the session, logging what the human sent.
 
     Counted, and the product's queued notes put in front of it, here in front
@@ -665,6 +694,7 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus):
     if bus is not None:
         blocks_to_send = bus.begin_turn(blocks, by=conn.human)
         turn = bus.turn
+        who = attribution(conn.human)
         _publish(
             event_log,
             registry,
@@ -674,8 +704,16 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus):
                 client_id=client_id,
                 viewer=conn.tab_id,
                 by=_login(conn),
+                principal_id=who[0] if who else None,
+                display=who[1] if who else None,
             ),
         )
+        if records is not None:
+            # Before the session sees the turn, so the durable copy of what
+            # the human asked exists whatever the agent then does.
+            await records.user_turn(
+                conn.human, getattr(session, "session_id", None), turn, blocks, client_id
+            )
     else:
         blocks_to_send = blocks
     try:
@@ -700,6 +738,19 @@ def _login(conn):
     records as ``by``; ``None`` for the browser token's holder, whose identity
     is unknown."""
     return conn.human.login if conn.human is not None else None
+
+
+def _pending_tool(bus, request_id):
+    """The tool the open permission request ``request_id`` asks about, for the
+    durable record of the decision; ``None`` when it cannot be told."""
+    broker = getattr(bus, "broker", None)
+    try:
+        for request in broker.pending_requests() if broker is not None else ():
+            if request.request_id == request_id:
+                return request.tool
+    except Exception:
+        pass
+    return None
 
 
 def _publish(event_log, registry, event):

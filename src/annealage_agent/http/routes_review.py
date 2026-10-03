@@ -21,7 +21,10 @@ not readable without them either, unlike a product's own file routes (Mesh's
 ``/callouts``) whose contract predates this one. A human signed in by their
 tailnet login is recorded: the comment they add carries their login as
 ``by``, and a status they set carries it as ``status_by``, for a store that
-keeps them (``JsonReviewStore``).
+keeps them (``JsonReviewStore``). In hosted mode the comment and the status
+change are also recorded, with the principal id and display snapshot, through
+the injected state sink (``hosted_state.py``); the login stays attribution
+only.
 
 A product with no review store still has the routes, answering 404: the
 route list is the agent layer's own, the same for every product, which is also
@@ -40,15 +43,21 @@ import asyncio
 import functools
 
 from .. import product
+from ..hosted_state import StateRecorder
 from ..review.model import HUMAN, OPEN, RESOLVED, ReviewError
 from . import read_json_body
 from .ws import refusal
 
 
-def register_review_routes(app, *, store, auth):
+def register_review_routes(app, *, store, auth, recorder=None):
     """Register ``GET`` and ``POST /review`` and ``POST /review/<id>`` on
     ``app`` over ``store`` (a ``ReviewStore``, or ``None`` when the product
-    keeps no review), each gated by ``auth`` (``identity.BrowserAuth``)."""
+    keeps no review), each gated by ``auth`` (``identity.BrowserAuth``).
+    ``recorder`` is the hosted ``StateRecorder``, given each comment and
+    status change a hosted principal makes; ``None`` records nothing."""
+
+    if recorder is None:
+        recorder = StateRecorder(None)
 
     def _no_review():
         return {
@@ -105,14 +114,15 @@ def register_review_routes(app, *, store, auth):
                 "ok": False,
                 "error": 'body must be {"anchor": {...}, "text": "..."}',
             }, 400
+
+        def add():
+            written = store.add_comment(anchor=anchor, text=text, author=HUMAN, by=human.login)
+            recorder.comment(human, written.comment)
+            return written
+
         loop = asyncio.get_running_loop()
         try:
-            written = await loop.run_in_executor(
-                None,
-                functools.partial(
-                    store.add_comment, anchor=anchor, text=text, author=HUMAN, by=human.login
-                ),
-            )
+            written = await loop.run_in_executor(None, add)
         except ReviewError as exc:
             return {"ok": False, "error": str(exc)}, 400
         return {"ok": True, "comment": written.comment.to_wire()}, 200
@@ -142,9 +152,17 @@ def register_review_routes(app, *, store, auth):
             change = functools.partial(store.resolve_comment, comment_id, by=human.login)
         else:
             return {"ok": False, "error": 'status must be "open" or "resolved"'}, 400
+
+        def set_status():
+            written = change()
+            # Once the change has landed; a sink that fails costs the durable
+            # copy, never the status the human just set.
+            recorder.comment_status(human, written.comment, status)
+            return written
+
         loop = asyncio.get_running_loop()
         try:
-            written = await loop.run_in_executor(None, change)
+            written = await loop.run_in_executor(None, set_status)
         except ReviewError as exc:
             return {"ok": False, "error": str(exc)}, 400
         return {"ok": True, "comment": written.comment.to_wire()}, 200

@@ -38,6 +38,7 @@ from microdot import Microdot, Request
 
 from . import files, net, product, protocol, sessions, uploads
 from . import settings as settings_module
+from .hosted_state import StateRecorder
 from .http.routes_chat import register_chat_routes, register_upload_action_route
 from .http.routes_login import LoginNonces, register_login_routes, register_whoami_route
 from .http.routes_logs import register_log_routes
@@ -245,6 +246,7 @@ def create_app(
     hosted_upload_dir=None,
     hosted_tool_ops=None,
     hosted_frame_ops=None,
+    state_sink=None,
 ):
     """Build a Microdot app serving ``serve_dir``, routes registered, not started.
 
@@ -341,6 +343,12 @@ def create_app(
     worker's ambient home. Session state and uploads go to those paths; the
     served source remains the agent's working directory.
 
+    ``state_sink(record: dict) -> None`` (hosted mode only) receives the
+    durable record of each human-authored act (a comment, a status change, a
+    user turn, a permission decision), shaped and described in
+    ``hosted_state.py``. It must be thread-safe and idempotent by
+    ``record_id``; a failure is logged and never fails the request. ``None``
+    (the default) records nothing.
 
     ``resume_session`` is a factory shaped like ``build_session``
     (``(on_event, *, bus) -> session``) for the session an idle-closed app
@@ -384,6 +392,8 @@ def create_app(
             "processes beside the agent's shell, and the browser token approves "
             "permission requests"
         )
+    if state_sink is not None and not hosted_mode:
+        raise ValueError("state_sink records hosted principals, so it requires hosted mode")
     if hosted_mode:
         if hosted_state_dir is None:
             raise ValueError("hosted mode requires an external hosted_state_dir")
@@ -515,7 +525,8 @@ def create_app(
         hosted_mode=hosted_mode,
         mounted=bool(url_prefix),
     )
-    register_review_routes(app, store=review_store, auth=auth)
+    recorder = StateRecorder(state_sink)
+    register_review_routes(app, store=review_store, auth=auth, recorder=recorder)
 
     # The registry reports presence before the holder exists to take it (the
     # holder is built from the registry); the name is bound by the time a
@@ -812,6 +823,7 @@ def create_app(
         session_info=session_info,
         holder=holder,
         hosted_frame_ops=hosted_frame_ops,
+        recorder=recorder,
     )
 
     install_response_handlers(app, csp_value, server_header)
