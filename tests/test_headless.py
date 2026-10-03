@@ -423,6 +423,15 @@ async def test_invalid_omp_request_timeout_is_rejected(tmp_path, request_timeout
         await run_prompt("go", **make_args(tmp_path, omp_request_timeout=request_timeout))
 
 
+async def test_a_usage_sink_is_refused_for_claude_and_when_not_callable(tmp_path):
+    with pytest.raises(ValueError, match="usage_sink is only supported with backend='omp'"):
+        await run_prompt(
+            "go", **make_args(tmp_path, backend="claude", usage_sink=lambda event: None)
+        )
+    with pytest.raises(ValueError, match="usage_sink must be a callable"):
+        await run_prompt("go", **make_args(tmp_path, usage_sink="not a function"))
+
+
 async def test_omp_request_timeout_is_rejected_for_claude(tmp_path):
     with pytest.raises(ValueError, match="only supported with backend='omp'"):
         await run_prompt("go", **make_args(tmp_path, backend="claude", omp_request_timeout=180))

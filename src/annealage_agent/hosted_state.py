@@ -32,7 +32,11 @@ reconcile from. With no sink every method here is a no-op.
 The session's own lifecycle (launch, cancel, end, error) goes to the same sink
 as ``session_event`` records (``SessionEvents``), and each provider request's
 token counts go to a second, telemetry-only ``usage_sink`` (``usage_event``,
-``UsageRecorder``) under the same delivery policy.
+``UsageRecorder``) under the same delivery policy. The usage sink is not tied
+to hosted mode: ``create_app`` takes one in hosted mode, and
+``headless.run_prompt`` takes one for any omp run (a product's sub-sessions),
+so a caller can cross-check the inference proxy's meter. It reports tokens
+only, never a cost, and the proxy remains the authoritative meter.
 """
 
 import asyncio
@@ -200,6 +204,16 @@ class Sink:
         task = loop.create_task(self.emit_async(item, key))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    async def drain(self) -> None:
+        """Wait (bounded by ``SINK_TIMEOUT``) for the deliveries ``emit_soon``
+        started. Never raises."""
+        tasks = list(self._tasks)
+        if not tasks:
+            return
+        _, pending = await asyncio.wait(tasks, timeout=SINK_TIMEOUT)
+        if pending:
+            _warn("%s sink still delivering after %ss; carrying on" % (self._label, SINK_TIMEOUT))
 
 
 class StateRecorder:
@@ -406,7 +420,8 @@ def usage_event(
 class UsageRecorder:
     """Hands per-request usage events (``usage_event``) to the injected
     ``usage_sink``, with the same failure policy as the state sink. Telemetry
-    and attribution only: the inference proxy is the authoritative meter."""
+    and attribution only: the inference proxy is the authoritative meter. Used
+    by ``create_app`` (hosted mode) and by ``headless.run_prompt``."""
 
     def __init__(self, sink: Optional[Callable[[dict], None]]):
         self._sink = Sink(sink, label="usage")
@@ -418,6 +433,11 @@ class UsageRecorder:
     def report(self, event: dict) -> None:
         """Deliver ``event`` from the event loop without waiting for the sink."""
         self._sink.emit_soon(event, event["event_id"])
+
+    async def drain(self) -> None:
+        """Wait (bounded by ``SINK_TIMEOUT``) for the deliveries ``report``
+        started, for a caller that is about to leave the event loop."""
+        await self._sink.drain()
 
 
 __all__ = [

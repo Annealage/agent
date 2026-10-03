@@ -77,11 +77,13 @@ import contextlib
 import dataclasses
 import math
 import os
+import secrets
 import sys
 import tempfile
 from typing import Any, List, Optional, Tuple
 
 from . import product
+from .hosted_state import UsageRecorder
 from .session.base import (
     AGENT_READY,
     AGENT_UNAVAILABLE,
@@ -325,7 +327,9 @@ class _Run:
         )
 
 
-def _check_arguments(prompt, tools, backend, model, cwd, timeout, thinking, omp_request_timeout):
+def _check_arguments(
+    prompt, tools, backend, model, cwd, timeout, thinking, omp_request_timeout, usage_sink=None
+):
     if backend == "codex":
         raise ValueError(
             "run_prompt does not support the codex backend: it reaches its tools "
@@ -334,6 +338,16 @@ def _check_arguments(prompt, tools, backend, model, cwd, timeout, thinking, omp_
         )
     if backend not in BACKENDS:
         raise ValueError("backend must be one of %s, not %r" % (", ".join(BACKENDS), backend))
+    if usage_sink is not None:
+        if not callable(usage_sink):
+            raise ValueError(
+                "usage_sink must be a callable taking one dict, not %r" % (usage_sink,)
+            )
+        if backend != "omp":
+            raise ValueError(
+                "usage_sink is only supported with backend='omp': the Claude backend reports "
+                "usage per turn, not per provider request"
+            )
     if not isinstance(tools, ToolSet):
         raise ValueError("tools must be a ToolSet, not %r" % (tools,))
     if not isinstance(prompt, str) or not prompt.strip():
@@ -389,13 +403,14 @@ def _build_session(
     omp_binary,
     omp_config_dir,
     omp_request_timeout,
+    session_id,
+    on_request_usage,
 ):
     """The session ``backend`` names, built and not started. ``launch.build_session``
     is the app's: it is made of the served directory (the working directory and
     the state directory are one there), resume, settings and the product's own
     context, none of which a headless run has, so the two classes are built
     directly with only what a run needs."""
-    session_id = "headless"
     if backend == "omp":
         from .session.omp import OmpSession
 
@@ -415,6 +430,7 @@ def _build_session(
             # The conversation file goes under the run's own state, and goes
             # with it.
             session_dir=os.path.join(state_dir, "omp"),
+            on_request_usage=on_request_usage,
         )
 
     from .session.sdk import SdkSession
@@ -491,6 +507,7 @@ async def run_prompt(
     omp_binary=None,
     omp_config_dir=None,
     omp_request_timeout=None,
+    usage_sink=None,
 ):
     """Run ``prompt`` as one turn of a fresh agent session with ``tools``, and
     return its ``RunResult``. See the module docstring.
@@ -511,10 +528,27 @@ async def run_prompt(
     are ``launch.build_session``'s omp profile, executable and config root,
     ``None`` for omp as installed.
 
+    ``usage_sink(event: dict) -> None`` (omp only) receives one event per
+    provider request the run makes, with that request's own token counts
+    (``hosted_state.usage_event``'s shape: ``event_id``, ``session_id``,
+    ``turn_index``, ``backend``, ``model``, ``provider``,
+    ``provider_request_id``, ``tokens_*``, ``ts``; ``None`` for a count omp did
+    not give, no cost). ``event_id`` is ``<session_id>:<turn>:<request n>`` and
+    ``session_id`` is minted for the run (``headless-<16 hex>``), so two runs,
+    concurrent or not, never share an id. It is telemetry only, to check the
+    inference proxy's meter against: best effort, called from an executor
+    thread (so thread-safe), idempotent by ``event_id``, and a sink that
+    raises is logged and retried a few times, never failing or changing the
+    run. The events are delivered before ``run_prompt`` returns (up to 10
+    seconds). No sink, no events, and the run is otherwise unchanged. The
+    Claude backend gives no per-request figures, so it refuses a sink.
+
     Raises ``ValueError`` for a bad argument, ``CancelledError`` if cancelled
     (the session closed first); never for a model or backend failure.
     """
-    _check_arguments(prompt, tools, backend, model, cwd, timeout, thinking, omp_request_timeout)
+    _check_arguments(
+        prompt, tools, backend, model, cwd, timeout, thinking, omp_request_timeout, usage_sink
+    )
 
     with tempfile.TemporaryDirectory(prefix="annealage-headless-") as state_dir:
         bus = ViewerBus(ViewerRegistry(), url="")
@@ -531,6 +565,13 @@ async def run_prompt(
         # The channel a tool that reads its broker uses (app.py's, launch.py's).
         bus.tools = server
         bus.broker = broker
+        # The per-request usage channel (app.py's, launch.py's): None unless the
+        # caller gave a sink, and then omp registers nothing extra.
+        usage = UsageRecorder(usage_sink)
+        bus.request_usage = usage.report if usage.enabled else None
+        # Unique to this run: the usage event ids are built from it, and two
+        # runs in one process (or one meter) must not share them.
+        session_id = "headless-%s" % secrets.token_hex(8)
         try:
             try:
                 session = _build_session(
@@ -548,6 +589,8 @@ async def run_prompt(
                     omp_binary=omp_binary,
                     omp_config_dir=omp_config_dir,
                     omp_request_timeout=omp_request_timeout,
+                    session_id=session_id,
+                    on_request_usage=bus.request_usage,
                 )
             except Exception as exc:
                 # The backend's package missing (omp_rpc is installed apart), say.
@@ -574,3 +617,8 @@ async def run_prompt(
                 await run.drain()
         finally:
             run.end()
+            # After the session is closed, so every request it reported is
+            # queued; a caller that leaves the event loop next (asyncio.run
+            # ending) would otherwise drop those still being delivered. Never
+            # raises, bounded, and nothing at all without a sink.
+            await usage.drain()

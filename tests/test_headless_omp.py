@@ -411,3 +411,98 @@ async def test_a_handler_that_will_not_stop_is_abandoned_after_the_drain(
     release.set()
     assert result.error == "timeout"
     assert time.monotonic() - began < 3
+
+
+# --- usage_sink: per-request usage events ---------------------------------------------
+
+
+def _request(client, usage, response_id=None):
+    message = {"role": "assistant", "provider": "titan", "model": "qwen3-27b", "usage": usage}
+    if response_id is not None:
+        message["responseId"] = response_id
+    client._listeners["message_end"](SimpleNamespace(message=message))
+
+
+async def test_every_provider_request_of_a_run_reaches_the_usage_sink_before_it_returns(
+    omp_client, tmp_path
+):
+    events = []
+
+    def script(client):
+        _request(client, {"input": 900, "output": 40, "cacheRead": 0, "cacheWrite": 120}, "resp-a")
+        client.call("lookup", {"q": "x"}, "c1")
+        _request(client, {"input": 30, "output": 75, "cacheRead": 1020, "cacheWrite": 0})
+        client.end()
+
+    omp_client.script = script
+    result = await run_prompt("go", **make_args(tmp_path, usage_sink=events.append))
+
+    # Delivered already: nothing is awaited between the return and this check.
+    assert result.error is None
+    session_id = events[0]["session_id"]
+    assert session_id.startswith("headless-") and len(session_id) == len("headless-") + 16
+    assert [e["event_id"] for e in events] == [session_id + ":1:1", session_id + ":1:2"]
+    assert {k: v for k, v in events[0].items() if k not in ("ts", "event_id", "session_id")} == {
+        "turn_index": 1,
+        "backend": "omp",
+        "model": "qwen3-27b",
+        "provider": "titan",
+        "provider_request_id": "resp-a",
+        "tokens_input": 900,
+        "tokens_output": 40,
+        "tokens_cache_read": 0,
+        "tokens_cache_write": 120,
+        "tokens_reasoning": None,
+    }
+    assert events[1]["provider_request_id"] is None
+    assert (events[1]["tokens_input"], events[1]["tokens_cache_read"]) == (30, 1020)
+    assert not any("cost" in key for event in events for key in event)
+
+
+async def test_concurrent_runs_never_share_an_event_id(omp_client, tmp_path):
+    events = []
+    lock = threading.Lock()
+
+    def sink(event):
+        with lock:
+            events.append(event)
+
+    def script(client):
+        _request(client, {"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0})
+        client.end()
+
+    omp_client.script = script
+    results = await asyncio.gather(
+        *(run_prompt("go", **make_args(tmp_path, usage_sink=sink)) for _ in range(4))
+    )
+
+    assert [r.error for r in results] == [None] * 4
+    ids = [e["event_id"] for e in events]
+    assert len(ids) == 4 and len(set(ids)) == 4
+    assert len({e["session_id"] for e in events}) == 4
+
+
+async def test_without_a_usage_sink_omp_is_listened_to_as_before(omp_client, tmp_path):
+    omp_client.script = lambda client: client.end()
+    result = await run_prompt("go", **make_args(tmp_path))
+    assert result.error is None
+    (client,) = omp_client.instances
+    assert "message_end" not in client._listeners
+
+
+async def test_a_usage_sink_that_raises_is_logged_and_never_fails_the_run(
+    omp_client, tmp_path, capsys
+):
+    def sink(event):
+        raise RuntimeError("meter down")
+
+    def script(client):
+        _request(client, {"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0})
+        client.say("fine")
+        client.end()
+
+    omp_client.script = script
+    result = await run_prompt("go", **make_args(tmp_path, usage_sink=sink))
+
+    assert (result.error, result.text, result.stop_reason) == (None, "fine", "end")
+    assert "usage sink failed" in capsys.readouterr().err
