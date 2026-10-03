@@ -546,3 +546,96 @@ async def test_an_event_log_from_before_attribution_replays_beside_a_new_one(tmp
     replayed = [wire for _seq, wire in EventLog(str(path)).replay(0).events]
     assert replayed[:3] == old
     assert replayed[3]["by"] == LOGIN
+
+
+class _HostedClaims:
+    sub = "usr_123"
+    wsp = "wsp_123"
+    prj = "prj_123"
+    ops = ("project.read",)
+    job = "job_123"
+    rev = "rev-1"
+    exp = 9999999999
+
+
+class _HostedVerifier:
+    def __init__(self, claims=None, error=None):
+        self.claims = claims or _HostedClaims()
+        self.error = error
+        self.calls = []
+
+    def verify(self, token, requested_operation):
+        self.calls.append((token, requested_operation))
+        if self.error:
+            raise self.error
+        return self.claims
+
+
+async def test_hosted_auth_requires_operation_scoped_verified_bearer():
+    from types import SimpleNamespace
+
+    from annealage_agent.identity import BrowserAuth
+
+    verifier = _HostedVerifier()
+    auth = BrowserAuth(None, hosted_mode=True, hosted_verifier=verifier)
+    request = SimpleNamespace(headers={"Authorization": "Bearer signed-token"})
+
+    assert auth.authenticate(request) is None
+    assert auth.authenticate(request, "project.write") is None
+    human = auth.authenticate(request, "project.read")
+
+    assert verifier.calls == [
+        ("signed-token", "project.write"),
+        ("signed-token", "project.read"),
+    ]
+    assert human.principal_id == "usr_123"
+    assert human.workspace_id == "wsp_123"
+    assert human.project_id == "prj_123"
+    assert human.hosted_claims is verifier.claims
+
+
+async def test_hosted_display_is_attribution_only_and_rejects_control_text():
+    from types import SimpleNamespace
+
+    from annealage_agent.identity import BrowserAuth
+
+    auth = BrowserAuth(None, hosted_mode=True, hosted_verifier=_HostedVerifier())
+    request = SimpleNamespace(
+        headers={
+            "Authorization": "Bearer signed-token",
+            "X-Annealage-Principal-Display": "  Public beta  ",
+        }
+    )
+    human = auth.authenticate(request, "project.read")
+    assert human.name == "Public beta"
+
+    request.headers["X-Annealage-Principal-Display"] = "Public\nbeta"
+    assert auth.authenticate(request, "project.read").name is None
+
+
+async def test_hosted_auth_refuses_invalid_verifier_result_and_does_not_fallback():
+    from types import SimpleNamespace
+
+    from annealage_agent.identity import BrowserAuth
+
+    request = SimpleNamespace(
+        headers={
+            "Authorization": "Bearer signed-token",
+            "Tailscale-User-Login": LOGIN,
+        }
+    )
+    auth = BrowserAuth(
+        TOKEN,
+        TailscaleIdentity([LOGIN]),
+        hosted_mode=True,
+        hosted_verifier=_HostedVerifier(error=ValueError("invalid")),
+    )
+    assert auth.authenticate(request, "project.read") is None
+    assert auth.authenticate(SimpleNamespace(headers={"?t": TOKEN}), "project.read") is None
+
+
+async def test_hosted_mode_requires_a_verifier():
+    from annealage_agent.identity import BrowserAuth
+
+    with pytest.raises(ValueError, match="requires a delegation-token verifier"):
+        BrowserAuth(None, hosted_mode=True)

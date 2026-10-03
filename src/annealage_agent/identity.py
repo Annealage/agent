@@ -1,45 +1,17 @@
-"""Who the human at the page is: the browser token's holder, or a tailnet login.
+"""Who a request came from: a browser token, tailnet login or hosted principal.
 
-Every browser-gated route asks one question, ``BrowserAuth.authenticate``,
-and gets back a ``Human`` or ``None`` (the opaque 403). Two credentials answer
-it:
+Every browser-gated route asks ``BrowserAuth.authenticate`` and gets a
+``Human`` or ``None``. Standalone deployments keep their browser-token and
+Tailscale rules. A hosted worker accepts only a short-lived operation-scoped
+delegation token verified by its injected ``HostedVerifier``; the agent
+package does not parse hosted tokens or depend on the hosted control plane.
 
-- **The browser token** (``?t=``), as before: its holder is the human, and
-  nothing more is known about them (``Human()``, ``login`` of ``None``).
-- **A tailnet login** (``TailscaleIdentity``), when the server sits behind
-  ``tailscale serve``: serve adds ``Tailscale-User-Login`` and
-  ``Tailscale-User-Name`` to every request it proxies from a tailnet device,
-  WebSocket upgrades included, and replaces any copy the client sent. A login
-  on the product's users file (``load_users``) is the human, by name.
-
-The headers are ambient authority, like a cookie: serve adds them to whatever
-the browser sends, including a request a page on another site makes it send.
-Serve passes a hostile ``Origin`` straight through, so the Origin check is what
-stands between a login and cross-site request forgery or a cross-site
-WebSocket. That decides the rule ``authenticate`` applies to a header:
-
-- a present ``Origin`` must be one this server serves, as for the token;
-- anything but a plain ``GET`` or ``HEAD`` (a ``POST``, a ``PUT``, and the
-  ``/ws`` upgrade, which is a ``GET`` carrying ``Upgrade``) must carry an
-  ``Origin`` at all. A browser always sends one there; a request without one
-  is not the page, and a header on it proves nothing. A plain ``GET`` without
-  one is the page's own fetch (browsers leave ``Origin`` off a same-origin
-  ``GET``) unless its ``Sec-Fetch-Site`` says another site sent it (an
-  ``<img>`` or a link on that site), and nothing a route does for a ``GET``
-  changes anything.
-
-The token keeps its own rule: absent ``Origin`` is accepted with a valid
-token, so a script or a test holding it works as it always has.
-
-The headers are only as good as the path they came by. Anything on the host
-that can open a connection to the server's port can send them, which is why an
-app with an identity must be bound to loopback (``create_app``, ``serve`` and
-``FrontDoor`` refuse anything else) and why a product must not enable this for
-an agent backend with a shell of its own: that shell could forge a login to
-its own server and approve its own permission cards. The Origin rule stops
-browsers, not programs: anything running on a device signed in as an allowed
-login can go through serve with a matching ``Origin`` of its own and be the
-human, so a shell agent on that device can approve cards too.
+The Tailscale headers are ambient authority, like a cookie: serve adds them to
+whatever the browser sends, including a request a page on another site makes it
+send. The Origin check prevents cross-site requests, but not programs on a
+trusted device. Such an app must be bound to loopback and must not use an agent
+backend with a shell of its own, which could forge a login and approve its own
+permission cards.
 """
 
 import dataclasses
@@ -50,46 +22,65 @@ import unicodedata
 from email.errors import HeaderParseError
 from email.header import decode_header, make_header
 from pathlib import Path
-from typing import FrozenSet, Iterable, Optional
+from typing import FrozenSet, Iterable, Optional, Protocol
 
 from .http.ws import _origin_is_allowed, _token_is_allowed
 
+
+class HostedClaims(Protocol):
+    """The validated, job-scoped identity and authority from the hosted front."""
+
+    sub: str
+    wsp: str
+    prj: str
+    ops: tuple[str, ...]
+    job: str
+    rev: str
+    exp: int
+
+
+class HostedVerifier(Protocol):
+    """Verify a hosted delegation token for the operation being attempted."""
+
+    def verify(self, token: str, requested_operation: str) -> HostedClaims: ...
+
+
+DELEGATION_HEADER = "Authorization"
+PRINCIPAL_DISPLAY_HEADER = "X-Annealage-Principal-Display"
+_DISPLAY_LIMIT = 120
+
 #: The header serve puts the tailnet login in (``andrew@example.com``, or
 #: ``someone@github`` for a GitHub-backed tailnet).
-LOGIN_HEADER = "Tailscale-User-Login"
 #: The header serve puts the account's display name in, RFC 2047 encoded when
 #: it is not ASCII.
-NAME_HEADER = "Tailscale-User-Name"
-
 #: The users-file entry that allows any login serve vouches for.
-ANY_LOGIN = "*"
-
 # One login: printable ASCII with no space and no comma, which is what a proxy
 # that folded two copies of the header into one line would leave. ASCII only,
 # so comparing without regard to case is plain ASCII case folding: Unicode
 # ``lower()`` maps some other characters onto ASCII letters (the Kelvin sign
 # onto ``k``), which would let a login an identity provider issued stand in for
 # a different, allowed one. Tailnet logins are email-like and ASCII in practice.
+LOGIN_HEADER = "Tailscale-User-Login"
+NAME_HEADER = "Tailscale-User-Name"
+ANY_LOGIN = "*"
 _LOGIN_RE = re.compile(r"[\x21-\x2b\x2d-\x7e]+")
-
 _SAFE_METHODS = frozenset(("GET", "HEAD"))
 
 
 @dataclasses.dataclass(frozen=True)
 class Human:
-    """The human a request came from.
-
-    ``login`` is their tailnet login, or ``None`` for the browser token's
-    holder, whose identity is unknown. ``name`` is the display name serve
-    reported (the login when it reported none); ``None`` with no login.
-    """
+    """The human a request came from, retaining local and hosted authorship."""
 
     login: Optional[str] = None
     name: Optional[str] = None
+    principal_id: Optional[str] = None
+    workspace_id: Optional[str] = None
+    project_id: Optional[str] = None
+    hosted_claims: Optional[HostedClaims] = None
 
     @property
     def label(self) -> Optional[str]:
-        """What to call them: the name, else the login, else ``None``."""
+        """What to call them, with the hosted display snapshot first."""
         return self.name or self.login or None
 
 
@@ -221,11 +212,8 @@ def load_users(path) -> TailscaleIdentity:
 class BrowserAuth:
     """The one check every browser-gated route makes: ``authenticate(req)``.
 
-    ``token`` is the browser token (``None``: no token opens anything),
-    ``identity`` the tailnet logins allowed (``None``: headers are ignored),
-    ``allowed_origins`` the exact ``Origin`` values this server serves. The
-    agent token is never one of these: it opens ``/mcp`` and nothing else, and
-    no identity header opens ``/mcp``.
+    Hosted mode accepts only a verified, operation-scoped delegation token.
+    Local browser-token and Tailscale authentication remain unchanged.
     """
 
     def __init__(
@@ -234,24 +222,47 @@ class BrowserAuth:
         identity: Optional[TailscaleIdentity] = None,
         *,
         allowed_origins: Iterable[str] = (),
+        hosted_mode: bool = False,
+        hosted_verifier: Optional[HostedVerifier] = None,
     ):
+        if hosted_mode and hosted_verifier is None:
+            raise ValueError("hosted mode requires a delegation-token verifier")
         self._token = token
         self.identity = identity
         self._allowed_origins = frozenset(allowed_origins)
+        self._hosted_mode = hosted_mode
+        self._hosted_verifier = hosted_verifier
 
-    def authenticate(self, req) -> Optional[Human]:
-        """The ``Human`` behind ``req``, or ``None`` to refuse it.
+    def authenticate(self, req, requested_operation: Optional[str] = None) -> Optional[Human]:
+        """Return the authenticated author, or ``None`` to refuse the request.
 
-        A present ``Origin`` this server does not serve refuses the request
-        whatever it carries. Then an allowed login wins, so the human is
-        named even when the page also holds the token, provided the request
-        may carry one (the module docstring's rule: a plain ``GET`` or
-        ``HEAD`` the page itself sent, or any request with an ``Origin``).
-        Then a valid token gives
-        ``Human()``. Everything else is ``None``.
+        Hosted callers must name the operation being attempted. The injected
+        verifier checks the signature, expiry, audience and operation scope.
         """
         if not _origin_is_allowed(req, self._allowed_origins):
             return None
+        if self._hosted_mode:
+            if requested_operation is None:
+                return None
+            authorization = req.headers.get(DELEGATION_HEADER)
+            if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
+                return None
+            token = authorization[7:]
+            if not token or token.strip() != token:
+                return None
+            try:
+                claims = self._hosted_verifier.verify(token, requested_operation)
+            except Exception:
+                return None
+            if requested_operation not in claims.ops:
+                return None
+            return Human(
+                name=_hosted_display(req.headers.get(PRINCIPAL_DISPLAY_HEADER)),
+                principal_id=claims.sub,
+                workspace_id=claims.wsp,
+                project_id=claims.prj,
+                hosted_claims=claims,
+            )
         has_origin = req.headers.get("Origin") is not None
         if self.identity is not None and (has_origin or _is_plain_read(req)):
             human = self.identity.from_request(req)
@@ -260,6 +271,16 @@ class BrowserAuth:
         if _token_is_allowed(req, self._token):
             return Human()
         return None
+
+
+def _hosted_display(raw) -> Optional[str]:
+    """Accept only the front's short plain-text author snapshot."""
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()[:_DISPLAY_LIMIT]
+    if not value or any(unicodedata.category(char).startswith("C") for char in value):
+        return None
+    return value
 
 
 #: ``Sec-Fetch-Site`` values of a request the page itself (or the human, typing
@@ -285,8 +306,9 @@ def _is_plain_read(req) -> bool:
 
 
 def via(human: Human) -> str:
-    """How ``human`` was authenticated, as ``GET /whoami`` reports it:
-    ``"tailscale"`` for a login, ``"token"`` for the token's holder."""
+    """How ``human`` was authenticated, as ``GET /whoami`` reports it."""
+    if human.hosted_claims is not None:
+        return "hosted"
     return "tailscale" if human.login is not None else "token"
 
 
@@ -305,9 +327,13 @@ def check_bind(identity: Optional[TailscaleIdentity], bind) -> None:
 
 __all__ = [
     "ANY_LOGIN",
+    "DELEGATION_HEADER",
     "LOGIN_HEADER",
     "NAME_HEADER",
+    "PRINCIPAL_DISPLAY_HEADER",
     "BrowserAuth",
+    "HostedClaims",
+    "HostedVerifier",
     "Human",
     "TailscaleIdentity",
     "check_bind",

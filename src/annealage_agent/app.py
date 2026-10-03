@@ -31,6 +31,7 @@ import inspect
 import re
 import sys
 import time
+from typing import Optional
 
 from microdot import Microdot, Request
 
@@ -44,7 +45,7 @@ from .http.routes_review import register_review_routes
 from .http.routes_settings import register_settings_routes
 from .http.static import register_agent_static_routes
 from .http.ws import host_is_allowed, ping_forever, refusal, register_ws
-from .identity import BrowserAuth, check_bind
+from .identity import BrowserAuth, HostedVerifier, check_bind
 from .review.watcher import ReviewWatcher
 from .session import secret_paths
 from .session.base import (
@@ -237,6 +238,8 @@ def create_app(
     identity=None,
     start_closed=False,
     upload_actions=(),
+    hosted_mode=False,
+    hosted_verifier: Optional[HostedVerifier] = None,
 ):
     """Build a Microdot app serving ``serve_dir``, routes registered, not started.
 
@@ -282,13 +285,12 @@ def create_app(
     ``identity`` is an ``identity.TailscaleIdentity``, the tailnet logins
     allowed to act as the human when the server sits behind ``tailscale
     serve``, beside the token (``None``: the token alone). An app with one
-    must be bound to loopback, and is refused otherwise: serve's identity
-    headers are trustworthy only on a port nothing but serve and this host
-    can reach. ``app.agent_auth`` is the app's one ``identity.BrowserAuth``,
-    the check every browser route of the agent layer makes, and the one a
-    product's own routes should make (``app.agent_auth.authenticate(req)``,
-    a ``Human`` or ``None`` to refuse); it is set before ``register_routes``
-    is called.
+    must be bound to loopback, and is refused otherwise.
+
+    ``hosted_mode`` accepts only operation-scoped delegation tokens verified
+    by ``hosted_verifier``; the agent package does not depend on the hosted
+    control-plane package. Browser token and Tailscale authentication remain
+    available in standalone mode.
 
     ``session_id`` is the id the CLI resolved for this run (fresh or resumed,
     per plan section 3.4), or None for viewer-only; it is reported in the
@@ -389,7 +391,13 @@ def create_app(
     check_bind(identity, bind)
     allowed_origins = net.allowed_origins(bind, port, extra_origins)
     allowed_hosts = net.allowed_hosts(bind, port, extra_hosts)
-    auth = BrowserAuth(token, identity, allowed_origins=allowed_origins)
+    auth = BrowserAuth(
+        token,
+        identity,
+        allowed_origins=allowed_origins,
+        hosted_mode=hosted_mode,
+        hosted_verifier=hosted_verifier,
+    )
     agent_mode = session_id is not None or external_agents
     upload_actions = uploads.check_upload_actions(upload_actions) if agent_mode else ()
     # The documents uploaded for them, outside the served tree; building it
