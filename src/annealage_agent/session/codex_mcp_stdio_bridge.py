@@ -47,10 +47,8 @@ stdio-to-HTTP MCP proxy worth vendoring instead of this file: the ecosystem's
 best-known example of the pattern, ``mcp-remote``, is an npm package with no
 Python equivalent, and reaching for it would mean shipping a Node runtime
 dependency this project does not otherwise have, for a translation loop this file
-implements in well under 100 lines using a dependency (``mcp``, ``httpx``)
-this project already carries transitively through ``claude-agent-sdk`` (a
-base dependency, not the optional ``codex`` extra) and now declares
-directly.
+implements in well under 100 lines using the dependencies (``mcp``, ``httpx``)
+declared directly by this project rather than relied on through the Claude SDK.
 """
 
 from __future__ import annotations
@@ -139,25 +137,24 @@ async def _call_authority(
 
 
 def build_server(client: httpx.AsyncClient, url: httpx.URL, *, name: str, version: str) -> Server:
-    """A low-level ``Server`` named ``name``/``version`` whose
-    ``list_tools``/``call_tool`` handlers forward to the host's own ``/mcp``
-    endpoint - the whole of this proxy's own logic, everything else being the
-    official SDK's stdio machinery."""
-    server: Server = Server(name, version=version)
+    """A low-level ``Server`` whose request handlers forward to ``/mcp``."""
 
-    @server.list_tools()
-    async def list_tools() -> list[types.Tool]:
+    async def list_tools(ctx, params):
         result = await _call_authority(client, url, "tools/list", {})
-        return [types.Tool.model_validate(t) for t in (result or {}).get("tools", [])]
+        return types.ListToolsResult(
+            tools=[types.Tool.model_validate(t) for t in (result or {}).get("tools", [])]
+        )
 
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
+    async def call_tool(ctx, params):
         result = await _call_authority(
-            client, url, "tools/call", {"name": name, "arguments": arguments}
+            client,
+            url,
+            "tools/call",
+            {"name": params.name, "arguments": params.arguments or {}},
         )
         return types.CallToolResult.model_validate(result or {})
 
-    return server
+    return Server(name, version=version, on_list_tools=list_tools, on_call_tool=call_tool)
 
 
 def authority_url(host: str, port: int, path: str) -> httpx.URL:

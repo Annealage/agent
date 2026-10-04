@@ -235,13 +235,17 @@ async def test_run_prompt_omp_request_timeout_controls_the_rpc_ack_deadline(tmp_
         "    elif command == 'get_state':\n"
         "        data = {'sessionId': 'timeout-test'}\n"
         "    elif command == 'get_session_stats':\n"
-        "        data = {'tokens': {}, 'cost': 0.0}\n"
+        "        data = {'sessionId': 'timeout-test', 'userMessages': 0, "
+        "'assistantMessages': 0, 'toolCalls': 0, 'toolResults': 0, "
+        "'totalMessages': 0, 'premiumRequests': 0.0, 'cost': 0.0, "
+        "'tokens': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0, 'total': 0}}\n"
         "    elif command == 'get_available_models':\n"
         "        data = {'models': []}\n"
         "    print(json.dumps({'type': 'response', 'id': request['id'], "
         "'success': True, 'data': data}), flush=True)\n"
         "    if command == 'prompt':\n"
-        "        print(json.dumps({'type': 'agent_end', 'isTerminal': True}), flush=True)\n",
+        "        print(json.dumps({'type': 'agent_end', 'isTerminal': True, "
+        "'messages': []}), flush=True)\n",
         encoding="utf-8",
     )
     binary.chmod(0o755)

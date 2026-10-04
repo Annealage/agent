@@ -74,11 +74,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 import anyio
 import httpx
+import httpx2
 import mcp.types as types
 from claude_agent_sdk import SdkMcpTool, create_sdk_mcp_server
-from mcp import ClientSession
+from mcp import ClientSession, MCPError
 from mcp.client.streamable_http import streamable_http_client
-from mcp.shared.exceptions import McpError
 
 from . import product
 from .tools import Grading, _wrap, fail, namespaced
@@ -236,10 +236,10 @@ def _warn(message):
 async def _session(server):
     """An initialized ``ClientSession`` on ``server``, and its
     ``InitializeResult``, closed (and the remote's session ended) on exit."""
-    async with httpx.AsyncClient(
-        headers=dict(server.headers or {}), timeout=httpx.Timeout(CALL_TIMEOUT)
+    async with httpx2.AsyncClient(
+        headers=dict(server.headers or {}), timeout=httpx2.Timeout(CALL_TIMEOUT)
     ) as client:
-        async with streamable_http_client(server.url, http_client=client) as (read, write, _):
+        async with streamable_http_client(server.url, http_client=client) as (read, write):
             async with ClientSession(read, write) as session:
                 initialized = await session.initialize()
                 yield session, initialized
@@ -259,7 +259,7 @@ async def _call(session, name, arguments):
     request = types.CallToolRequest(
         params=types.CallToolRequestParams(name=name, arguments=arguments)
     )
-    return await session.send_request(types.ClientRequest(request), types.CallToolResult)
+    return await session.send_request(request, types.CallToolResult)
 
 
 async def _listing(server):
@@ -269,8 +269,8 @@ async def _listing(server):
             if server.prime is not None:
                 tool, arguments = server.prime
                 try:
-                    failed = (await _call(session, tool, arguments)).isError
-                except McpError:
+                    failed = (await _call(session, tool, arguments)).is_error
+                except MCPError:
                     failed = True
                 if failed:
                     _warn(
@@ -282,9 +282,9 @@ async def _listing(server):
             while True:
                 page = await session.list_tools(params=params)
                 listed.extend(page.tools)
-                if not page.nextCursor:
+                if not page.next_cursor:
                     break
-                params = types.PaginatedRequestParams(cursor=page.nextCursor)
+                params = types.PaginatedRequestParams(cursor=page.next_cursor)
     return initialized.instructions, listed
 
 
@@ -313,11 +313,11 @@ def _reason(exc, timeout):
     leaf = _leaf(exc)
     if isinstance(leaf, TimeoutError):
         return "no answer within %g s" % timeout
-    if isinstance(leaf, httpx.HTTPStatusError):
+    if isinstance(leaf, (httpx.HTTPStatusError, httpx2.HTTPStatusError)):
         return "HTTP %d" % leaf.response.status_code
-    if isinstance(leaf, McpError):
+    if isinstance(leaf, MCPError):
         return "it answered with an error: %s" % leaf.error.message
-    if isinstance(leaf, (httpx.TransportError, OSError)):
+    if isinstance(leaf, (httpx.TransportError, httpx2.TransportError, OSError)):
         return "%s: %s" % (type(leaf).__name__, leaf) if str(leaf) else type(leaf).__name__
     return None
 
@@ -333,7 +333,7 @@ def _proxied(server, tool):
     than reading it as the ``{param: type}`` shorthand. omp refuses a tool
     with no description, so one without gets a plain one.
     """
-    schema = dict(tool.inputSchema or {})
+    schema = dict(tool.input_schema or {})
     schema.setdefault("type", "object")
     schema.setdefault("properties", {})
     description = (tool.description or "").strip() or "%s, on the %s MCP server" % (
@@ -370,7 +370,7 @@ async def call(server, name, arguments):
             # Only closing the connection failed; the call itself answered.
             return _result(server.name, name, result)
         leaf = _leaf(exc)
-        if sent and isinstance(leaf, McpError):
+        if sent and isinstance(leaf, MCPError):
             return fail(
                 "the %s MCP server refused %s: %s" % (server.name, name, leaf.error.message)
             )
@@ -399,16 +399,16 @@ def _result(server_name, tool_name, result):
         if isinstance(block, types.TextContent):
             content.append({"type": "text", "text": block.text})
         elif isinstance(block, types.ImageContent):
-            content.append({"type": "image", "data": block.data, "mimeType": block.mimeType})
+            content.append({"type": "image", "data": block.data, "mimeType": block.mime_type})
         else:
             omitted.append(block.type)
-    if result.isError:
+    if result.is_error:
         text = "\n".join(item["text"] for item in content if item["type"] == "text")
         return fail(
             text or "%s on the %s MCP server failed without saying why" % (tool_name, server_name)
         )
-    if not content and result.structuredContent is not None:
-        content.append({"type": "text", "text": json.dumps(result.structuredContent, indent=2)})
+    if not content and result.structured_content is not None:
+        content.append({"type": "text", "text": json.dumps(result.structured_content, indent=2)})
     if omitted:
         content.append(
             {

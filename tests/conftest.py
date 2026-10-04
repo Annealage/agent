@@ -14,7 +14,10 @@ smallest served directory and a viewer-only app over it.
 
 import contextlib
 
+import anyio
 import pytest
+from mcp import ClientSession
+from mcp.shared.memory import create_client_server_memory_streams
 from microdot.test_client import TestClient
 from toy_product import TOY, TOY_PAGE, register_toy_routes
 
@@ -40,6 +43,18 @@ TEST_AUTHORITY = "%s:%d" % (TEST_HOST, DEFAULT_PORT)
 def make_test_client(app):
     """A TestClient whose Host header names the bind ``app`` was built for."""
     return TestClient(app, host=TEST_AUTHORITY)
+
+
+@contextlib.asynccontextmanager
+async def mcp_client(server):
+    """Connect a real MCP client/server over the SDK's memory transport."""
+    async with create_client_server_memory_streams() as (client_streams, server_streams):
+        async with anyio.create_task_group() as group:
+            group.start_soon(server.run, *server_streams, server.create_initialization_options())
+            async with ClientSession(*client_streams) as client:
+                await client.initialize()
+                yield client
+            group.cancel_scope.cancel()
 
 
 def create_toy_app(

@@ -41,49 +41,35 @@ classifiers = [
 # dependency resolves per platform, and upstream publishes wheels for macOS
 # arm64 and x86_64, manylinux aarch64 and x86_64, and win_amd64.
 #
-# The floor is 0.2.136 rather than 0.2.135 because that is the version the
-# permission-broker contract was verified against: a `can_use_tool` callback
-# must return PermissionResultAllow or PermissionResultDeny, and the plain dict
-# form that older examples show is rejected outright (Annealage Mesh's
-# docs/agent-chat-plan.md section 2a, fact 14). The `<0.3` cap is load-bearing,
-# since this design depends on `Transport`, which the SDK documents as internal.
+# The floor is 0.2.136 because the permission-broker contract was verified
+# against that release. The `<0.3` cap remains load-bearing because this
+# design depends on the SDK's internal `Transport` interface.
 dependencies = [
     # The web framework every route here is written against (app.py, http/).
     "microdot>=2.6,<3",
-    # 0.2.160: session/sdk.py imports ConversationResetMessage, which older
-    # releases lack (Mesh's venv at 0.2.136 failed to import the session).
-    "claude-agent-sdk>=0.2.160,<0.3",
-    # http/routes_mcp.py builds the /mcp endpoint's request and response
-    # bodies from mcp.types (Tool/CallToolResult/ListToolsResult), and
-    # session/codex_mcp_stdio_bridge.py's stdio side is built entirely on
-    # mcp.server (Server/stdio_server), and remote.py's client for a
-    # product's remote MCP servers on mcp.client: all direct imports of this
-    # project's own code, not merely something claude-agent-sdk happens to
-    # pull in underneath it, so it is declared here rather than relied on
-    # transitively - a future claude-agent-sdk release dropping its own use
-    # of mcp must not silently break this project's own direct imports of
-    # it. 1.24 is the first release with streamable_http_client (the client
-    # transport taking an httpx client, which replaced the deprecated
-    # streamablehttp_client) that remote.py connects with. The `<2` cap
-    # follows this project's usual practice of not trusting an unreleased
-    # next major to keep today's API shape.
-    "mcp>=1.24,<2",
-    # The HTTP client session/codex_mcp_stdio_bridge.py reaches the
-    # product's own /mcp endpoint with from the stdio-proxy subprocess, and
-    # the one remote.py hands mcp's transport for a remote server. Also
-    # already transitively present (mcp's own dependency), declared directly
-    # for the same reason as mcp above. 0.28.1 is what this floor was
-    # verified against; httpx's own versioning has stayed stable through the
-    # 0.2x series, so no upper cap tighter than the next major is warranted.
+    # 0.2.163 supports MCP 2 tool servers and includes the
+    # ConversationResetMessage imported by session/sdk.py.
+    "claude-agent-sdk>=0.2.163,<0.3",
+    # http/routes_mcp.py builds /mcp bodies from mcp.types,
+    # session/codex_mcp_stdio_bridge.py builds its stdio server with
+    # mcp.server, and remote.py connects to product servers through
+    # mcp.client. These direct imports must not rely on the Claude SDK's
+    # transitive dependency.
+    # MCP 2.3 moved streamable HTTP to httpx2 and now yields only read/write
+    # streams from streamable_http_client.
+    "mcp>=2.3,<3",
+    # remote.py uses httpx2 for MCP transport and its transport errors.
+    "httpx2>=2.10,<3",
+    # The Codex bridge's /mcp hop and URL construction use httpx directly;
+    # keep it declared rather than relying on another package to install it.
     "httpx>=0.27,<1",
     # session/codex_mcp_stdio_bridge.py imports anyio directly (anyio.run()
     # and anyio.get_cancelled_exc_class()), and remote.py bounds its calls
-    # with anyio.fail_after, so it is declared here for the
-    # same reason as mcp above rather than relied on through mcp and httpx,
-    # which both pull it in. The floor follows mcp's own (anyio>=4.5), the
-    # package whose stdio server the bridge runs under it; the `<5` cap
-    # follows the usual practice for the next major.
-    "anyio>=4.5,<5",
+    # with anyio.fail_after, so it is declared here for the same reason as
+    # mcp above rather than relied on through another package. MCP 2.3
+    # requires anyio>=4.9 on supported Python versions; the `<5` cap follows
+    # the usual practice for the next major.
+    "anyio>=4.9,<5",
     # settings.py locates the one user-wide settings.toml with this rather
     # than hand-rolling the platform's config-directory convention
     # (XDG_CONFIG_HOME on Linux, Application Support on macOS, %APPDATA% on

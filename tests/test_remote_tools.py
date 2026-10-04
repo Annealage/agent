@@ -1,10 +1,9 @@
 """Remote MCP servers a product declares beside its own tools (``remote.py``),
 reaching every backend through the same grading, pause gate and broker.
 
-The remote is ``FakeRemote``: a real MCP server (the ``mcp`` package's own
-low-level ``Server`` behind its streamable HTTP session manager) on a
-loopback port, served from a thread of its own the way a remote runs in a
-process of its own, so nothing here leaves the machine. Like a server that
+The remote is ``FakeRemote``: a real MCP low-level ``Server`` serving
+streamable HTTP on a loopback port from a thread of its own, the way a remote
+runs in a process of its own, so nothing here leaves the machine. Like a server that
 advertises tools progressively, it lists ``begin`` and ``lookup`` until
 ``begin`` has been called on a connection, and every tool after that; any
 tool is callable by name on any connection.
@@ -15,7 +14,6 @@ The toy product's tool server is built with the fake as its remote
 """
 
 import asyncio
-import contextlib
 import json
 import socket
 import threading
@@ -26,13 +24,9 @@ import anyio
 import mcp.types as types
 import pytest
 import uvicorn
-from conftest import make_test_client
+from conftest import make_test_client, mcp_client
 from mcp.server.lowlevel import Server
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp.shared.memory import create_connected_server_and_client_session
 from microdot import Microdot
-from starlette.applications import Starlette
-from starlette.routing import Route
 from toy_product import TOY, TOY_PAUSED_MESSAGE, build_toy_tools
 
 from annealage_agent import launch, sessions
@@ -96,55 +90,56 @@ class FakeRemote:
         self.arguments = []
         self.stored = []
         self.headers = []
-        server = Server("fake", instructions=INSTRUCTIONS)
         primed = set()
 
-        @server.list_tools()
-        async def list_tools():
-            session = id(server.request_context.session)
-            return ADVERTISED + (LATER if session in primed else [])
+        async def list_tools(ctx, params):
+            return types.ListToolsResult(
+                tools=ADVERTISED
+                + (LATER if ctx.request.headers["mcp-session-id"] in primed else [])
+            )
 
-        @server.call_tool(validate_input=False)
-        async def call_tool(name, arguments):
+        async def call_tool(ctx, params):
+            name, arguments = params.name, params.arguments or {}
             self.calls.append(name)
             self.arguments.append((name, arguments))
             if name == "submit":
-                return [types.TextContent(type="text", text="job 123")]
-            if name == "begin":
-                primed.add(id(server.request_context.session))
-                return [types.TextContent(type="text", text="welcome")]
-            if name == "lookup":
-                return [types.TextContent(type="text", text="found %s" % arguments["query"])]
-            if name == "picture":
-                return [
+                content = [types.TextContent(type="text", text="job 123")]
+            elif name == "begin":
+                primed.add(ctx.request.headers["mcp-session-id"])
+                content = [types.TextContent(type="text", text="welcome")]
+            elif name == "lookup":
+                content = [types.TextContent(type="text", text="found %s" % arguments["query"])]
+            elif name == "picture":
+                content = [
                     types.TextContent(type="text", text="a part"),
                     types.ImageContent(type="image", data=PNG, mimeType="image/png"),
                 ]
-            if name == "broken":
+            elif name == "broken":
                 return types.CallToolResult(
                     isError=True, content=[types.TextContent(type="text", text="no such part")]
                 )
-            if name == "slow":
-                await anyio.sleep(2)
-            if name == "store":
+            elif name == "store":
                 self.stored.append(arguments["text"])
-                return [types.TextContent(type="text", text="stored")]
-            return [types.TextContent(type="text", text="done")]
+                content = [types.TextContent(type="text", text="stored")]
+            else:
+                if name == "slow":
+                    await anyio.sleep(2)
+                content = [types.TextContent(type="text", text="done")]
+            return types.CallToolResult(content=content)
 
-        manager = StreamableHTTPSessionManager(app=server)
+        server = Server(
+            "fake", instructions=INSTRUCTIONS, on_list_tools=list_tools, on_call_tool=call_tool
+        )
+        mcp_app = server.streamable_http_app()
         seen = self.headers
 
         class Endpoint:
             async def __call__(self, scope, receive, send):
-                seen.append({k.decode(): v.decode() for k, v in scope["headers"]})
-                await manager.handle_request(scope, receive, send)
+                if scope["type"] == "http":
+                    seen.append({k.decode(): v.decode() for k, v in scope["headers"]})
+                await mcp_app(scope, receive, send)
 
-        @contextlib.asynccontextmanager
-        async def lifespan(app):
-            async with manager.run():
-                yield
-
-        app = Starlette(routes=[Route("/mcp", endpoint=Endpoint())], lifespan=lifespan)
+        app = Endpoint()
         self._server = uvicorn.Server(
             uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error")
         )
@@ -374,7 +369,7 @@ async def test_claude_gets_the_remote_as_a_server_of_its_own(fake, bus, tmp_path
 
     # What the Claude CLI sees of that server: the graded tools, callable.
     instance = options.mcp_servers["fake"]["instance"]
-    async with create_connected_server_and_client_session(instance) as client:
+    async with mcp_client(instance) as client:
         listed = await client.list_tools()
         assert {tool.name for tool in listed.tools} == PROXIED
         called = await client.call_tool("lookup", {"query": "RP2040"})

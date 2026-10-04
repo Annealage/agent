@@ -7,7 +7,6 @@ The remote is a Datum-shaped fake: it lists a few tools until
 including the three the agent must not get and one nobody has graded.
 """
 
-import contextlib
 import json
 import threading
 import time
@@ -16,10 +15,7 @@ from types import SimpleNamespace
 import mcp.types as types
 import pytest
 import uvicorn
-from mcp.server.lowlevel import Server
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from starlette.applications import Starlette
-from starlette.routing import Route
+from mcp.server import Server
 from toy_product import build_toy_tools
 
 from annealage_agent import datum
@@ -59,7 +55,6 @@ ADVERTISED = ("getting_started", "search_parts", "semantic_search", "list_boards
 class FakeDatum:
     def __init__(self, extra=()):
         self.calls = []
-        server = Server("datasheet-wiki", instructions="Call getting_started first.")
         primed = set()
         names = (*LOOKUPS, *WRITES, *WITHHELD, *extra)
 
@@ -68,30 +63,31 @@ class FakeDatum:
                 name=name, description="Datum's %s." % name, inputSchema={"type": "object"}
             )
 
-        @server.list_tools()
-        async def list_tools():
-            here = id(server.request_context.session) in primed
-            return [listed(n) for n in (names if here else ADVERTISED)]
+        async def list_tools(ctx, params):
+            here = ctx.request.headers["mcp-session-id"] in primed
+            return types.ListToolsResult(tools=[listed(n) for n in (names if here else ADVERTISED)])
 
-        @server.call_tool(validate_input=False)
-        async def call_tool(name, arguments):
-            self.calls.append((name, arguments))
-            if name == "getting_started":
-                primed.add(id(server.request_context.session))
-            return [types.TextContent(type="text", text="%s %s" % (name, json.dumps(arguments)))]
+        async def call_tool(ctx, params):
+            self.calls.append((params.name, params.arguments))
+            if params.name == "getting_started":
+                primed.add(ctx.request.headers["mcp-session-id"])
+            return types.CallToolResult(
+                content=[
+                    types.TextContent(
+                        type="text",
+                        text="%s %s" % (params.name, json.dumps(params.arguments)),
+                    )
+                ]
+            )
 
-        manager = StreamableHTTPSessionManager(app=server)
+        server = Server(
+            "datasheet-wiki",
+            instructions="Call getting_started first.",
+            on_list_tools=list_tools,
+            on_call_tool=call_tool,
+        )
 
-        class Endpoint:
-            async def __call__(self, scope, receive, send):
-                await manager.handle_request(scope, receive, send)
-
-        @contextlib.asynccontextmanager
-        async def lifespan(app):
-            async with manager.run():
-                yield
-
-        app = Starlette(routes=[Route("/mcp", endpoint=Endpoint())], lifespan=lifespan)
+        app = server.streamable_http_app()
         self._server = uvicorn.Server(
             uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error")
         )

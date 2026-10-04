@@ -576,9 +576,8 @@ class CodexSession:
         interpreter and installed package running this process, guaranteed
         to have that module and its own dependencies (``mcp``, ``httpx``)
         importable regardless of whether the optional ``codex`` extra is
-        installed, since both are already transitive dependencies of
-        ``claude-agent-sdk``, a base dependency, and are now declared
-        directly.
+        installed. The MCP SDK and ``httpx`` are declared as base
+        dependencies rather than relied on through the Claude SDK.
 
         The agent token is not among these: every entry here becomes part of
         the app-server's command line. ``env_vars`` (Codex's allowlist of

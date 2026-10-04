@@ -3,22 +3,18 @@
 (``http/routes_mcp.py``) and the stdio-to-HTTP proxy
 (``session/codex_mcp_stdio_bridge.py``), run against the toy product's tools.
 
-Three layers, tested separately and then together:
+Two layers, tested separately and then together:
 
 - ``/mcp`` in isolation, against a bare ``Microdot`` app (``register_mcp_routes``
   called directly, no ``create_app``): the token/Origin gate, ``tools/list``,
   and ``tools/call`` including the write-class broker gate this bridge is
   responsible for wiring (``routes_mcp.py``'s own docstring explains why that
   gate lives here rather than in ``tools.py``).
-- The stdio proxy's ``Server`` (``build_server``) against a mocked HTTP
-  authority, pinning that its ``list_tools``/``call_tool`` handlers forward
-  correctly and nothing else.
 - The full chain end to end: a real bound socket serving the toy product's
   app, a real ``httpx`` connection, and a fake app-server (a genuine
-  ``mcp.ClientSession`` connected in-memory to the proxy's own ``Server`` -
-  ``mcp.shared.memory.create_connected_server_and_client_session``, the same
-  helper the ``mcp`` SDK's own test suite uses to connect any client to any
-  server) - the shape the ticket's own acceptance criteria ask for.
+  ``mcp.ClientSession`` connected in-memory to the proxy's own ``Server``
+  through the SDK's memory transport) - the shape the ticket's own acceptance
+  criteria ask for.
 
 The last section proves the proxy subprocess itself exits cleanly when its
 stdin closes (what a stdio-launched MCP server sees when its launcher goes
@@ -36,7 +32,7 @@ import time
 
 import httpx
 import pytest
-from conftest import create_toy_app, make_test_client
+from conftest import create_toy_app, make_test_client, mcp_client
 from microdot import Microdot
 from toy_product import NOTES_FILE, build_toy_tools
 
@@ -295,88 +291,6 @@ async def test_missing_method_is_a_400(toy_tools):
     assert res.status_code == 400
 
 
-# ---------------------------------------------------------------------------
-# the proxy's own Server, against a mocked HTTP authority
-# ---------------------------------------------------------------------------
-
-
-async def test_proxy_list_tools_forwards_to_the_authority():
-    import mcp.types as types
-
-    fake_result = {
-        "result": {
-            "tools": [
-                {
-                    "name": "list_notes",
-                    "description": "d",
-                    "inputSchema": {"type": "object", "properties": {}},
-                }
-            ]
-        }
-    }
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.params.get("t") == TOKEN
-        body = json.loads(request.content)
-        assert body == {"method": "tools/list", "params": {}}
-        return httpx.Response(200, json=fake_result)
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport) as client:
-        url = authority_url("127.0.0.1", 8765, "/mcp").copy_merge_params({"t": TOKEN})
-        server = build_server(client, url, name="annealage-toy", version="0")
-        list_tools = server.request_handlers[types.ListToolsRequest]
-        result = await list_tools(types.ListToolsRequest(method="tools/list"))
-        tools = result.root.tools
-        assert [t.name for t in tools] == ["list_notes"]
-
-
-async def test_proxy_call_tool_forwards_name_and_arguments_and_returns_the_result():
-    import mcp.types as types
-
-    fake_list_result = {
-        "result": {
-            "tools": [
-                {
-                    "name": "list_notes",
-                    "description": "d",
-                    "inputSchema": {"type": "object", "properties": {}},
-                }
-            ]
-        }
-    }
-    fake_call_result = {"result": {"content": [{"type": "text", "text": "ok"}], "isError": False}}
-    calls = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        calls.append(body)
-        # call_tool's own wrapper warms its schema cache with a tools/list
-        # round trip before validating input (Server._get_cached_tool_
-        # definition) - the real authority sees this too, not only tools/call.
-        if body["method"] == "tools/list":
-            return httpx.Response(200, json=fake_list_result)
-        assert body == {
-            "method": "tools/call",
-            "params": {"name": "list_notes", "arguments": {"x": 1}},
-        }
-        return httpx.Response(200, json=fake_call_result)
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport) as client:
-        url = authority_url("127.0.0.1", 8765, "/mcp").copy_merge_params({"t": TOKEN})
-        server = build_server(client, url, name="annealage-toy", version="0")
-        call_tool = server.request_handlers[types.CallToolRequest]
-        req = types.CallToolRequest(
-            method="tools/call",
-            params=types.CallToolRequestParams(name="list_notes", arguments={"x": 1}),
-        )
-        result = await call_tool(req)
-        assert result.root.content[0].text == "ok"
-        assert result.root.isError is False
-        assert [c["method"] for c in calls] == ["tools/list", "tools/call"]
-
-
 async def test_authority_http_failure_raises_authority_error():
     """The forwarding helper's own failure path: an unreachable/erroring
     authority raises ``AuthorityError`` rather than returning a silent empty
@@ -478,8 +392,6 @@ async def _stop_real_server(task):
 
 
 async def test_fake_app_server_lists_and_calls_a_read_tool_through_the_real_http_hop(project):
-    from mcp.shared.memory import create_connected_server_and_client_session
-
     token = "e2e-read-token"
     broker = PermissionBroker(lambda e: None, timeout=2.0)
     port, task = await _run_real_server(project, agent_token=token, broker=broker)
@@ -487,13 +399,13 @@ async def test_fake_app_server_lists_and_calls_a_read_tool_through_the_real_http
         url = authority_url("127.0.0.1", port, "/mcp").copy_merge_params({"t": token})
         async with httpx.AsyncClient() as client:
             proxy_server = build_server(client, url, name="annealage-toy", version="0")
-            async with create_connected_server_and_client_session(proxy_server) as session:
+            async with mcp_client(proxy_server) as session:
                 tools = await session.list_tools()
                 names = {t.name for t in tools.tools}
                 assert "list_notes" in names
 
                 result = await session.call_tool("list_notes", {})
-                assert not result.isError
+                assert not result.is_error
                 payload = json.loads(result.content[0].text)
                 assert payload["notes"] == ["first"]
     finally:
@@ -505,8 +417,6 @@ async def test_fake_app_server_write_call_reaches_the_broker_exactly_once_end_to
     the fake app-server's call_tool for a write-class tool blocks on a real
     PermissionBroker.ask, which this test answers exactly once
     (broker.decide), and the tool only takes effect after that answer."""
-    from mcp.shared.memory import create_connected_server_and_client_session
-
     from annealage_agent.session.base import PermissionRequest
 
     token = "e2e-write-token"
@@ -518,7 +428,7 @@ async def test_fake_app_server_write_call_reaches_the_broker_exactly_once_end_to
         url = authority_url("127.0.0.1", port, "/mcp").copy_merge_params({"t": token})
         async with httpx.AsyncClient(timeout=10.0) as client:
             proxy_server = build_server(client, url, name="annealage-toy", version="0")
-            async with create_connected_server_and_client_session(proxy_server) as session:
+            async with mcp_client(proxy_server) as session:
 
                 async def approve():
                     # Poll for the PermissionRequest broker.ask emitted, then
@@ -537,7 +447,7 @@ async def test_fake_app_server_write_call_reaches_the_broker_exactly_once_end_to
                 result = await session.call_tool("add_note", {"text": "from codex"})
                 await approver
 
-        assert not result.isError
+        assert not result.is_error
         assert _notes(project) == ["first", "from codex"]
         request_count = sum(1 for e in events if isinstance(e, PermissionRequest))
         assert request_count == 1
