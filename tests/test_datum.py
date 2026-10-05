@@ -34,6 +34,7 @@ LOOKUPS = (
     "get_datasheet_outline",
     "get_document_relations",
     "get_job_status",
+    "get_request_status",
     "list_boards",
     "trace_board_rail_or_net",
     "get_board_bom",
@@ -47,7 +48,7 @@ LOOKUPS = (
     "semantic_search_vault_components",
     "check_board_bom_against_vault",
 )
-WRITES = ("submit_datasheet",)
+WRITES = ("submit_datasheet", "request_datasheet")
 WITHHELD = ("publish_reference", "relate_documents", "unrelate_documents")
 ADVERTISED = ("getting_started", "search_parts", "semantic_search", "list_boards")
 

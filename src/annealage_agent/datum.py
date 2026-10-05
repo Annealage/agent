@@ -15,11 +15,20 @@ about Datum's tools and not about any product:
 * every lookup Datum marks read-only is read grade;
 * ``submit_datasheet`` files a document into Datum, which outlasts the
   session, so it is write grade and reaches the human as a card;
+* ``request_datasheet`` asks Datum to find and ingest a part's datasheet by
+  MPN (it queues work and can fetch from outside), so it is write grade too,
+  and ``get_request_status`` reads a request's progress and is read grade;
 * ``publish_reference``, ``relate_documents`` and ``unrelate_documents``
   change what Datum holds for everyone, so they are excluded: the agent never
   gets them, and a Datum that lists them is not warned about;
 * Datum lists most of its tools only once ``getting_started`` has been
   called, so that is the ``prime`` call.
+
+What Datum returns is text the model reads, not instructions: a request's
+``mpn``, ``requester``, ``log``, ``error`` and ``candidates`` come from
+outside Datum. ``get_part_by_mpn`` rows carry ``match`` (``exact`` or
+``family``; absent means exact), ``matched_mpn`` and ``requested_mpn``, and a
+``family`` row is not the part that was asked for.
 
 A tool Datum adds that this grading does not name is left out with the
 remote's usual startup warning, until it is graded here.
@@ -39,6 +48,9 @@ DEFAULT_URL = "https://ds.story-kettle.ts.net/mcp"
 #: The tool that files a document into Datum.
 SUBMIT_TOOL = "submit_datasheet"
 
+#: The tool that asks Datum to find and ingest a datasheet by MPN.
+REQUEST_TOOL = "request_datasheet"
+
 GRADING = Grading(
     read=(
         "getting_started",
@@ -51,6 +63,7 @@ GRADING = Grading(
         "get_datasheet_outline",
         "get_document_relations",
         "get_job_status",
+        "get_request_status",
         "list_boards",
         "trace_board_rail_or_net",
         "get_board_bom",
@@ -65,7 +78,7 @@ GRADING = Grading(
         "check_board_bom_against_vault",
     ),
     view=(),
-    write=(SUBMIT_TOOL,),
+    write=(SUBMIT_TOOL, REQUEST_TOOL),
 )
 
 #: Datum's tools the agent does not get: they change what Datum holds for
