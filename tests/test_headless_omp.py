@@ -510,3 +510,40 @@ async def test_a_usage_sink_that_raises_is_logged_and_never_fails_the_run(
 
     assert (result.error, result.text, result.stop_reason) == (None, "fine", "end")
     assert "usage sink failed" in capsys.readouterr().err
+
+
+async def test_builtin_tools_are_off_by_default_and_pass_only_the_named_ones_to_omp(
+    omp_client, tmp_path
+):
+    omp_client.script = lambda client: client.end()
+
+    await run_prompt("go", **make_args(tmp_path))
+    await run_prompt("go", **make_args(tmp_path, builtin_tools=("web_search",)))
+
+    plain, enabled = omp_client.instances
+    assert plain.kwargs["tools"] == ()
+    assert enabled.kwargs["tools"] == ("web_search",)
+
+
+async def test_a_builtin_tool_call_is_reported_by_omp_s_name(omp_client, tmp_path):
+    def script(client):
+        client.say("looking")
+        client._listeners["tool_execution_start"](
+            SimpleNamespace(tool_call_id="b1", tool_name="web_search", args={"query": "x"})
+        )
+        client._listeners["tool_execution_end"](
+            SimpleNamespace(
+                tool_call_id="b1",
+                tool_name="web_search",
+                result={"content": [{"type": "text", "text": "hit"}]},
+                is_error=False,
+            )
+        )
+        client.say("found")
+        client.end()
+
+    omp_client.script = script
+    result = await run_prompt("go", **make_args(tmp_path, builtin_tools=("web_search",)))
+
+    assert result.calls == (("web_search", True),)
+    assert result.text == "found"

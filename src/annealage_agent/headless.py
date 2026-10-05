@@ -38,7 +38,8 @@ no settings file is loaded (``setting_sources`` empty), so nothing under
 ``cwd`` or in the user's own configuration adds a rule, a hook or a tool; the
 shell sandbox is off since there is no shell. ``HeadlessBroker`` is the backstop
 should anything still ask. omp already runs with every built-in disabled
-(``--no-tools --no-extensions``), so its only tools are the ``ToolSet``'s.
+(``--no-tools --no-extensions``), so its only tools are the ``ToolSet``'s,
+unless the caller opts in with ``builtin_tools`` (see ``run_prompt``).
 Codex is refused: it reaches tools through the app's ``/mcp`` endpoint, which
 a headless run has no listener for.
 
@@ -100,6 +101,12 @@ from .viewers import ViewerBus, ViewerRegistry
 
 #: The backends ``run_prompt`` can drive.
 BACKENDS = ("omp", "claude")
+
+#: The omp built-in tools a caller may enable with ``builtin_tools``: the
+#: network-read ones, by omp's own names (omp 18.4.5 has no ``fetch`` built-in;
+#: it refuses an unknown name in ``--tools``). Nothing that writes, runs code or
+#: drives a browser is on this list, and it is not widened by configuration.
+BUILTIN_TOOLS = ("web_search",)
 
 #: The common thinking levels supported by both backends.
 THINKING_LEVELS = ("low", "medium", "high")
@@ -330,7 +337,16 @@ class _Run:
 
 
 def _check_arguments(
-    prompt, tools, backend, model, cwd, timeout, thinking, omp_request_timeout, usage_sink=None
+    prompt,
+    tools,
+    backend,
+    model,
+    cwd,
+    timeout,
+    thinking,
+    omp_request_timeout,
+    usage_sink=None,
+    builtin_tools=(),
 ):
     if backend == "codex":
         raise ValueError(
@@ -360,6 +376,18 @@ def _check_arguments(
         raise ValueError(
             "thinking must be one of %s or None, not %r" % (", ".join(THINKING_LEVELS), thinking)
         )
+    if isinstance(builtin_tools, (str, bytes)) or not isinstance(builtin_tools, (list, tuple)):
+        raise ValueError("builtin_tools must be a list or tuple of tool names")
+    if builtin_tools:
+        if backend != "omp":
+            raise ValueError("builtin_tools is only supported with backend='omp'")
+        for name in builtin_tools:
+            if name not in BUILTIN_TOOLS:
+                raise ValueError(
+                    "builtin_tools may name only %s, not %r" % (", ".join(BUILTIN_TOOLS), name)
+                )
+        if len(set(builtin_tools)) != len(builtin_tools):
+            raise ValueError("builtin_tools names a tool twice")
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not timeout > 0:
         raise ValueError("timeout must be a number of seconds greater than 0, not %r" % (timeout,))
     if omp_request_timeout is not None:
@@ -407,6 +435,7 @@ def _build_session(
     omp_request_timeout,
     session_id,
     on_request_usage,
+    builtin_tools=(),
 ):
     """The session ``backend`` names, built and not started. ``launch.build_session``
     is the app's: it is made of the served directory (the working directory and
@@ -433,6 +462,7 @@ def _build_session(
             # with it.
             session_dir=os.path.join(state_dir, "omp"),
             on_request_usage=on_request_usage,
+            builtin_tools=builtin_tools,
         )
 
     from .session.sdk import SdkSession
@@ -510,6 +540,7 @@ async def run_prompt(
     omp_config_dir=None,
     omp_request_timeout=None,
     usage_sink=None,
+    builtin_tools=(),
 ):
     """Run ``prompt`` as one turn of a fresh agent session with ``tools``, and
     return its ``RunResult``. See the module docstring.
@@ -530,6 +561,16 @@ async def run_prompt(
     are ``launch.build_session``'s omp profile, executable and config root,
     ``None`` for omp as installed.
 
+    ``builtin_tools`` (omp only, default none) names omp built-in tools to leave
+    enabled for this run, from ``BUILTIN_TOOLS`` (``web_search`` only);
+    anything else is a ``ValueError``, and so is naming one on the Claude
+    backend. The default is every built-in off. These tools run inside omp, so
+    they bypass this module's permission broker, grading and ``grant`` entirely
+    (omp runs ``--auto-approve``): they reach the network on the run's behalf with
+    whatever arguments the model chooses, and what they return is untrusted text.
+    They appear in ``RunResult.calls`` by omp's name. There is no hosted or
+    interactive equivalent: ``create_app`` never enables them.
+
     ``usage_sink(event: dict) -> None`` (omp only) receives one event per
     provider request the run makes, with that request's own token counts
     (``hosted_state.usage_event``'s shape: ``event_id``, ``session_id``,
@@ -549,7 +590,16 @@ async def run_prompt(
     (the session closed first); never for a model or backend failure.
     """
     _check_arguments(
-        prompt, tools, backend, model, cwd, timeout, thinking, omp_request_timeout, usage_sink
+        prompt,
+        tools,
+        backend,
+        model,
+        cwd,
+        timeout,
+        thinking,
+        omp_request_timeout,
+        usage_sink,
+        builtin_tools,
     )
 
     with tempfile.TemporaryDirectory(prefix="annealage-headless-") as state_dir:
@@ -593,6 +643,7 @@ async def run_prompt(
                     omp_request_timeout=omp_request_timeout,
                     session_id=session_id,
                     on_request_usage=bus.request_usage,
+                    builtin_tools=tuple(builtin_tools),
                 )
             except Exception as exc:
                 # The backend's package missing (omp_rpc is installed apart), say.

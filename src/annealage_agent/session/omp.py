@@ -211,7 +211,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from omp_rpc import RpcClient, host_tool
 
@@ -306,6 +306,12 @@ class OmpSession:
 
     ``request_timeout`` optionally overrides ``RpcClient``'s per-request wait;
     ``None`` leaves its 30-second default unchanged.
+
+    ``builtin_tools`` names omp built-in tools to leave enabled, passed as
+    ``--tools``; empty (the default) is ``--no-tools``. Only ``headless.run_prompt``
+    sets it, from a short allowlist of network-read tools. Such a tool runs
+    inside omp: the ``host_tool_call`` broker gate, grading and permission cards
+    never see it, and omp runs with ``--auto-approve``.
     """
 
     #: A message sent while a turn runs redirects it (``hello``'s ``steers``).
@@ -336,7 +342,11 @@ class OmpSession:
         thinking: Optional[str] = None,
         request_timeout: Optional[float] = None,
         on_request_usage: Optional[Callable[[dict], None]] = None,
+        builtin_tools: Sequence[str] = (),
     ):
+        # omp's own tools to leave enabled (``--tools``); none by default, which
+        # is ``--no-tools``. They run inside omp, outside the broker.
+        self._builtin_tools = tuple(builtin_tools)
         # Called on the session's loop with one ``hosted_state.usage_event`` per
         # provider request; ``None`` (the default) registers nothing extra.
         self._on_request_usage = on_request_usage
@@ -730,14 +740,15 @@ class OmpSession:
                 model=model_arg,
                 cwd=self.cwd,
                 env=env,
-                # Every built-in tool disabled: the model's only capabilities
-                # are the host tools registered below. Extension discovery
+                # Every built-in tool disabled unless the caller named some
+                # (``builtin_tools``, headless only): the model's only
+                # capabilities are then the host tools registered below. Extension discovery
                 # disabled too: without it, a project-local .omp/.pi
                 # extension in `cwd` would load as trusted code and could
                 # register its own native tools, entirely outside this
                 # file's own host_tool_call broker gate. See this module's
                 # docstring on the permission design this makes possible.
-                tools=(),
+                tools=self._builtin_tools,
                 custom_tools=self._build_host_tools(),
                 extra_args=(
                     "--auto-approve",

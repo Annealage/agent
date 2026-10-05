@@ -432,6 +432,24 @@ async def test_a_usage_sink_is_refused_for_claude_and_when_not_callable(tmp_path
         await run_prompt("go", **make_args(tmp_path, usage_sink="not a function"))
 
 
+@pytest.mark.parametrize(
+    "builtin_tools",
+    [("bash",), ("web_search", "write"), ("fetch",), ("web_search", "web_search"), "web_search", ["browser"]],
+)
+async def test_builtin_tools_outside_the_network_read_allowlist_are_refused(
+    tmp_path, builtin_tools
+):
+    with pytest.raises(ValueError, match="builtin_tools"):
+        await run_prompt("go", **make_args(tmp_path, builtin_tools=builtin_tools))
+
+
+async def test_builtin_tools_are_refused_for_claude(tmp_path):
+    with pytest.raises(ValueError, match="builtin_tools is only supported with backend='omp'"):
+        await run_prompt(
+            "go", **make_args(tmp_path, backend="claude", builtin_tools=("web_search",))
+        )
+
+
 async def test_omp_request_timeout_is_rejected_for_claude(tmp_path):
     with pytest.raises(ValueError, match="only supported with backend='omp'"):
         await run_prompt("go", **make_args(tmp_path, backend="claude", omp_request_timeout=180))
