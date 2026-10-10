@@ -370,6 +370,27 @@ async def test_no_sink_means_no_records_and_no_noise(capsys):
 # --- the usage sink -----------------------------------------------------------------
 
 
+async def test_request_usage_keeps_only_finite_nonnegative_reported_costs():
+    def event(cost):
+        return hosted_state.usage_event(
+            session_id="s",
+            turn_index=1,
+            request_n=1,
+            backend="omp",
+            model=None,
+            provider=None,
+            provider_request_id=None,
+            tokens={},
+            cost_usd=cost,
+        )
+
+    assert event(0.02)["cost_usd"] == pytest.approx(0.02)
+    assert event(0.02)["cost_source"] == "message_usage.cost.total"
+    for invalid in (None, -1, float("inf"), float("nan"), True, "0.02"):
+        assert event(invalid)["cost_usd"] is None
+        assert event(invalid)["cost_source"] is None
+
+
 async def test_request_usage_reaches_the_usage_sink_and_a_failure_is_retried_once_not_twice(
     served_dir, tmp_path_factory, capsys
 ):
@@ -399,7 +420,16 @@ async def test_request_usage_reaches_the_usage_sink_and_a_failure_is_retried_onc
         provider_request_id=None,
         tokens={"input": 3},
     )
-    second = dict(first, event_id="s:1:2")
+    second = hosted_state.usage_event(
+        session_id="s",
+        turn_index=1,
+        request_n=2,
+        backend="omp",
+        model="m",
+        provider=None,
+        provider_request_id=None,
+        tokens={"input": 3},
+    )
     report = app.agent_bus.request_usage
     report(first)
     await asyncio.sleep(0.05)
@@ -408,9 +438,9 @@ async def test_request_usage_reaches_the_usage_sink_and_a_failure_is_retried_onc
     await asyncio.sleep(0.05)
     report(second)
     await asyncio.sleep(0.05)
-    assert [e["event_id"] for e in delivered] == ["s:1:1", "s:1:2"]
-    assert capsys.readouterr().err.count("usage sink failed for s:1:1") == 1
+    assert [e["event_id"] for e in delivered] == [first["event_id"], second["event_id"]]
+    assert capsys.readouterr().err.count("usage sink failed for %s" % first["event_id"]) == 1
 
 
-async def test_no_usage_sink_leaves_the_bus_without_a_consumer(served_dir):
-    assert create_toy_app(served_dir, token="t").agent_bus.request_usage is None
+async def test_no_usage_sink_still_installs_a_noop_request_usage_reporter(served_dir):
+    assert callable(create_toy_app(served_dir, token="t").agent_bus.request_usage)

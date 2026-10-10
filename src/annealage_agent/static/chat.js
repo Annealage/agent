@@ -360,12 +360,39 @@ function dollars(cost) {
 function turnMeta(t) {
   const parts = [];
   if (t.stopReason) parts.push(["turnstop", t.stopReason]);
-  if (typeof t.costUsd === "number") parts.push(["turncost", "$" + t.costUsd.toFixed(4)]);
-  const tokens = t.tokens || {};
-  const counts = [];
-  if (typeof tokens.input === "number") counts.push(tokenCount(tokens.input) + " in");
-  if (typeof tokens.output === "number") counts.push(tokenCount(tokens.output) + " out");
-  if (counts.length) parts.push(["turntokens", counts.join(", ")]);
+  parts.push([
+    "turncost",
+    typeof t.costUsd === "number" ? "$" + t.costUsd.toFixed(4) : "cost unknown",
+  ]);
+  const tokens = t.tokens;
+  if (tokens) {
+    const counts = [
+      typeof tokens.input === "number" ? tokenCount(tokens.input) + " in" : "unknown in",
+      typeof tokens.output === "number" ? tokenCount(tokens.output) + " out" : "unknown out",
+    ];
+    parts.push(["turntokens", counts.join(", ")]);
+  } else if (t.complete) {
+    parts.push(["turntokens", "tokens unknown"]);
+  }
+  const labels = {
+    received: "Pending backend delivery",
+    queued: "Queued until the current turn ends",
+    provider_ack: "Accepted by backend",
+    rejected: "Not sent",
+    uncertain: "Delivery uncertain; do not resend until checked",
+  };
+  if (t.usageSource === "counter_regression") {
+    parts.push(["turnaccounting", "Counter reset: this turn's cumulative usage is unknown"]);
+  } else if (t.usageSource === "epoch_baseline") {
+    parts.push(["turnaccounting", "Usage baseline only; this turn's cumulative usage is unknown"]);
+  }
+  if (t.inputState) {
+    const detail = t.inputDetail ? ": " + t.inputDetail : "";
+    parts.push([
+      "turninputstate turninputstate-" + t.inputState,
+      (labels[t.inputState] || t.inputState) + detail,
+    ]);
+  }
   return parts;
 }
 
@@ -400,6 +427,10 @@ export function usageSummary(usage) {
   title.push("Tokens: " + tokenCount(tokens.input) + " in, " + tokenCount(tokens.output)
     + " out, " + tokenCount(tokens.cache_read) + " read from the cache, "
     + tokenCount(tokens.cache_write) + " written to it");
+  if (Number.isInteger(usage.usage_epoch)) {
+    title.push("Cumulative snapshot: current epoch " + usage.usage_epoch);
+  }
+  if (usage.usage_source) title.push("Usage source: " + usage.usage_source);
   return { text: parts.join(" · "), title: title.join("\n") };
 }
 
@@ -418,15 +449,19 @@ function usageChip(agentStatusEl) {
  * Mounts the pane. `send` is ws.js's frame sender; `root` is where the pane's
  * elements are looked up (default: the document); `ids` overrides any of
  * `DEFAULT_IDS`; `agentTitles` overrides any of the agent status tooltips.
- * A required element that is missing is an error here, at mount, naming the
- * id, rather than a null dereference on the first event.
+ * `modelControl` defaults to true; false lets a product omit the model picker
+ * entirely. A required element that is missing is an error here, at mount,
+ * rather than a null dereference on the first event.
  */
-export function initChat({ send, root = document, ids = {}, agentTitles = {} }) {
+export function initChat({
+  send, root = document, ids = {}, agentTitles = {}, modelControl = true,
+}) {
   const idMap = { ...DEFAULT_IDS, ...ids };
   const els = {};
   for (const [role, id] of Object.entries(idMap)) {
     els[role] = findById(root, id);
-    if (!els[role] && !OPTIONAL_ELEMENTS.has(role)) {
+    if (!els[role] && !OPTIONAL_ELEMENTS.has(role)
+        && !(role === "modelInput" && !modelControl)) {
       throw new Error("chat pane: no element #" + id + " (" + role + ") under the given root");
     }
   }
@@ -728,10 +763,14 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     const userEl = document.createElement("div");
     userEl.className = "msg user";
     userEl.hidden = true;
+    const userAuthor = document.createElement("div");
+    userAuthor.className = "author";
+    userAuthor.hidden = true;
     const userText = document.createElement("div");
     userText.className = "text";
     const userAttachmentsEl = document.createElement("div");
     userAttachmentsEl.className = "attachthumbs";
+    userEl.appendChild(userAuthor);
     userEl.appendChild(userText);
     userEl.appendChild(userAttachmentsEl);
 
@@ -750,12 +789,17 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     row.appendChild(userEl);
     row.appendChild(assistantEl);
 
-    return { row, userEl, userText, userAttachmentsEl, textEl, toolsEl, metaEl, tools: new Map() };
+    return { row, userEl, userAuthor, userText, userAttachmentsEl, textEl, toolsEl, metaEl, tools: new Map() };
   }
 
   function updateTurnRow(rec, t) {
+
     if (t.user) {
       rec.userEl.hidden = false;
+      const automated = !!t.automationSource;
+      rec.userAuthor.hidden = !automated;
+      rec.userAuthor.textContent = t.automationSource === "loom_root_continuation"
+        ? "Automatic workflow continuation" : automated ? "Automatic turn" : "";
       rec.userText.textContent = blocksToText(t.user);
       renderUserAttachments(rec.userAttachmentsEl, t.user);
     }
@@ -780,7 +824,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     }
 
     // Rebuilt only when it changes, since every render passes every turn.
-    const meta = t.complete ? turnMeta(t) : [];
+    const meta = t.complete || t.inputState ? turnMeta(t) : [];
     const metaKey = meta.map(([cls, text]) => cls + ":" + text).join("\n");
     if (rec.metaKey !== metaKey) {
       rec.metaKey = metaKey;
@@ -991,6 +1035,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
   // a product's own event about its files (Mesh's `models_changed`) is taken
   // by the product's handler in ws.js and never reaches this pane.
   function applyModelInput() {
+    if (!modelControl) return;
     // Any fresh edit supersedes a revert queued by an earlier refusal: the
     // human has already moved past that rejected value, so there is
     // nothing left for the queued revert to correct.
@@ -1018,50 +1063,39 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     }
   }
 
-  chatModelInputEl.addEventListener("change", applyModelInput);
-  chatModelInputEl.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      chatModelInputEl.blur(); // fires "change" above if the value differs
-    }
-  });
-  // `change` alone cannot apply a queued revert: it only fires when the
-  // field's value differs from its value at focus time, which is exactly
-  // false in the stuck case (the human refocused, made no further edit,
-  // then blurred) that queuedModelRevert exists to fix. `blur` fires
-  // regardless of whether the value changed.
-  chatModelInputEl.addEventListener("blur", () => {
-    if (queuedModelRevert) {
-      queuedModelRevert = false;
-      renderModel(store.getState().chat);
-    }
-  });
-
-  // The backend's listed models, as suggestions under the field: a datalist,
-  // so any other name can still be typed. Built here rather than asked of the
-  // page's markup, since a page without it would simply offer none.
-  const chatModelListEl = document.createElement("datalist");
-  chatModelListEl.id = "chatModelList";
-  chatModelInputEl.after(chatModelListEl);
-  chatModelInputEl.setAttribute("list", chatModelListEl.id);
+  let chatModelListEl = null;
   let listedModels = null;
-  // A datalist only offers what matches the field's text, and the field holds
-  // the current model, so focusing it would offer that one alone. While
-  // focused it is emptied, the current model kept as its placeholder; leaving
-  // it empty puts the model back (applyModelInput's empty case).
-  const modelPlaceholder = chatModelInputEl.placeholder;
-  chatModelInputEl.addEventListener("focus", () => {
-    // Only the displayed current model is swapped for the placeholder: a
-    // refocus (the window regaining focus) must not erase a half-typed id.
-    const current = store.getState().chat.model || "";
-    if (!store.getState().chat.models.length || chatModelInputEl.value !== current) return;
-    chatModelInputEl.placeholder = chatModelInputEl.value || modelPlaceholder;
-    chatModelInputEl.value = "";
-  });
-  chatModelInputEl.addEventListener("blur", () => {
-    chatModelInputEl.placeholder = modelPlaceholder;
-    if (!chatModelInputEl.value) chatModelInputEl.value = store.getState().chat.model || "";
-  });
+  if (modelControl) {
+    chatModelInputEl.addEventListener("change", applyModelInput);
+    chatModelInputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        chatModelInputEl.blur();
+      }
+    });
+    chatModelInputEl.addEventListener("blur", () => {
+      if (queuedModelRevert) {
+        queuedModelRevert = false;
+        renderModel(store.getState().chat);
+      }
+    });
+
+    chatModelListEl = document.createElement("datalist");
+    chatModelListEl.id = "chatModelList";
+    chatModelInputEl.after(chatModelListEl);
+    chatModelInputEl.setAttribute("list", chatModelListEl.id);
+    const modelPlaceholder = chatModelInputEl.placeholder;
+    chatModelInputEl.addEventListener("focus", () => {
+      const current = store.getState().chat.model || "";
+      if (!store.getState().chat.models.length || chatModelInputEl.value !== current) return;
+      chatModelInputEl.placeholder = chatModelInputEl.value || modelPlaceholder;
+      chatModelInputEl.value = "";
+    });
+    chatModelInputEl.addEventListener("blur", () => {
+      chatModelInputEl.placeholder = modelPlaceholder;
+      if (!chatModelInputEl.value) chatModelInputEl.value = store.getState().chat.model || "";
+    });
+  }
 
   // The one writer of the model field's value and disabled state; mirrors
   // renderSendButton's reasoning for gating on `agentStatus`. Skipped while
@@ -1069,6 +1103,7 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
   // reconnect's hello, another tab's own AgentModelChanged) cannot overwrite
   // what they are typing.
   function renderModel(chat) {
+    if (!modelControl) return;
     if (chat.models !== listedModels) {
       listedModels = chat.models;
       chatModelListEl.replaceChildren(
@@ -1102,12 +1137,15 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     const uploading = chat.attachments.some((a) => a.state === "uploading");
     const busy = chat.pendingUser.length > 0 || chat.turns.some((t) => !t.complete);
     const steering = steers && busy && ready;
+    const queueing = !steers && busy && ready;
     chatSendBtn.disabled = !ready || uploading;
-    chatSendBtn.textContent = steering ? "Steer" : "Send";
+    chatSendBtn.textContent = steering ? "Steer" : (queueing ? "Queue" : "Send");
     chatSendBtn.title = uploading
       ? "Waiting for an attachment to finish uploading"
       : (!ready ? titles[chat.agentStatus] || ""
-        : (steering ? "The agent is working: this message redirects it now" : ""));
+        : (steering
+          ? "The agent is working: this message redirects it now"
+          : (queueing ? "This message will be queued until the current turn ends" : "")));
   }
 
   function renderBanner(chat) {
@@ -1386,17 +1424,17 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
     const replayed = !!meta.replayed;
     switch (event.kind) {
       case "user_turn":
-        store.setChatUserTurn(event.turn, event.blocks, event.client_id || null);
-        // The human answering is what the agent asked for, so its question
-        // leaves the banner (it stays in the conversation, with the tool
-        // call that raised it). Replayed too: a tab reconnecting after the
-        // human answered elsewhere catches up here. Nothing replayed raises
-        // an attention banner, so this can only clear a live one. Any other
-        // banner is left as it is.
-        {
+        store.setChatUserTurn(
+          event.turn, event.blocks, event.client_id || null, event.automation_source || null,
+        );
+        // Only a human answering can clear an attention prompt.
+        if (!event.automation_source) {
           const banner = store.getState().chat.banner;
           if (banner && banner.kind === "attention") store.clearChatBanner();
         }
+        break;
+      case "input_state":
+        store.setChatInputState(event.turn, event.state, event.detail || null);
         break;
       case "text_delta":
         store.appendChatTextDelta(event.turn, event.text);
@@ -1408,14 +1446,26 @@ export function initChat({ send, root = document, ids = {}, agentTitles = {} }) 
         store.setChatToolResult(event.tool_use_id, !!event.is_error, event.text);
         break;
       case "turn_end":
-        store.endChatTurn(event.turn, event.stop_reason, event.cost_usd, event.tokens || null);
+        store.endChatTurn(
+          event.turn,
+          event.stop_reason,
+          event.cost_usd,
+          event.tokens || null,
+          event.usage_epoch ?? null,
+          event.usage_source || null,
+        );
         break;
       case "usage":
-        // The hello's `session.usage` is current as of this connection; a
-        // replayed one is older, and every one is the whole conversation's,
-        // so only a live one updates it.
+        // A cumulative backend observation is one current-epoch snapshot,
+        // never a per-turn delta or a value to add to another snapshot.
         if (!replayed) {
-          store.setChatUsage({ cost_usd: event.cost_usd, tokens: event.tokens, context: event.context });
+          store.setChatUsage({
+            cost_usd: event.cost_usd,
+            tokens: event.tokens,
+            context: event.context,
+            usage_epoch: event.usage_epoch ?? null,
+            usage_source: event.usage_source || null,
+          });
         }
         break;
       case "attention":

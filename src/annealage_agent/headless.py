@@ -89,6 +89,7 @@ from .session.base import (
     AGENT_READY,
     AGENT_UNAVAILABLE,
     AgentError,
+    AgentRuntimeResolved,
     AgentStatus,
     TextDelta,
     ToolResult,
@@ -110,6 +111,10 @@ BUILTIN_TOOLS = ("web_search",)
 
 #: The common thinking levels supported by both backends.
 THINKING_LEVELS = ("low", "medium", "high")
+BACKEND_THINKING_LEVELS = {
+    "claude": THINKING_LEVELS,
+    "omp": (*THINKING_LEVELS, "xhigh"),
+}
 
 #: What a pause-gated tool answers while the view is paused. A headless run has
 #: no human to pause it, so it is never said; ``ToolServer`` requires it.
@@ -187,9 +192,9 @@ class RunResult:
     A turn that ends on a tool call (``ended_by_tool``) has no text.
     ``stop_reason`` is the backend's (``end_turn``, ``max_tokens``, ...) or
     ``ended_by_tool``, ``rejected``, ``timeout`` or ``error``. ``cost_usd`` and
-    ``tokens`` are the turn's, as the backend reports them (0.0 and ``None``
-    where it does not). ``error`` is ``None`` for a clean run, else why not
-    (``"timeout"`` for a timeout).
+    ``tokens`` are reported turn figures; unknown cost or token dimensions
+    remain ``None``, never a fabricated zero. ``error`` is ``None`` for a
+    clean run, else why not (``"timeout"`` for a timeout).
 
     ``calls`` is every tool the model called, in order, as ``(name, ok)``:
     the ``ToolSet``'s own name on both backends, and ``ok`` false for a call
@@ -199,23 +204,26 @@ class RunResult:
 
     text: str
     stop_reason: str
-    cost_usd: float
+    cost_usd: Optional[float]
     tokens: Optional[dict]
-    error: Optional[str]
     calls: Tuple[Tuple[str, bool], ...] = ()
-
+    native_max_turns: Optional[int] = None
+    native_num_turns: Optional[int] = None
+    native_turns_supported: Optional[bool] = None
+    error: Optional[str] = None
 
 class _Run:
     """The events of one turn, collected. ``on_event`` is the session's sink and
     only ever runs on the event loop."""
 
-    def __init__(self, server_prefix: str):
+    def __init__(self, server_prefix: str, on_runtime=None):
         self._prefix = server_prefix
+        self._on_runtime = on_runtime
         self.done = asyncio.Event()
         self.text: List[str] = []
         self.errors: List[str] = []
         self.stop_reason: Optional[str] = None
-        self.cost_usd = 0.0
+        self.cost_usd: Optional[float] = None
         self.tokens: Optional[dict] = None
         # [name, ok] per call in the order made, and where each call id is.
         self._calls: List[list] = []
@@ -276,7 +284,13 @@ class _Run:
     def on_event(self, event) -> None:
         if self.finished:
             return
-        if isinstance(event, TextDelta):
+        if isinstance(event, AgentRuntimeResolved):
+            if self._on_runtime is not None:
+                try:
+                    self._on_runtime(event)
+                except Exception as exc:
+                    sys.stderr.write("warning: headless runtime observer failed: %r\n" % (exc,))
+        elif isinstance(event, TextDelta):
             self.text.append(event.text)
         elif isinstance(event, ToolUse):
             name = event.name
@@ -331,11 +345,12 @@ class _Run:
             stop_reason=stop_reason or self.stop_reason or "error",
             cost_usd=self.cost_usd,
             tokens=self.tokens,
-            error=error if error is not None else self.error(),
             calls=self.calls(),
+            native_max_turns=getattr(self.session, "_native_max_turns", None),
+            native_num_turns=getattr(self.session, "last_result_num_turns", None),
+            native_turns_supported=getattr(self.session, "_native_turns_supported", None),
+            error=error if error is not None else self.error(),
         )
-
-
 def _check_arguments(
     prompt,
     tools,
@@ -347,6 +362,9 @@ def _check_arguments(
     omp_request_timeout,
     usage_sink=None,
     builtin_tools=(),
+    on_runtime=None,
+    max_budget_usd=None,
+    native_max_turns=None,
 ):
     if backend == "codex":
         raise ValueError(
@@ -366,15 +384,28 @@ def _check_arguments(
                 "usage_sink is only supported with backend='omp': the Claude backend reports "
                 "usage per turn, not per provider request"
             )
+
+    if on_runtime is not None and not callable(on_runtime):
+        raise ValueError("on_runtime must be a callable taking one AgentRuntimeResolved event")
     if not isinstance(tools, ToolSet):
         raise ValueError("tools must be a ToolSet, not %r" % (tools,))
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("prompt must be a non-empty string")
     if not isinstance(model, str) or not model.strip():
         raise ValueError("model must be a non-empty string: a headless run has no default")
-    if thinking is not None and thinking not in THINKING_LEVELS:
+    if max_budget_usd is not None:
+        if (backend != "claude" or isinstance(max_budget_usd, bool)
+                or not isinstance(max_budget_usd, (int, float))
+                or not math.isfinite(max_budget_usd) or max_budget_usd <= 0):
+            raise ValueError("max_budget_usd requires a finite positive Claude-native budget")
+    if native_max_turns is not None:
+        if (backend != "claude" or isinstance(native_max_turns, bool)
+                or not isinstance(native_max_turns, int) or native_max_turns <= 0):
+            raise ValueError("native_max_turns requires a positive integer and backend='claude'")
+    levels = BACKEND_THINKING_LEVELS[backend]
+    if thinking is not None and thinking not in levels:
         raise ValueError(
-            "thinking must be one of %s or None, not %r" % (", ".join(THINKING_LEVELS), thinking)
+            "thinking must be one of %s or None for %s, not %r" % (", ".join(levels), backend, thinking)
         )
     if isinstance(builtin_tools, (str, bytes)) or not isinstance(builtin_tools, (list, tuple)):
         raise ValueError("builtin_tools must be a list or tuple of tool names")
@@ -436,6 +467,10 @@ def _build_session(
     session_id,
     on_request_usage,
     builtin_tools=(),
+    max_budget_usd,
+    native_max_turns,
+    on_owner,
+    owner_context,
 ):
     """The session ``backend`` names, built and not started. ``launch.build_session``
     is the app's: it is made of the served directory (the working directory and
@@ -466,7 +501,6 @@ def _build_session(
         )
 
     from .session.sdk import SdkSession
-
     return SdkSession(
         on_event,
         cwd=cwd,
@@ -484,6 +518,10 @@ def _build_session(
         builtin_tools=(),
         setting_sources=(),
         persist_session=False,
+        max_budget_usd=max_budget_usd,
+        native_max_turns=native_max_turns,
+        on_owner=on_owner,
+        owner_context=owner_context,
     )
 
 
@@ -541,6 +579,11 @@ async def run_prompt(
     omp_request_timeout=None,
     usage_sink=None,
     builtin_tools=(),
+    on_runtime=None,
+    max_budget_usd=None,
+    native_max_turns=None,
+    on_owner=None,
+    owner_context=None,
 ):
     """Run ``prompt`` as one turn of a fresh agent session with ``tools``, and
     return its ``RunResult``. See the module docstring.
@@ -554,12 +597,21 @@ async def run_prompt(
     including the prompt acknowledgement. ``None`` leaves ``omp_rpc``'s 30-second
     default unchanged; it is separate from the whole-run ``timeout``.
     ``system`` is appended to the backend's system prompt. ``thinking`` is
-    ``low``, ``medium`` or ``high``; ``None`` leaves the backend's own default
-    unchanged. OMP receives ``--thinking`` and Claude receives the SDK's
+    ``low``, ``medium`` or ``high``; OMP also accepts ``xhigh``. ``None`` leaves
+    the backend's own default unchanged. OMP receives ``--thinking`` and Claude receives the SDK's
     ``effort`` option. These are backend-native settings, not calibrated levels
     across providers. ``omp_agent_dir``, ``omp_binary`` and ``omp_config_dir``
     are ``launch.build_session``'s omp profile, executable and config root,
     ``None`` for omp as installed.
+    ``max_budget_usd`` is optional and Claude-only. When provided it is passed
+    unchanged to the SDK's native query budget option, which can stop a query
+    at its reported USD budget; it is not an invoice or exact-billing guarantee.
+    OMP has no corresponding native request/run cap, so a bounded caller must
+    refuse that backend before starting it.
+    ``native_max_turns`` is optional and Claude-only. When set, the installed
+    SDK's native ``max_turns`` option is consumed; this counts native model turns,
+    not transport retries or invoices. ``RunResult`` exposes the configured cap,
+    SDK capability and reported ``num_turns`` when the CLI supplies it.
 
     ``builtin_tools`` (omp only, default none) names omp built-in tools to leave
     enabled for this run, from ``BUILTIN_TOOLS`` (``web_search`` only);
@@ -574,17 +626,36 @@ async def run_prompt(
     ``usage_sink(event: dict) -> None`` (omp only) receives one event per
     provider request the run makes, with that request's own token counts
     (``hosted_state.usage_event``'s shape: ``event_id``, ``session_id``,
-    ``turn_index``, ``backend``, ``model``, ``provider``,
-    ``provider_request_id``, ``tokens_*``, ``ts``; ``None`` for a count omp did
-    not give, no cost). ``event_id`` is ``<session_id>:<turn>:<request n>`` and
-    ``session_id`` is minted for the run (``headless-<16 hex>``), so two runs,
-    concurrent or not, never share an id. It is telemetry only, to check the
-    inference proxy's meter against: best effort, called from an executor
-    thread (so thread-safe), idempotent by ``event_id``, and a sink that
-    raises is logged and retried a few times, never failing or changing the
-    run. The events are delivered before ``run_prompt`` returns (up to 10
-    seconds). No sink, no events, and the run is otherwise unchanged. The
-    Claude backend gives no per-request figures, so it refuses a sink.
+    ``conversation_id``, ``usage_epoch``, ``turn_index``, ``request_n``,
+    ``backend``, nullable ``model``, ``provider``, ``provider_request_id``,
+    ``cost_usd`` (nullable, an estimate reported by the provider message, not
+    an invoice), ``cost_source`` when reported, nullable ``tokens_*``, ``ts``
+    and ``usage_source``). ``event_id``
+    is positional within the session/conversation/epoch, not a provider
+    response id. ``session_id`` is minted for the run (``headless-<16
+    hex>``), so two runs, concurrent or not, never share an id. It is
+    telemetry only, to check the inference proxy's meter against: best effort,
+    called from an executor thread (so thread-safe), idempotent by
+    ``event_id``, and a sink that raises is logged and retried a few times,
+    never failing or changing the run. The events are delivered before
+    ``run_prompt`` returns (up to 10 seconds). No sink, no events, and the run
+    is otherwise unchanged. The Claude backend gives no per-request figures,
+    so it refuses a sink.
+
+    ``on_runtime(event: AgentRuntimeResolved) -> None`` receives each runtime
+    identity the backend actually reports, never the requested model. Startup
+    events follow successful OMP state/model observation or SDK initialization;
+    later reported changes may produce another event. Unknown fields remain
+    null and ``provenance`` identifies the report source. Observer failures are
+    logged and do not change the run.
+
+    ``on_owner(event)`` optionally receives native-process ownership and
+    termination records for a Claude SDK run when ``owner_context`` supplies
+    ``run_id``, ``project_id``, ``source`` and integer ``epoch``. The SDK
+    identifies only its actual native CLI subprocess and checks its unique
+    ``LOOM_CHILD_OWNER`` marker in ``/proc``; custom or unknown transports
+    produce an ``unverified`` termination record instead. Observer failures
+    are logged and do not change the run. Both arguments default to ``None``.
 
     Raises ``ValueError`` for a bad argument, ``CancelledError`` if cancelled
     (the session closed first); never for a model or backend failure.
@@ -600,11 +671,14 @@ async def run_prompt(
         omp_request_timeout,
         usage_sink,
         builtin_tools,
+        on_runtime,
+        max_budget_usd,
+        native_max_turns,
     )
 
     with tempfile.TemporaryDirectory(prefix="annealage-headless-") as state_dir:
         bus = ViewerBus(ViewerRegistry(), url="")
-        run = _Run(namespaced(product.current().mcp_server_name, ""))
+        run = _Run(namespaced(product.current().mcp_server_name, ""), on_runtime=on_runtime)
         server = ToolServer(
             [run.guard(t) for t in tools.tools],
             grading=tools.grading,
@@ -620,7 +694,7 @@ async def run_prompt(
         # The per-request usage channel (app.py's, launch.py's): None unless the
         # caller gave a sink, and then omp registers nothing extra.
         usage = UsageRecorder(usage_sink)
-        bus.request_usage = usage.report if usage.enabled else None
+        bus.request_usage = usage.report
         # Unique to this run: the usage event ids are built from it, and two
         # runs in one process (or one meter) must not share them.
         session_id = "headless-%s" % secrets.token_hex(8)
@@ -644,6 +718,10 @@ async def run_prompt(
                     session_id=session_id,
                     on_request_usage=bus.request_usage,
                     builtin_tools=tuple(builtin_tools),
+                    max_budget_usd=max_budget_usd,
+                    native_max_turns=native_max_turns,
+                    on_owner=on_owner,
+                    owner_context=owner_context,
                 )
             except Exception as exc:
                 # The backend's package missing (omp_rpc is installed apart), say.
@@ -667,6 +745,11 @@ async def run_prompt(
                 await _cancelled(waiter)
                 await _cancelled(task)
                 await _close(session, kill=unfinished)
+                if backend != "claude" and on_owner is not None and owner_context is not None:
+                    try:
+                        on_owner({"event": "native_termination", "outcome": "unverified"})
+                    except Exception as exc:
+                        sys.stderr.write("warning: native owner observer failed: %r\n" % (exc,))
                 await run.drain()
         finally:
             run.end()

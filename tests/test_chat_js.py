@@ -221,7 +221,7 @@ chat.handleEvent({ kind: "user_turn", turn: 2, blocks: [{ type: "text", text: "a
 out.paneSecondStarted = paneData();
 chat.handleEvent({ kind: "turn_end", turn: 2, stop_reason: "interrupted", cost_usd: 0 }, live);
 out.paneInterrupted = paneData();
-// An omp steer: the new turn is logged, then the running one ends "steered".
+// A replayable steered boundary: the new turn is logged before the old one ends.
 clock = 10000;
 chat.handleEvent({ kind: "user_turn", turn: 3, blocks: [{ type: "text", text: "do x" }] }, live);
 clock = 70000;
@@ -231,19 +231,6 @@ out.paneSteered = paneData();
 chat.handleEvent({ kind: "turn_end", turn: 4, stop_reason: "end_turn", cost_usd: 0.0412,
                    tokens: { input: 6120, output: 814 } }, live);
 out.paneSteerEnded = paneData();
-// The finished turns' meta lines: one span per part that is known.
-const metaEls = [];
-const collectMeta = (node) => {
-  for (const c of node.children || []) {
-    if (typeof c !== "object") continue;
-    if (c.className === "turnmeta") metaEls.push(c);
-    collectMeta(c);
-  }
-};
-collectMeta(el("chatLog"));
-const metaParts = (m) => m.children.map((c) => (typeof c === "string" ? c : [c.className, c.textContent]));
-out.metaSteered = metaParts(metaEls[metaEls.length - 2]);
-out.metaFull = metaParts(metaEls[metaEls.length - 1]);
 // A page that connects mid-turn: the replay is the first it hears of it.
 clock = 90000;
 chat.handleHello({ id: "third", agent: "ready" });
@@ -254,6 +241,57 @@ out.paneMidTurnConnect = paneData();
 chat.handleEvent({ kind: "permission_resolved", request_id: "pr_c_1", outcome: "allow" }, replay);
 chat.handleEvent({ kind: "session_reset", reason: "new" }, live);
 out.paneAfterReset = paneData();
+
+// Queue delivery states remain visible on their own turn; a reset-tagged turn
+// shows unknown attribution, never a phantom zero-cost "steered" turn.
+clock = 100000;
+chat.handleHello({ id: "queued", agent: "ready", steers: false });
+const deliverySnapshot = () => {
+  const turns = store.getState().chat.turns;
+  const log = el("chatLog");
+  const spans = (node) => {
+    if (!node || typeof node !== "object") return [];
+    return [node, ...(node.children || []).flatMap(spans)];
+  };
+  return turns.map((t) => {
+    // The harness does not detach old rows on remove(); pick the newest row
+    // for this session's turn number.
+    const row = [...log.children].reverse().find((r) => r.dataset?.turn === String(t.turn));
+    return {
+      turn: t.turn, state: t.inputState, complete: t.complete,
+      cost: t.costUsd, source: t.usageSource,
+      deliveryVisible: spans(row).some((n) => (
+        (n.className || "").split(" ").includes("turninputstate-" + t.inputState)
+        && !!n.textContent
+      )),
+      detailVisible: !t.inputDetail || spans(row).some((n) => (
+        (n.textContent || "").includes(t.inputDetail)
+      )),
+    };
+  });
+};
+chat.handleEvent({ kind: "user_turn", turn: 1, blocks: [{ type: "text", text: "first" }] }, live);
+chat.handleEvent({ kind: "input_state", input_id: "i1", turn: 1, state: "received" }, live);
+chat.handleEvent({ kind: "input_state", input_id: "i1", turn: 1, state: "queued" }, live);
+out.queuedDelivery = deliverySnapshot();
+chat.handleEvent({ kind: "input_state", input_id: "i1", turn: 1, state: "provider_ack" }, live);
+chat.handleEvent({
+  kind: "turn_end", turn: 1, stop_reason: "end", cost_usd: null, tokens: null,
+  usage_epoch: 1, usage_source: "counter_regression",
+}, live);
+out.acknowledgedDelivery = deliverySnapshot();
+chat.handleEvent({
+  kind: "user_turn", turn: 2, blocks: [{ type: "text", text: "uncertain" }],
+}, live);
+chat.handleEvent({
+  kind: "input_state", input_id: "i2", turn: 2, state: "uncertain",
+  detail: "pipe closed after send",
+}, live);
+chat.handleEvent({
+  kind: "input_state", input_id: "i3", turn: 3, state: "rejected",
+  detail: "backend declined the input",
+}, live);
+out.finalDelivery = deliverySnapshot();
 
 // The model field: the listed models as its suggestions, emptied on focus so
 // all of them are offered, and the current model back if nothing is typed.
@@ -277,6 +315,22 @@ modelInput.value = "haiku";
 blurModel();
 out.modelSent = sent.filter((f) => f.type === "set_model").map((f) => f.model);
 
+sent.length = 0;
+const modelLessRoot = {
+  nodeType: 9,
+  querySelector(selector) {
+    return selector === "#chatModelInput" ? null : document.querySelector(selector);
+  },
+};
+initChat({
+  send: (frame) => { sent.push(frame); return true; },
+  root: modelLessRoot,
+  modelControl: false,
+});
+out.restrictedModelControl = {
+  mountedWithoutInput: true,
+  sent: sent.filter((f) => f.type === "set_model").map((f) => f.model),
+};
 console.log(JSON.stringify(out));
 process.exit(0);
 """
@@ -398,16 +452,24 @@ def test_the_pane_root_says_whether_a_turn_runs_since_when_and_what_waits(observ
     assert observed["paneAfterReset"] == idle
 
 
-def test_a_finished_turn_s_meta_is_a_span_per_known_part(observed):
-    assert observed["metaFull"] == [
-        ["turnstop", "end_turn"],
-        ", ",
-        ["turncost", "$0.0412"],
-        ", ",
-        ["turntokens", "6,120 in, 814 out"],
+
+
+def test_delivery_outcomes_are_rendered_on_their_own_turn_without_inventing_spend(observed):
+    queued = observed["queuedDelivery"]
+    assert [(turn["turn"], turn["state"], turn["complete"]) for turn in queued] == [
+        (1, "queued", False)
     ]
-    # No tokens reported: no tokens part.
-    assert observed["metaSteered"] == [["turnstop", "steered"], ", ", ["turncost", "$0.0000"]]
+    acknowledged = observed["acknowledgedDelivery"]
+    assert [(turn["turn"], turn["state"], turn["complete"]) for turn in acknowledged] == [
+        (1, "provider_ack", True)
+    ]
+    final = observed["finalDelivery"]
+    assert [(turn["turn"], turn["state"]) for turn in final] == [
+        (1, "provider_ack"), (2, "uncertain"), (3, "rejected")
+    ]
+    assert all(turn["deliveryVisible"] and turn["detailVisible"] for turn in final)
+    assert all(turn["cost"] is None for turn in final)
+    assert final[0]["source"] == "counter_regression"
 
 
 def test_the_model_field_offers_the_listed_models_from_an_empty_field(observed):
@@ -421,3 +483,10 @@ def test_the_model_field_offers_the_listed_models_from_an_empty_field(observed):
 def test_a_half_typed_model_survives_a_refocus_and_is_sent(observed):
     assert observed["modelAfterRefocus"] == "hai"
     assert observed["modelSent"] == ["haiku"]
+
+
+def test_products_can_omit_the_live_model_picker(observed):
+    assert observed["restrictedModelControl"] == {
+        "mountedWithoutInput": True,
+        "sent": [],
+    }

@@ -162,26 +162,17 @@ logs the profile in: ``login_command`` when the product names one (a
 service's own seed script), else `omp`'s own ``auth-broker login`` under the
 environment this session launches it with (``_login_command``).
 
-**Steering and resuming.** Every human message is sent as ``prompt`` with
-``streamingBehavior: "steer"``: an idle `omp` starts a turn with it, a busy
-one queues it to redirect the running turn (``omp://rpc.md``, "While
-streaming"; a prompt with no streaming behaviour is refused while a turn
-runs). Sending the steer form every time rather than choosing from this
-session's own idea of whether a turn is running means a race between the
-two can never turn a message into a refusal. The pane shows a steer as the
-next turn: the running turn ends as ``steered`` and the agent's further
-output carries the new turn number. A message `omp` refuses is reported in
-the chat and leaves the session ready; only a dead `omp` process marks it
-unavailable. With ``session_dir`` given, `omp` keeps its conversation there
-(``--session-dir``, in the workspace's state directory, never in the
-throwaway agent directory), the conversation file it reports
-(``get_state``'s ``sessionFile``) is recorded through ``on_session_file``,
-and ``resume`` names such a file to switch to at start (``switch_session``).
-Tokens and cost per turn are the difference between two
-``get_session_stats`` readings, one at each turn's end. The readings
-themselves, cumulative over the conversation file and so over a resume, are
-the ``Usage`` that follows each turn end (and one at start), beside the
-context window's fill from ``get_state``'s ``contextUsage``.
+**Input delivery.** The inspected RPC API exposes a ``streamingBehavior`` prompt
+option but no negotiated steering capability. OMP therefore reports
+``steers=False`` and this session queues new user inputs locally until the
+current turn reaches its terminal event. Inputs are never sent speculatively
+with ``streamingBehavior: "steer"``. A transport loss after send is uncertain
+and is not retried; queued inputs are rejected on interrupt or process exit.
+When ``session_dir`` is given, OMP keeps its conversation there; the reported
+conversation file is recorded and optionally resumed. Cumulative ``Usage``
+snapshots remain whole-conversation observations labelled with their current
+epoch. ``TurnEnd`` deltas are only attributed within one epoch; resets and
+regressions create an explicit new epoch with unknown cross-boundary figures.
 
 ``omp_api_key``, when set, is never written into ``models.yml`` as a
 literal string: `omp`'s own ``apiKey`` resolution (`omp://providers.md`)
@@ -199,6 +190,7 @@ not fighting it.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import contextvars
 import functools
 import hashlib
@@ -209,6 +201,7 @@ import shutil
 import sys
 import tempfile
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
@@ -225,13 +218,16 @@ from .base import (
     AgentError,
     AgentModelChanged,
     AgentModelsAvailable,
+    AgentRuntimeResolved,
     AgentStatus,
     SandboxStatus,
     SessionReset,
+    InputState,
     TextDelta,
     ToolResult,
     ToolUse,
     TurnEnd,
+    RequestUsage,
     UnknownRequest,
     Usage,
     context_figures,
@@ -314,8 +310,9 @@ class OmpSession:
     never see it, and omp runs with ``--auto-approve``.
     """
 
-    #: A message sent while a turn runs redirects it (``hello``'s ``steers``).
-    steers = True
+    #: No positive steering capability is negotiated by the observed RPC API.
+    #: A message during a turn is held locally until its terminal boundary.
+    steers = False
 
     def __init__(
         self,
@@ -399,12 +396,13 @@ class OmpSession:
         # The last turn of a resumed session's history (launch passes
         # bus.turn), so the next one continues its numbering.
         self._turn = int(turn)
-        # Whether a turn is running, as far as this session knows: set when a
-        # message is sent, cleared by omp's terminal agent_end. Decides only
-        # whether a new message ends the running turn as "steered" in the
-        # pane; omp itself decides what the message does (see the module
-        # docstring on why every message is sent the steer way).
+        # Retain ownership through the terminal event's asynchronous usage read:
+        # a later input must not start until that turn's counters are settled.
         self._running = False
+        self._settling_turn: Optional[int] = None
+        self._input_queue = deque()
+        self._next_input_turn = self._turn
+        self._active_input_id: Optional[str] = None
         # end_turn_after_tool's tool call ids, read on the reader thread once
         # that call's result is delivered (_on_tool_execution_end), and the
         # stop reason the turn it ends reports.
@@ -413,6 +411,10 @@ class OmpSession:
         # The session's cumulative cost and tokens at the last turn end (or
         # at start), which the next turn's figures are the difference from.
         self._usage: Optional[dict] = None
+        self._usage_epoch = 0
+        self._conversation_id = str(self.session_id or uuid.uuid4().hex)
+        self.resolved_runtime = None
+        self._runtime_identity = None
         # (turn, provider requests seen in it), written only on the reader
         # thread, in wire order: the n of the deterministic usage event id.
         self._request_count: tuple = (None, 0)
@@ -493,59 +495,72 @@ class OmpSession:
             self._broker.viewer_disconnected()
             self._viewers_seen -= 1
 
+    def turn_refusal(self) -> Optional[str]:
+        """Report local admission limits before the caller consumes turn notes."""
+        if (self._running or self._input_queue) and len(self._input_queue) >= 8:
+            return "input queue is full; wait for a queued turn to finish"
+        return None
+
     async def submit_turn(self, blocks: list, viewer: Optional[str] = None) -> None:
-        """Send one human message to `omp` and return once it is accepted.
-
-        Always as a steer-capable prompt (this module's docstring says why):
-        with no turn running it starts one, with one running it redirects
-        it, and the running turn ends in the pane as ``steered`` while its
-        further output carries this message's turn number. A message `omp`
-        refuses is reported (``_refused``) and the session stays ready; only
-        a dead `omp` process marks it unavailable.
-
-        Unlike Codex's per-turn notification scope, `omp`'s event listeners
-        (registered once in ``start()``) keep delivering
-        ``message_update``/``tool_execution_*``/``agent_end`` frames for the
-        rest of this session's life regardless of how many turns are sent,
-        so there is nothing to hand off to a background drain here -- the
-        same "the pump runs whether or not a browser is attached" invariant
-        ``SdkSession``'s single persistent pump keeps.
-        """
+        """Queue human inputs until the current backend turn reaches a boundary."""
         if self._client is None or self._status != AGENT_READY:
             self._emit(
                 AgentError(stderr="", remediation=turn_not_sent(self._status), viewer=viewer)
             )
             return
-        steering = self._running
-        if steering:
-            self._emit(TurnEnd(turn=self._turn, stop_reason="steered", cost_usd=0.0))
-        # Before sending, not after: omp may start streaming the new turn
-        # before it answers the prompt, and those events must carry this
-        # turn's number.
-        self._turn += 1
+        self._next_input_turn += 1
+        input_id = uuid.uuid4().hex
+        turn = self._next_input_turn
+        self._emit(InputState(input_id, turn, "received"))
+        job = (input_id, turn, blocks, viewer)
+        if self._running or self._input_queue:
+            if len(self._input_queue) >= 8:
+                self._emit(InputState(input_id, turn, "rejected", "input queue is full"))
+                self._emit(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
+                return
+            self._input_queue.append(job)
+            self._emit(InputState(input_id, turn, "queued"))
+            return
+        await self._send_input(job)
+
+    async def _send_input(self, job) -> None:
+        input_id, turn, blocks, viewer = job
+        self._turn = turn
+        self._active_input_id = input_id
         self._running = True
-        turn = self._turn
         try:
             loop = asyncio.get_running_loop()
             expanded = await loop.run_in_executor(
                 None, turn_images.expand_turn_blocks, blocks, self.cwd
             )
             message, images = _to_omp_prompt(expanded)
-            await self._run_blocking(
-                self._client.prompt, message, images=images, streaming_behavior="steer"
-            )
+            await self._run_blocking(self._client.prompt, message, images=images)
+            self._emit(InputState(input_id, turn, "provider_ack"))
         except Exception as exc:
             if _process_gone(exc):
-                self._running = False
                 self._fail(exc, viewer=viewer)
             else:
-                self._refused(str(exc) or type(exc).__name__, turn, ends_turn=not steering)
+                self._running = False
+                self._active_input_id = None
+                self._emit(InputState(input_id, turn, "rejected", str(exc)))
+                self._refused(str(exc) or type(exc).__name__, turn, ends_turn=True)
+
+    async def _send_next_queued(self) -> None:
+        if self._running or not self._input_queue or self._status != AGENT_READY:
+            return
+        await self._send_input(self._input_queue.popleft())
+
+    def _settle_queued_inputs(self, reason: str) -> None:
+        while self._input_queue:
+            input_id, turn, _blocks, _viewer = self._input_queue.popleft()
+            self._emit(InputState(input_id, turn, "rejected", reason))
+            self._emit(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
 
     def _refused(self, reason: str, turn: int, *, ends_turn: bool) -> None:
         """`omp` refused a message (at once, or later: ``_on_protocol_error``).
         Reported in the chat; the session stays ready. ``ends_turn`` closes
         the turn the message would have started, so the pane does not wait on
-        it; a refused steer leaves the running turn running."""
+        it."""
         self._emit(
             AgentError(
                 stderr=reason,
@@ -555,7 +570,11 @@ class OmpSession:
         )
         if ends_turn:
             self._running = False
-            self._emit(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=0.0))
+            if self._active_input_id is not None:
+                self._emit(InputState(self._active_input_id, turn, "rejected", reason))
+            self._active_input_id = None
+            self._emit(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
+            asyncio.ensure_future(self._send_next_queued())
 
     def end_turn_after_tool(self) -> None:
         """A tool result asked to end the turn (``tools.ok``'s ``end_turn``).
@@ -610,6 +629,7 @@ class OmpSession:
         """
         if self._client is None:
             return
+        self._settle_queued_inputs("turn interrupted before provider submission")
         if self._broker is not None:
             # The agent's own requests: a card the human raised from the page
             # (an upload action) is not this turn's to deny.
@@ -626,6 +646,12 @@ class OmpSession:
             # Best-effort, like the other two backends: the turn is either
             # already finished or the child is gone, and both surface
             # through the event stream's own failure handling.
+            if _process_gone(exc):
+                if self._active_input_id is not None:
+                    self._emit(InputState(self._active_input_id, self._turn, "uncertain", str(exc)))
+                self._fail(exc)
+                self._settle_queued_inputs("backend exited before queued input was sent")
+                return
             sys.stderr.write("warning: interrupt failed: %r\n" % (exc,))
 
     async def set_model(self, model: str) -> None:
@@ -786,11 +812,42 @@ class OmpSession:
         try:
             state = await self._run_blocking(self._client.get_state)
             self._remember_sdk_session(state.session_id)
+            model = getattr(state, "model", None)
+            runtime = AgentRuntimeResolved(
+                backend="omp",
+                provider=_nonempty_string(getattr(model, "provider", None)),
+                model=_nonempty_string(getattr(model, "id", None)),
+                effort=_nonempty_string(getattr(state, "thinking_level", None)),
+                provenance="get_state",
+            )
+            if runtime.provider is not None or runtime.model is not None or runtime.effort is not None:
+                self._record_resolved_runtime(runtime)
             self._remember_session_file(state.session_file)
         except Exception as exc:
             # A session that cannot read this still works; what it costs is
             # the hello frame's session id and a later -c resuming it.
             sys.stderr.write("warning: could not read the omp session state: %r\n" % (exc,))
+        admission = getattr(self, "runtime_policy", None)
+        if isinstance(admission, dict):
+            selected = admission["selected"]
+            actual = self.resolved_runtime or {}
+            expected_model = selected["model"]
+            expected_provider = None
+            if not self._base_url and "/" in expected_model:
+                expected_provider, expected_model = expected_model.split("/", 1)
+            if (
+                actual.get("model") != expected_model
+                or (expected_provider is not None and actual.get("provider") != expected_provider)
+                or (selected["effort"] is not None and actual.get("effort") != selected["effort"])
+            ):
+                try:
+                    await self._run_blocking(self._client.stop)
+                except Exception as exc:
+                    sys.stderr.write("warning: agent client did not close cleanly: %r\n" % (exc,))
+                self._client = None
+                self._discard_agent_dir()
+                self._fail(ValueError("OMP runtime does not match the admitted model/effort policy; no substitution is permitted"))
+                return
         self._usage = await self._read_usage()
         # A resumed conversation's figures are known before any turn; a new
         # one has used nothing yet, which the first turn's end reports.
@@ -882,12 +939,18 @@ class OmpSession:
         except Exception as exc:
             reason = "omp could not open %s (%s)" % (session_file, exc)
         if reason is not None:
+            self._start_usage_epoch()
             self._emit(
                 SessionReset(
                     reason="asked to resume the previous omp conversation, but %s; "
                     "this is a new conversation" % reason
                 )
             )
+    def _start_usage_epoch(self, conversation_id: Optional[str] = None) -> None:
+        self._usage_epoch += 1
+        self._conversation_id = str(conversation_id or uuid.uuid4().hex)
+        self._usage = None
+        self._request_count = (None, 0)
 
     async def close(self) -> None:
         self._closing = True
@@ -999,8 +1062,7 @@ class OmpSession:
     def _register_listeners(self) -> None:
         client = self._client
         client.on_message_update(self._on_message_update)
-        if self._on_request_usage is not None:
-            client.on_message_end(self._on_message_end)
+        client.on_message_end(self._on_message_end)
         client.on_tool_execution_start(self._on_tool_execution_start)
         client.on_tool_execution_end(self._on_tool_execution_end)
         client.on_agent_end(self._on_agent_end)
@@ -1008,12 +1070,8 @@ class OmpSession:
         client.on_protocol_error(self._on_protocol_error)
 
     def _on_message_end(self, event) -> None:
-        """Runs on `omp_rpc`'s reader thread. An assistant message ends once
-        per provider request (a turn that calls tools makes several), and it
-        carries that request's own token counts and the provider's response id:
-        the only per-request figures omp gives (``get_session_stats``, which
-        ``TurnEnd`` is built from, is a running total). Registered only when a
-        ``on_request_usage`` consumer was given."""
+        """Runs on omp_rpc's reader thread and emits each assistant request
+        through the standard event publisher, with an optional sink."""
         message = event.message
         if not isinstance(message, dict) or message.get("role") != "assistant":
             return
@@ -1023,14 +1081,15 @@ class OmpSession:
         self._request_count = (turn, request_n)
         usage = message.get("usage")
         usage = usage if isinstance(usage, dict) else {}
+        cost = usage.get("cost")
         response_id = message.get("responseId")
         report = hosted_state.usage_event(
             session_id=self.session_id,
             turn_index=turn,
             request_n=request_n,
             backend="omp",
-            model=message.get("model") or self._model,
-            provider=message.get("provider") or None,
+            model=_nonempty_string(message.get("model")),
+            provider=_nonempty_string(message.get("provider")),
             provider_request_id=response_id
             if isinstance(response_id, str) and response_id
             else None,
@@ -1039,17 +1098,52 @@ class OmpSession:
                 "output": _token_count(usage.get("output")),
                 "cache_read": _token_count(usage.get("cacheRead")),
                 "cache_write": _token_count(usage.get("cacheWrite")),
-                # omp's usage has no separate reasoning count.
                 "reasoning": None,
             },
+            cost_usd=cost.get("total") if isinstance(cost, dict) else None,
+            conversation_id=self._conversation_id,
+            usage_epoch=self._usage_epoch,
         )
-        self._loop.call_soon_threadsafe(self._report_request_usage, report)
+        actual_model = _nonempty_string(message.get("model"))
+        actual_provider = _nonempty_string(message.get("provider"))
+        if actual_model is not None or actual_provider is not None:
+            self._loop.call_soon_threadsafe(
+                self._record_resolved_runtime,
+                AgentRuntimeResolved(
+                    backend="omp",
+                    provider=actual_provider,
+                    model=actual_model,
+                    effort=None,
+                    provenance="assistant_message",
+                ),
+            )
+        self._loop.call_soon_threadsafe(self._emit_request_usage, report)
 
-    def _report_request_usage(self, report: dict) -> None:
-        try:
-            self._on_request_usage(report)
-        except Exception as exc:
-            sys.stderr.write("warning: could not report request usage: %r\n" % (exc,))
+    def _record_resolved_runtime(self, event: AgentRuntimeResolved) -> None:
+        previous = self.resolved_runtime or {}
+        runtime = {
+            "backend": event.backend,
+            "provider": event.provider or previous.get("provider"),
+            "model": event.model or previous.get("model"),
+            "effort": event.effort or previous.get("effort"),
+            "provenance": event.provenance,
+        }
+        identity = tuple(runtime[key] for key in (
+            "backend", "provider", "model", "effort", "provenance"
+        ))
+        if identity == self._runtime_identity:
+            return
+        self._runtime_identity = identity
+        self.resolved_runtime = runtime
+        self._emit(AgentRuntimeResolved(**runtime))
+
+    def _emit_request_usage(self, report: dict) -> None:
+        self._emit(RequestUsage(**report))
+        if self._on_request_usage is not None:
+            try:
+                self._on_request_usage(report)
+            except Exception as exc:
+                sys.stderr.write("warning: could not report request usage: %r\n" % (exc,))
 
     def _on_message_update(self, event) -> None:
         """Runs on `omp_rpc`'s reader thread; every emit crosses back onto
@@ -1123,30 +1217,56 @@ class OmpSession:
         self._loop.call_soon_threadsafe(self._turn_settled, turn)
 
     def _turn_settled(self, turn: int) -> None:
-        """On the loop, for omp's terminal ``agent_end`` of a run that ended
-        in ``turn``. Its ``TurnEnd`` follows once its cost is read.
-
-        A settle for a turn no longer current is dropped: a message sent
-        between omp ending the run and this callback already ended that turn
-        as ``steered`` and started a run of its own, whose own ``agent_end``
-        settles it."""
-        if turn != self._turn:
+        """Settle only the terminal event's owning turn, before sending another."""
+        if turn != self._turn or not self._running or self._settling_turn is not None:
             return
-        self._running = False
+        self._settling_turn = turn
         self._end_turn_calls.clear()
         stop_reason, self._stop_reason = self._stop_reason or "end", None
         asyncio.ensure_future(self._emit_turn_end(turn, stop_reason))
 
     async def _emit_turn_end(self, turn: int, stop_reason: str) -> None:
-        cost, tokens = 0.0, None
         usage = await self._read_usage()
-        if usage is not None and self._usage is not None:
-            cost = max(0.0, usage["cost"] - self._usage["cost"])
-            tokens = {key: usage[key] - self._usage[key] for key in _TOKEN_KEYS}
+        tokens, cost = None, None
+        source = "cumulative_unknown"
         if usage is not None:
+            if self._usage is None:
+                source = "epoch_baseline"
+            else:
+                regressed = any(
+                    usage.get(key) is not None
+                    and self._usage.get(key) is not None
+                    and usage[key] < self._usage[key]
+                    for key in ("cost", *_TOKEN_KEYS)
+                )
+                if regressed:
+                    self._usage_epoch += 1
+                    self._conversation_id = uuid.uuid4().hex
+                    self._request_count = (None, 0)
+                    source = "counter_regression"
+                else:
+                    source = "cumulative_turn_delta"
+                    cost = _usage_delta(usage.get("cost"), self._usage.get("cost"))
+                    tokens = {
+                        key: _usage_delta(usage.get(key), self._usage.get(key))
+                        for key in _TOKEN_KEYS
+                    }
             self._usage = usage
-        self._emit(TurnEnd(turn=turn, stop_reason=stop_reason, cost_usd=cost, tokens=tokens))
+        self._running = False
+        self._settling_turn = None
+        self._active_input_id = None
+        self._emit(
+            TurnEnd(
+                turn=turn,
+                stop_reason=stop_reason,
+                cost_usd=cost,
+                tokens=tokens,
+                usage_epoch=self._usage_epoch,
+                usage_source=source,
+            )
+        )
         await self._emit_usage(usage)
+        await self._send_next_queued()
 
     async def _read_usage(self) -> Optional[dict]:
         """The session's cumulative cost and token counts so far
@@ -1156,8 +1276,18 @@ class OmpSession:
         except Exception as exc:
             sys.stderr.write("warning: could not read the omp session's usage: %r\n" % (exc,))
             return None
-        usage = {key: int(getattr(stats.tokens, key)) for key in _TOKEN_KEYS}
-        usage["cost"] = float(stats.cost)
+        usage = {
+            key: _token_count(getattr(stats.tokens, key, None))
+            for key in _TOKEN_KEYS
+        }
+        raw_cost = getattr(stats, "cost", None)
+        usage["cost"] = (
+            float(raw_cost)
+            if isinstance(raw_cost, (int, float))
+            and not isinstance(raw_cost, bool)
+            and raw_cost >= 0
+            else None
+        )
         return usage
 
     async def _emit_usage(self, usage: Optional[dict], state=None) -> None:
@@ -1181,6 +1311,8 @@ class OmpSession:
                 cost_usd=usage["cost"] if usage is not None else None,
                 tokens={key: usage[key] for key in _TOKEN_KEYS} if usage is not None else None,
                 context=context,
+                usage_epoch=self._usage_epoch,
+                usage_source="cumulative_snapshot",
             )
         )
 
@@ -1198,7 +1330,10 @@ class OmpSession:
     def _prompt_refused_late(self, reason: str, turn: int) -> None:
         """Reported whatever the turn; the turn is closed only if it is still
         the current one (a later message has otherwise already moved on)."""
-        self._refused(reason, turn, ends_turn=self._running and turn == self._turn)
+        self._refused(
+            reason, turn,
+            ends_turn=self._running and turn == self._turn and self._settling_turn is None,
+        )
 
     def _on_ui_request(self, request) -> None:
         """Runs on `omp_rpc`'s reader thread. See this module's docstring on
@@ -1262,12 +1397,19 @@ class OmpSession:
 
     def _remember_sdk_session(self, session_id: Optional[str]) -> None:
         if session_id and session_id != self.sdk_session_id:
+            previous = self.sdk_session_id
+            if previous is not None:
+                self._start_usage_epoch(session_id)
+            else:
+                self._conversation_id = str(session_id)
             self.sdk_session_id = session_id
             if self._on_sdk_session_id is not None:
                 try:
                     self._on_sdk_session_id(session_id)
                 except Exception as exc:
-                    sys.stderr.write("warning: could not record the omp session id: %r\n" % (exc,))
+                    sys.stderr.write(
+                        "warning: could not record the omp session id: %r\n" % (exc,)
+                    )
 
     def _remember_session_file(self, session_file: Optional[str]) -> None:
         """Record `omp`'s conversation file, what a later ``-c`` resumes."""
@@ -1315,6 +1457,12 @@ class OmpSession:
         ``CodexSession._fail``; ``remediation``, when given, replaces the
         one ``_remediation_for`` guesses from the exception's class."""
         self._set_status(AGENT_UNAVAILABLE)
+        if self._active_input_id is not None:
+            self._emit(InputState(self._active_input_id, self._turn, "uncertain", str(exc)))
+            self._emit(TurnEnd(turn=self._turn, stop_reason="backend_exited", cost_usd=None))
+            self._active_input_id = None
+            self._running = False
+        self._settle_queued_inputs("backend exited before queued input was sent")
         self._emit(
             AgentError(
                 stderr="%s: %s" % (type(exc).__name__, exc),
@@ -1334,7 +1482,14 @@ class OmpSession:
 #: ``TokenUsage`` names them.
 _TOKEN_KEYS = ("input", "output", "cache_read", "cache_write")
 
+def _usage_delta(current, previous):
+    if current is None or previous is None or current < previous:
+        return None
+    return current - previous
 
+
+def _nonempty_string(value) -> Optional[str]:
+    return value.strip() if isinstance(value, str) and value.strip() else None
 def _token_count(value) -> Optional[int]:
     """A token count omp reported, or ``None`` for anything else: an unknown
     figure is never turned into 0."""

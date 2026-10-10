@@ -37,6 +37,7 @@ from typing import Optional
 from microdot import Microdot, Request
 
 from . import files, net, product, protocol, sessions, uploads
+from . import remote_actions
 from . import settings as settings_module
 from .hosted_state import SessionEvents, StateRecorder, UsageRecorder
 from .http.routes_chat import register_chat_routes, register_upload_action_route
@@ -56,6 +57,7 @@ from .session.base import (
     AGENT_UNAVAILABLE,
     AgentError,
     AgentModelChanged,
+    AgentRuntimeResolved,
     AgentModelsAvailable,
     AgentStatus,
     PermissionResolved,
@@ -249,6 +251,7 @@ def create_app(
     hosted_frame_ops=None,
     state_sink=None,
     usage_sink=None,
+    builtin_tools=None,
 ):
     """Build a Microdot app serving ``serve_dir``, routes registered, not started.
 
@@ -328,6 +331,11 @@ def create_app(
     ``None`` resolves the file and default layers here instead, so a caller
     with no flags to declare, which is every test, needs to know nothing about
     settings at all.
+
+    ``builtin_tools`` is passed to ``SdkSession`` unchanged: ``None`` preserves
+    the SDK defaults; ``[]`` disables every native CLI tool while retaining
+    registered MCP tools. Callers use ``[]`` when the project must expose only
+    its curated tool server, including after a session reopen.
 
     ``url_prefix`` is the path this app is mounted under in a front door
     (``"/p/demo"``: no trailing slash; ``""``, the default, is an app served
@@ -540,6 +548,7 @@ def create_app(
         state_dir=state_project_dir,
         hosted_mode=hosted_mode,
         mounted=bool(url_prefix),
+        browser_runtime_controls=installed.browser_runtime_controls,
     )
     recorder = StateRecorder(state_sink)
     register_review_routes(app, store=review_store, auth=auth, recorder=recorder)
@@ -586,6 +595,20 @@ def create_app(
         publish=_event_publisher(registry, event_log),
         turn=event_log.last_turn,
     )
+    bus.remote_action_context = lambda: {
+        "project_id": str(Path(serve_dir).resolve()),
+        "source_manifest": remote_actions.UNKNOWN,
+        "authority_epoch": remote_actions.UNKNOWN,
+    }
+    bus.remote_action_store = (
+        remote_actions.RemoteActionStore(
+            sessions.state_dir(state_project_dir) / "remote-actions.json",
+            project_id=Path(serve_dir).resolve(),
+            session=session_id,
+        )
+        if session_id is not None
+        else None
+    )
     bus.agent_state_project_dir = state_project_dir
     bus.write_protected = write_protected
     # The product's tool server, built once, here, whether or not this backend
@@ -619,6 +642,7 @@ def create_app(
     # notify the watcher directly rather than wait for its next sample.
     bus.review_store = review_store
     bus.settings = settings
+    bus.builtin_tools = builtin_tools
     bus.hosted_mode = hosted_mode
     bus.hosted_tool_ops = dict(hosted_tool_ops or {})
     bus.hosted_turn_ops = ()
@@ -629,7 +653,7 @@ def create_app(
     # reads ``request_usage`` through launch.py; the publisher and the
     # WebSocket handler read ``session_events`` off the bus.
     usage_recorder = UsageRecorder(usage_sink)
-    bus.request_usage = usage_recorder.report if usage_recorder.enabled else None
+    bus.request_usage = usage_recorder.report
     session_events = (
         SessionEvents(recorder, session_id) if recorder.enabled and agent_mode else None
     )
@@ -673,6 +697,7 @@ def create_app(
         # The conversation's usage so far (``Usage.snapshot``), for the
         # hello: the last the log recorded until the backend reports afresh,
         # then kept live by ``_event_publisher``.
+        "resolved_runtime": None,
         "usage": event_log.last_usage,
     }
     app.agent_registry = registry
@@ -726,6 +751,7 @@ def create_app(
                 permissions_path=sessions.state_dir(state_project_dir) / "permissions.toml",
                 timeout=float(settings["approval_timeout"]),
                 never_remembered=tools.never_remembered,
+                request_guard=tools.request_guard,
             )
             session = ExternalAgentSession(publish, bus.broker)
         return session
@@ -827,6 +853,8 @@ def create_app(
                     publish=publish_action,
                     queue_note=bus.queue_note,
                     documents=documents,
+                    remote_action_context=bus.remote_action_context,
+                    action_store=bus.remote_action_store,
                 )
             )
             running_actions.add(task)
@@ -852,6 +880,7 @@ def create_app(
         holder=holder,
         hosted_frame_ops=hosted_frame_ops,
         recorder=recorder,
+        browser_runtime_controls=installed.browser_runtime_controls,
     )
 
     install_response_handlers(app, csp_value, server_header)
@@ -1064,6 +1093,14 @@ def _event_publisher(registry, event_log, session_info=None, bus=None):
         # it with that session), not to the conversation.
         if session_info is not None and isinstance(event, AgentModelsAvailable):
             session_info["models"] = list(event.models)
+        if session_info is not None and isinstance(event, AgentRuntimeResolved):
+            session_info["resolved_runtime"] = {
+                "backend": event.backend,
+                "provider": event.provider,
+                "model": event.model,
+                "effort": event.effort,
+                "provenance": event.provenance,
+            }
         if session_info is not None and isinstance(event, AgentError):
             session_info["agent_error"] = {
                 "remediation": event.remediation,
@@ -1751,7 +1788,7 @@ def _end_unfinished_turns(publish, turns):
     backend is gone (a killed process, a session that went down) and will
     never end them, so a page does not show them as running."""
     for turn in sorted(turns):
-        publish(TurnEnd(turn=turn, stop_reason="interrupted", cost_usd=0.0))
+        publish(TurnEnd(turn=turn, stop_reason="interrupted", cost_usd=None))
 
 
 async def serve(app, host, port, on_ready=None, background=()):

@@ -88,6 +88,7 @@ def register_settings_routes(
     state_dir=None,
     hosted_mode=False,
     mounted=False,
+    browser_runtime_controls=True,
 ):
     """Register GET/PUT settings routes.
 
@@ -125,30 +126,34 @@ def register_settings_routes(
         wire = settings.to_wire()
         if hosted_mode:
             wire = {name: entry for name, entry in wire.items() if _hosted_visible(name)}
+        if not browser_runtime_controls:
+            wire = {name: entry for name, entry in wire.items()
+                    if name not in {"backend", "model", "effort"}}
         if mounted:
             for name in BIND_KEYS:
                 if name in wire:
                     wire[name].update(editable=False, in_effect=False, reason=MOUNTED_BIND_REASON)
         installed = product.current()
+        hidden_runtime_keys = {"backend", "model", "effort"} if not browser_runtime_controls else set()
         body = {
             "ok": True,
             "settings": wire,
-            # How the window lays the keys out, from each key's own section
-            # (``settings.sections``), so a product's key is shown where the
-            # product declared it without the window naming it.
             "sections": [
                 {
                     "title": section["title"],
                     "keys": [
-                        name for name in section["keys"] if not hosted_mode or _hosted_visible(name)
+                        name for name in section["keys"]
+                        if (not hosted_mode or _hosted_visible(name))
+                        and name not in hidden_runtime_keys
                     ],
                 }
                 for section in settings_module.sections()
-                if not hosted_mode or any(_hosted_visible(name) for name in section["keys"])
+                if any(
+                    (not hosted_mode or _hosted_visible(name))
+                    and name not in hidden_runtime_keys
+                    for name in section["keys"]
+                )
             ],
-            # The names the window's prose needs and cannot know on its own:
-            # which product's version the diagnostics block reports, and the
-            # state directory the project config file lives in.
             "product": {
                 "title": installed.title,
                 "version": installed.version,
@@ -218,6 +223,16 @@ def register_settings_routes(
             }, 400
         if not changes:
             return {"ok": False, "error": "changes is empty; nothing to write"}, 400
+        if not browser_runtime_controls:
+            restricted = sorted(
+                name for name in changes if name in {"backend", "model", "effort"}
+            )
+            if restricted:
+                return {
+                    "ok": False,
+                    "error": "backend, model and effort are configured by the operator, "
+                    "not in the browser: %s" % ", ".join(restricted),
+                }, 400
         if hosted_mode:
             refused = sorted(
                 name

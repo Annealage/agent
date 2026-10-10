@@ -294,14 +294,21 @@ def size_text(count):
     return "%.1f MB" % (count / (1024 * 1024))
 
 
-async def run(action, upload, human, args, *, broker, server, publish, queue_note, documents):
-    """Ask the human, then make the call: the flow in the module docstring,
-    from the card on, with ``args`` from ``call_args``. ``server`` is the
-    ``RemoteServer`` ``action.tool`` names, ``broker`` the live session's
-    ``PermissionBroker``, ``publish`` the app's event publisher,
-    ``queue_note`` the bus's and ``documents`` the app's ``Documents``,
-    which the upload is discarded from at the end. Never raises: however it
-    ends, it ends with an ``UploadActionEnded``."""
+def _current_context(callback):
+    if not callable(callback):
+        return None
+    try:
+        value = callback()
+    except Exception:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+async def run(
+    action, upload, human, args, *, broker, server, publish, queue_note, documents,
+    action_store=None, remote_action_context=None,
+):
+    """Ask the human, then make the call, recording upload writes durably."""
     # Imported here: the tool layer and the MCP client come with the SDK,
     # which only an app with an agent (the only kind with actions) loads.
     from . import remote
@@ -309,6 +316,7 @@ async def run(action, upload, human, args, *, broker, server, publish, queue_not
 
     remote_name, tool_name = action.tool
     tool = namespaced(remote_name, tool_name)
+    approved_context = _current_context(remote_action_context)
 
     def ended(outcome, text):
         documents.discard(upload.id)
@@ -353,9 +361,14 @@ async def run(action, upload, human, args, *, broker, server, publish, queue_not
         action.content_arg: base64.b64encode(data).decode("ascii"),
     }
     try:
-        result = await remote.call(server, tool_name, arguments)
+        current_context = _current_context(remote_action_context)
+        result = await remote.call(
+            server, tool_name, arguments, action_store=action_store, source="upload:" + action.name,
+            approval=human.login, context=current_context, expected_context=approved_context,
+            context_callback=remote_action_context,
+        )
     except Exception as exc:
-        sys.stderr.write("error: upload action %s failed: %r\n" % (action.name, exc))
+        sys.stderr.write("error: upload action %s failed (%s)\n" % (action.name, type(exc).__name__))
         ended(
             ACTION_FAILED,
             "%s failed inside %s itself (%s), which is a bug; it may or may not have reached "

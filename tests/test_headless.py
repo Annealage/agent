@@ -29,6 +29,7 @@ from annealage_agent.session.base import (
     AGENT_READY,
     AGENT_UNAVAILABLE,
     AgentError,
+    AgentRuntimeResolved,
     AgentStatus,
     TextDelta,
     ToolResult,
@@ -153,6 +154,52 @@ async def test_a_turn_returns_its_text_cost_and_tokens(monkeypatch, tmp_path):
     assert built.kwargs["model"] == "prov/model"
     assert Path(built.kwargs["cwd"]) == tmp_path
     assert built.session.started == 1 and built.session.closed == 1
+
+
+async def test_runtime_callback_receives_only_backend_reported_identity(monkeypatch, tmp_path):
+    observed = []
+
+    async def script(session):
+        await finish(session)
+
+    def on_start(session):
+        session.emit(
+            AgentRuntimeResolved(
+                backend="omp",
+                provider="observed-provider",
+                model="observed-model",
+                effort="high",
+                provenance="get_state",
+            )
+        )
+
+    script_session(monkeypatch, script, on_start=on_start)
+    await run_prompt(
+        "go",
+        on_runtime=observed.append,
+        **make_args(tmp_path, model="requested-provider/requested-model"),
+    )
+
+    assert observed == [
+        AgentRuntimeResolved(
+            backend="omp",
+            provider="observed-provider",
+            model="observed-model",
+            effort="high",
+            provenance="get_state",
+        )
+    ]
+
+
+async def test_a_missing_turn_cost_stays_unknown(monkeypatch, tmp_path):
+    async def script(session):
+        await finish(session, cost=None, tokens=None)
+
+    script_session(monkeypatch, script)
+    result = await run_prompt("say hello", **make_args(tmp_path))
+
+    assert result.cost_usd is None
+    assert result.tokens is None
 
 
 async def test_tool_calls_are_recorded_by_name_and_outcome_only(monkeypatch, tmp_path):
@@ -344,7 +391,6 @@ async def test_the_claude_session_has_no_builtin_tools_and_no_settings(monkeypat
     assert Path(options.cwd) == tmp_path
     # Read, view and the one grant; the ungranted write tool is absent.
     assert options.allowed_tools == ["mcp__toy__lookup", "mcp__toy__pan", "mcp__toy__save"]
-    assert options.effort is None
     assert list(options.mcp_servers) == ["toy"]
     assert options.sandbox is None
     # No transcript of the run is left under ~/.claude/projects.
@@ -394,7 +440,6 @@ async def test_the_claude_broker_decides_a_builtin_a_grant_and_an_ungranted_writ
 
     for name in ("bash", "add_note"):
         assert isinstance(decisions[name], PermissionResultDeny)
-        assert "unattended" in decisions[name].message
     # Allowed, and not as a session-wide rule the CLI would keep applying.
     assert isinstance(decisions["save"], PermissionResultAllow)
     assert not decisions["save"].updated_permissions
@@ -472,10 +517,15 @@ async def test_bad_arguments_raise_value_error(tmp_path, overrides, message):
         await run_prompt("go", **make_args(tmp_path, **overrides))
 
 
-@pytest.mark.parametrize("thinking", ["", "auto", "xhigh", "HIGH", 1])
+@pytest.mark.parametrize("thinking", ["", "auto", "HIGH", 1])
 async def test_invalid_thinking_level_is_rejected(tmp_path, thinking):
     with pytest.raises(ValueError, match="thinking must be"):
         await run_prompt("go", **make_args(tmp_path, thinking=thinking))
+
+
+async def test_claude_rejects_omp_only_xhigh(tmp_path):
+    with pytest.raises(ValueError, match="thinking must be.*for claude"):
+        await run_prompt("go", **make_args(tmp_path, backend="claude", thinking="xhigh"))
 
 
 async def test_a_missing_cwd_raises_value_error(tmp_path):

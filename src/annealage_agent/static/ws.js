@@ -301,7 +301,8 @@ function wsUrl() {
  * Connects, and keeps connecting, for the life of the page. See this
  * module's header for what each hook is for. `indicator` is the element the
  * connection state is shown on (default: `#connIndicator`); a page without
- * one passes null.
+ * one passes null. `allowModelChange` controls whether `send` permits a
+ * `set_model` frame; other frame types are unaffected.
  */
 export function initWs({
   onEvent = {},
@@ -314,6 +315,7 @@ export function initWs({
   dispatchCall = null,
   connTitles = {},
   indicator = document.getElementById("connIndicator"),
+  allowModelChange = true,
 } = {}) {
   let ws = null;
   let opened = false; // true once this attempt's WebSocket has reached readyState OPEN
@@ -359,6 +361,7 @@ export function initWs({
   // coming for it, and the caller must reconcile its own optimistic state
   // immediately instead of waiting on an answer that will never arrive.
   function send(frame) {
+    if (frame.type === "set_model" && !allowModelChange) return false;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ ...frame, v: PROTOCOL_VERSION }));
       return true;

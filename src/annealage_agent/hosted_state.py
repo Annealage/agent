@@ -34,15 +34,17 @@ as ``session_event`` records (``SessionEvents``), and each provider request's
 token counts go to a second, telemetry-only ``usage_sink`` (``usage_event``,
 ``UsageRecorder``) under the same delivery policy. The usage sink is not tied
 to hosted mode: ``create_app`` takes one in hosted mode, and
-``headless.run_prompt`` takes one for any omp run (a product's sub-sessions),
-so a caller can cross-check the inference proxy's meter. It reports tokens
-only, never a cost, and the proxy remains the authoritative meter.
+``headless.run_prompt`` takes one for any OMP run (a product's sub-sessions),
+so a caller can cross-check the inference proxy's meter. Its optional
+per-request cost is an estimate reported on the provider message, not an
+invoice; the proxy remains the authoritative meter.
 """
 
 import asyncio
 import collections
 import hashlib
 import re
+import math
 import sys
 import threading
 import unicodedata
@@ -381,39 +383,48 @@ def usage_event(
     provider: Optional[str],
     provider_request_id: Optional[str],
     tokens: dict,
+    cost_usd: Optional[float] = None,
+    conversation_id: Optional[str] = None,
+    usage_epoch: int = 0,
     when: Optional[datetime] = None,
 ) -> dict:
-    """One provider request's usage, as ``usage_sink`` receives it::
-
-        {"event_id": "<session>:<turn>:<request n>", "session_id": ..,
-         "turn_index": .., "backend": "omp", "model": .., "provider": ..,
-         "provider_request_id": null or the provider's own id,
-         "tokens_input": .., "tokens_output": .., "tokens_cache_read": ..,
-         "tokens_cache_write": .., "tokens_reasoning": .., "ts": ".."}
-
-    Token fields are this request's counts, never running totals, and ``None``
-    where the backend did not say (never 0). There is no cost field: the agent
-    does not price anything. ``event_id`` is always the position of the
-    request in the conversation (a provider's own id is not trusted to be
-    unique: some OpenAI-compatible servers repeat one), so a redelivery of this
-    event is recognised, and an event without a provider id is still
-    identified; ``provider_request_id`` is carried beside it for the meter to
-    cross-check against.
-    """
+    """Build one positional request-local usage observation."""
+    conversation_id = str(conversation_id or session_id)
+    event_id = "%s:%s:%s:%s:%s" % (
+        session_id, conversation_id, usage_epoch, turn_index, request_n
+    )
+    raw_cost = cost_usd
+    if (
+        isinstance(raw_cost, (int, float))
+        and not isinstance(raw_cost, bool)
+        and math.isfinite(raw_cost)
+        and raw_cost >= 0
+    ):
+        reported_cost = float(raw_cost)
+        cost_source = "message_usage.cost.total"
+    else:
+        reported_cost = None
+        cost_source = None
     return {
-        "event_id": "%s:%s:%s" % (session_id, turn_index, request_n),
+        "event_id": event_id,
         "session_id": str(session_id),
+        "conversation_id": conversation_id,
+        "usage_epoch": usage_epoch,
         "turn_index": turn_index,
+        "request_n": request_n,
         "backend": backend,
         "model": model,
         "provider": provider,
         "provider_request_id": provider_request_id,
+        "cost_usd": reported_cost,
+        "cost_source": cost_source,
         "tokens_input": tokens.get("input"),
         "tokens_output": tokens.get("output"),
         "tokens_cache_read": tokens.get("cache_read"),
         "tokens_cache_write": tokens.get("cache_write"),
         "tokens_reasoning": tokens.get("reasoning"),
         "ts": timestamp(when or now()),
+        "usage_source": "message_usage",
     }
 
 

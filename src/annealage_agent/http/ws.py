@@ -129,6 +129,7 @@ def register_ws(
     holder,
     hosted_frame_ops=None,
     recorder=None,
+    browser_runtime_controls=True,
 ):
     """Register ``/ws`` on ``app``.
 
@@ -215,6 +216,7 @@ def register_ws(
                         usage=session_info.get("usage"),
                         upload_actions=session_info.get("upload_actions"),
                         models=session_info.get("models"),
+                        resolved_runtime=session_info.get("resolved_runtime"),
                     )
                 )
             )
@@ -238,6 +240,7 @@ def register_ws(
                 human,
                 hosted_frame_ops or {},
                 recorder,
+                browser_runtime_controls,
             )
         except (WebSocketError, ConnectionError, asyncio.IncompleteReadError):
             # The peer closed, vanished (a reset or broken pipe as this
@@ -454,6 +457,7 @@ async def _serve_connection(
     human=None,
     frame_ops=None,
     records=None,
+    browser_runtime_controls=True,
 ):
     """Read and dispatch frames until the peer goes away.
 
@@ -499,6 +503,13 @@ async def _serve_connection(
                     json.dumps(protocol.build_refused("operation not granted for this frame"))
                 )
                 continue
+        if kind == "set_model" and not browser_runtime_controls:
+            await ws.send(
+                json.dumps(protocol.build_refused(
+                    "model selection is configured by the operator, not in the browser"
+                ))
+            )
+            continue
         if kind in _AGENT_FRAMES:
             await holder.ensure(retry=True)
         session = holder.session
@@ -520,14 +531,24 @@ async def _serve_connection(
                 bus.hosted_turn_live = False
                 bus.hosted_turn_ops = ()
                 bus.hosted_turn_secret = None
-        await _dispatch(ws, conn, registry, event_log, token, frame, session, bus, records)
-
+        await _dispatch(
+            ws, conn, registry, event_log, token, frame, session, bus, records,
+            browser_runtime_controls,
+        )
 
 async def _dispatch(
-    ws, conn, registry, event_log, token, frame, session=None, bus=None, records=None
+    ws, conn, registry, event_log, token, frame, session=None, bus=None, records=None,
+    browser_runtime_controls=True,
 ):
     """Route one validated inbound frame."""
     kind = frame["type"]
+    if kind == "set_model" and not browser_runtime_controls:
+        await ws.send(
+            json.dumps(protocol.build_refused(
+                "model selection is configured by the operator, not in the browser"
+            ))
+        )
+        return
     if kind == "hello":
         # The opening hello is answered by _greet, before this connection was
         # registered. A second one is not a resync request: replaying from here
@@ -572,6 +593,7 @@ async def _dispatch(
             # event per redundant click would make every other tab re-render for
             # no reason.
             return
+        await bus.notify_pause(bus.paused, conn.human)
         # Announced to every viewer, not answered to this one, because the
         # switch is one property of the server and each tab has a control
         # showing it. Through the log, so the seq stays part of the one
@@ -657,6 +679,16 @@ async def _dispatch(
 
 
 async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, records=None):
+    if bus is not None:
+        async with bus.turn_submission_lock:
+            await _submit_turn_locked(
+                ws, conn, registry, event_log, frame, session, bus, records
+            )
+    else:
+        await _submit_turn_locked(ws, conn, registry, event_log, frame, session, bus, records)
+
+
+async def _submit_turn_locked(ws, conn, registry, event_log, frame, session, bus, records=None):
     """Hand one ``turn`` frame to the session, logging what the human sent.
 
     Counted, and the product's queued notes put in front of it, here in front
@@ -686,6 +718,19 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, recor
     """
     blocks = frame["blocks"]
     client_id = frame.get("client_id")
+    refusal_reader = getattr(bus, "manual_turn_refusal", None) if bus is not None else None
+    blocked_reason = refusal_reader() if callable(refusal_reader) else None
+    budget_reader = getattr(session, "root_budget_metadata", None)
+    if blocked_reason is None and callable(budget_reader):
+        budget = budget_reader()
+        if isinstance(budget, dict) and budget.get("inflight") is True:
+            blocked_reason = "Automatic continuation is active; pause it or wait before sending a message."
+    admission_reader = getattr(session, "turn_refusal", None)
+    if blocked_reason is None and callable(admission_reader):
+        blocked_reason = admission_reader()
+    if blocked_reason is not None:
+        await ws.send(json.dumps(protocol.build_refused(str(blocked_reason), client_id)))
+        return
     status = session.agent_status()
     if status != AGENT_READY:
         await ws.send(
@@ -714,6 +759,7 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, recor
                 display=who[1] if who else None,
             ),
         )
+        bus.mark_turn_submitted(turn)
         if records is not None:
             # Before the session sees the turn, so the durable copy of what
             # the human asked exists whatever the agent then does.

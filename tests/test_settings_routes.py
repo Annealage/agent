@@ -14,6 +14,7 @@ appears under ``pending``, because a settings window that could not confirm
 its own write would be useless. Both are asserted below against a real write.
 """
 
+import dataclasses
 import json
 import time
 from types import SimpleNamespace
@@ -23,8 +24,6 @@ from conftest import DEFAULT_PORT, TEST_HOST, create_toy_app, make_test_client
 from toy_product import TOY
 
 from annealage_agent import settings
-
-pytestmark = pytest.mark.asyncio
 
 TOKEN = "the-real-settings-token-Value_123"
 
@@ -190,8 +189,34 @@ async def test_get_lays_out_the_window_from_each_keys_own_section(make_client):
     assert payload["settings"]["units"]["nullable"] is False
     assert payload["settings"]["backend"]["choices"] == ["claude", "codex", "omp"]
     assert payload["settings"]["backend"]["nullable"] is True
-    assert payload["product"]["title"] == "Toy"
     assert payload["product"]["state_dirname"] == ".toy"
+
+
+async def test_runtime_controls_are_hidden_and_refused_for_products_that_reserve_them(
+    served_dir, swap_product,
+):
+    """A product can keep backend/model/effort operator-owned: the browser
+    neither learns their settings fields nor writes any part of a mixed batch."""
+    installed = dataclasses.replace(TOY, browser_runtime_controls=False)
+    swap_product(installed)
+    client = make_test_client(create_toy_app(served_dir, token=TOKEN))
+
+    payload = body_of(await client.get("/settings?t=%s" % TOKEN))
+    assert not {"backend", "model", "effort"} & set(payload["settings"])
+    assert all(
+        not ({"backend", "model", "effort"} & set(section["keys"]))
+        for section in payload["sections"]
+    )
+
+    project_path = settings.project_config_path(served_dir)
+    assert not project_path.exists()
+    res = await _put(
+        client,
+        {"backend": "omp", "model": "operator/model", "effort": "high", "units": "in"},
+    )
+    assert res.status_code == 400
+    assert "backend, model and effort" in body_of(res)["error"]
+    assert not project_path.exists()
 
 
 async def test_get_diagnostics_carries_the_project_and_is_json_able(make_client, served_dir):

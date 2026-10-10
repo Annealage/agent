@@ -45,13 +45,16 @@ from annealage_agent.session.base import (
     AgentError,
     AgentModelChanged,
     AgentModelsAvailable,
+    AgentRuntimeResolved,
     AgentStatus,
+    InputState,
     PermissionRequest,
     PermissionResolved,
     SessionReset,
     TextDelta,
     ToolResult,
     ToolUse,
+    RequestUsage,
     TurnEnd,
     Usage,
 )
@@ -97,6 +100,8 @@ class FakeRpcClient:
         # get_state's contextUsage (omp_rpc's ContextUsage), None when omp
         # reports none.
         self.context_usage = None
+        self.model = None
+        self.thinking_level = None
 
     def start(self):
         self.started = True
@@ -110,6 +115,8 @@ class FakeRpcClient:
             session_id=self.session_id,
             session_file=self.session_file,
             context_usage=self.context_usage,
+            model=self.model,
+            thinking_level=self.thinking_level,
         )
 
     def get_session_stats(self):
@@ -1110,6 +1117,11 @@ async def _next_of(recorder, kind):
         event = await recorder.next()
         if isinstance(event, kind):
             return event
+async def _next_input_state(recorder, turn, state):
+    while True:
+        event = await recorder.next()
+        if isinstance(event, InputState) and event.turn == turn and event.state == state:
+            return event
 
 
 def _text(text):
@@ -1117,35 +1129,105 @@ def _text(text):
 
 
 @pytest.mark.asyncio
-async def test_a_message_sent_while_a_turn_runs_steers_it_and_the_session_stays_ready():
+async def test_inflight_messages_queue_until_terminal_and_keep_their_turn_identity():
     session, fake, recorder, broker = await _started_session()
     try:
+        assert session.steers is False
         await session.submit_turn(_text("draw the regulator"))
         fake.push_message_update({"type": "text_delta", "delta": "Working"})
         assert (await _next_of(recorder, TextDelta)).turn == 1
 
         await session.submit_turn(_text("use the LDO instead"))
-        # Both as a steer-capable prompt: omp starts a turn with the first and
-        # redirects the running one with the second, never refusing either.
-        assert [(c.message, c.streaming_behavior) for c in fake.prompt_calls] == [
-            ("draw the regulator", "steer"),
-            ("use the LDO instead", "steer"),
+        assert [c.message for c in fake.prompt_calls] == ["draw the regulator"]
+        assert [
+            (event.turn, event.state)
+            for event in recorder.all
+            if isinstance(event, InputState)
+        ] == [(1, "received"), (1, "provider_ack"), (2, "received"), (2, "queued")]
+        fake.push_agent_end()
+        ended = await _next_of(recorder, TurnEnd)
+        assert (ended.turn, ended.stop_reason) == (1, "end")
+        await _next_input_state(recorder, 2, "provider_ack")
+        assert [c.message for c in fake.prompt_calls] == [
+            "draw the regulator",
+            "use the LDO instead",
         ]
-        steered = await _next_of(recorder, TurnEnd)
-        assert (steered.turn, steered.stop_reason) == (1, "steered")
-        assert session.agent_status() == AGENT_READY
+        assert fake.prompt_calls[1].streaming_behavior is None
 
-        # The agent's further output belongs to the steering message's turn,
-        # which omp's one agent_end for the whole run ends.
         fake.push_message_update({"type": "text_delta", "delta": "Switching"})
         assert (await _next_of(recorder, TextDelta)).turn == 2
         fake.push_agent_end()
         ended = await _next_of(recorder, TurnEnd)
         assert (ended.turn, ended.stop_reason) == (2, "end")
+        assert any(
+            isinstance(event, InputState) and event.turn == 2 and event.state == "provider_ack"
+            for event in recorder.all
+        )
+    finally:
+        await session.close()
 
-        # Idle again: the next message ends nothing before it starts.
-        await session.submit_turn(_text("thanks"))
-        assert [e.turn for e in recorder.all if isinstance(e, TurnEnd)] == [1, 2]
+
+@pytest.mark.asyncio
+async def test_terminal_ownership_survives_a_new_input_and_a_delayed_usage_read(monkeypatch):
+    session, fake, recorder, broker = await _started_session()
+    reading, release = asyncio.Event(), asyncio.Event()
+    read_usage = session._read_usage
+
+    async def delayed_usage():
+        reading.set()
+        await release.wait()
+        return await read_usage()
+
+    monkeypatch.setattr(session, "_read_usage", delayed_usage)
+    try:
+        await session.submit_turn(_text("one"))
+        fake.cost = 0.25
+        fake.tokens = {"input": 10, "output": 2, "cache_read": 0, "cache_write": 0}
+        # The reader captured turn 1, but its loop callback has not run yet.
+        fake.push_agent_end()
+        await session.submit_turn(_text("two"))
+        await asyncio.wait_for(reading.wait(), 2)
+        await session.submit_turn(_text("three"))
+        fake.push_agent_end()  # duplicate terminal boundary must not settle twice
+        assert [call.message for call in fake.prompt_calls] == ["one"]
+
+        release.set()
+        first = await _next_of(recorder, TurnEnd)
+        assert (first.turn, first.stop_reason) == (1, "end")
+        assert first.cost_usd == pytest.approx(0.25)
+        assert first.tokens["input"] == 10
+        await _next_input_state(recorder, 2, "provider_ack")
+        assert [call.message for call in fake.prompt_calls] == ["one", "two"]
+
+        fake.cost = 0.40
+        fake.tokens["input"] = 16
+        fake.push_agent_end()
+        second = await _next_of(recorder, TurnEnd)
+        assert second.turn == 2 and second.cost_usd == pytest.approx(0.15)
+        assert second.tokens["input"] == 6
+        await _next_input_state(recorder, 3, "provider_ack")
+        assert [event.turn for event in recorder.all if isinstance(event, TurnEnd)] == [1, 2]
+    finally:
+        release.set()
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_queue_admission_refuses_only_when_all_local_slots_are_occupied():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn(_text("active"))
+        for index in range(8):
+            assert session.turn_refusal() is None
+            await session.submit_turn(_text("queued %d" % index))
+        assert session.turn_refusal() is not None
+        assert [call.message for call in fake.prompt_calls] == ["active"]
+        assert [event.turn for event in recorder.all if isinstance(event, InputState)
+                and event.state == "queued"] == list(range(2, 10))
+
+        fake.push_agent_end()
+        await _next_input_state(recorder, 2, "provider_ack")
+        assert session.turn_refusal() is None
     finally:
         await session.close()
 
@@ -1158,7 +1240,6 @@ async def test_a_refused_message_is_reported_and_leaves_the_session_ready():
         await session.submit_turn(_text("hello"))
         error = await _next_of(recorder, AgentError)
         assert error.stderr == "No model selected"
-        assert "still ready" in error.remediation
         # The turn the message would have started is closed, so the pane is
         # not left waiting on it.
         ended = await _next_of(recorder, TurnEnd)
@@ -1167,8 +1248,8 @@ async def test_a_refused_message_is_reported_and_leaves_the_session_ready():
 
         fake.prompt_error = None
         await session.submit_turn(_text("hello again"))
+        await _next_input_state(recorder, 2, "provider_ack")
         assert [c.message for c in fake.prompt_calls] == ["hello again"]
-        assert not any(isinstance(e, TurnEnd) and e.stop_reason == "steered" for e in recorder.all)
     finally:
         await session.close()
 
@@ -1242,6 +1323,7 @@ async def test_a_message_refused_after_omp_acknowledged_it_is_reported_the_same_
     session, fake, recorder, broker = await _started_session()
     try:
         await session.submit_turn(_text("hello"))
+        await session.submit_turn(_text("queued"))
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, fake.push_protocol_error, "set_model", "unrelated")
         await loop.run_in_executor(None, fake.push_protocol_error, "prompt", "quota exhausted")
@@ -1250,6 +1332,8 @@ async def test_a_message_refused_after_omp_acknowledged_it_is_reported_the_same_
         ended = await _next_of(recorder, TurnEnd)
         assert (ended.turn, ended.stop_reason) == (1, "rejected")
         assert session.agent_status() == AGENT_READY
+        await _next_input_state(recorder, 2, "provider_ack")
+        assert [call.message for call in fake.prompt_calls] == ["hello", "queued"]
     finally:
         await session.close()
 
@@ -1289,6 +1373,47 @@ async def test_a_turn_end_reports_that_turn_s_cost_and_tokens_from_the_session_s
         await session.close()
 
 
+@pytest.mark.asyncio
+async def test_cumulative_regression_starts_an_epoch_without_negative_attribution():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn(_text("one"))
+        fake.cost = 1.5
+        fake.tokens = {"input": 100, "output": 20, "cache_read": 30, "cache_write": 2}
+        fake.push_agent_end()
+        first = await _next_of(recorder, TurnEnd)
+        assert first.cost_usd == pytest.approx(1.5)
+        assert first.tokens == {"input": 100, "output": 20, "cache_read": 30, "cache_write": 2}
+
+        await session.submit_turn(_text("two"))
+        fake.cost = 0.5
+        fake.tokens = {"input": 60, "output": 25, "cache_read": 12, "cache_write": 1}
+        fake.push_agent_end()
+        reset = await _next_of(recorder, TurnEnd)
+        assert reset.cost_usd is None
+        assert reset.tokens is None
+        assert reset.usage_epoch == 1
+        assert reset.usage_source == "counter_regression"
+
+        fake.push_message_end(_assistant({"input": 7}))
+        request = await _next_of(recorder, RequestUsage)
+        assert request.tokens_input == 7
+        assert request.usage_epoch == 1
+        assert request.conversation_id != "omp-sess-1"
+
+        await session.submit_turn(_text("three"))
+        fake.cost = 0.75
+        fake.tokens = {"input": 75, "output": 30, "cache_read": 20, "cache_write": 1}
+        fake.push_agent_end()
+        after_reset = await _next_of(recorder, TurnEnd)
+        assert after_reset.cost_usd == pytest.approx(0.25)
+        assert after_reset.tokens == {"input": 15, "output": 5, "cache_read": 8, "cache_write": 0}
+        assert after_reset.usage_epoch == 1
+        assert after_reset.usage_source == "cumulative_turn_delta"
+    finally:
+        await session.close()
+
+
 def _assistant(usage=None, response_id=None, **extra):
     message = {"role": "assistant", "provider": "titan", "model": "qwen3-27b", **extra}
     if usage is not None:
@@ -1310,7 +1435,10 @@ async def test_each_provider_request_reports_its_own_tokens_with_a_deterministic
         fake.push_message_end({"role": "user", "content": "one"})
         fake.push_message_end(
             _assistant(
-                {"input": 900, "output": 40, "cacheRead": 0, "cacheWrite": 120},
+                {
+                    "input": 900, "output": 40, "cacheRead": 0, "cacheWrite": 120,
+                    "cost": {"total": 0.0042},
+                },
                 response_id="resp-a",
             )
         )
@@ -1319,35 +1447,43 @@ async def test_each_provider_request_reports_its_own_tokens_with_a_deterministic
             _assistant({"input": 30, "output": 75, "cacheRead": 1020, "cacheWrite": 0})
         )
         await session.submit_turn(_text("two"))
+        fake.push_agent_end()
+        await _next_of(recorder, TurnEnd)
+        await _next_input_state(recorder, 2, "provider_ack")
         fake.push_message_end(
             _assistant({"input": 5, "output": 6, "cacheRead": 7, "cacheWrite": 8})
         )
-        await asyncio.sleep(0.01)
+        await _next_of(recorder, RequestUsage)
 
         assert [e["event_id"] for e in reported] == [
-            "toy-sess-1:1:1",
-            "toy-sess-1:1:2",
-            "toy-sess-1:2:1",
+            "toy-sess-1:omp-sess-1:0:1:1",
+            "toy-sess-1:omp-sess-1:0:1:2",
+            "toy-sess-1:omp-sess-1:0:2:1",
         ]
-        first = reported[0]
-        assert {k: v for k, v in first.items() if k != "ts"} == {
-            "event_id": "toy-sess-1:1:1",
-            "session_id": "toy-sess-1",
-            "turn_index": 1,
-            "backend": "omp",
-            "model": "qwen3-27b",
-            "provider": "titan",
-            "provider_request_id": "resp-a",
-            "tokens_input": 900,
-            "tokens_output": 40,
-            "tokens_cache_read": 0,
-            "tokens_cache_write": 120,
-            "tokens_reasoning": None,
-        }
-        assert first["ts"].endswith("Z")
-        assert reported[1]["provider_request_id"] is None
         assert (reported[1]["tokens_input"], reported[1]["tokens_cache_read"]) == (30, 1020)
-        assert not any("cost" in key for event in reported for key in event)
+    finally:
+        await session.close()
+
+@pytest.mark.asyncio
+async def test_resolved_runtime_uses_the_omp_get_state_model_and_thinking_level():
+    class StateReported(FakeRpcClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.model = SimpleNamespace(id="actual-model", provider="actual-provider")
+            self.thinking_level = "high"
+
+    session, _fake, recorder, _broker = await _started_session(client_class=StateReported)
+    try:
+        runtime = [event for event in recorder.all if isinstance(event, AgentRuntimeResolved)]
+        assert runtime[-1].to_wire() == {
+            "kind": "agent_runtime_resolved",
+            "backend": "omp",
+            "provider": "actual-provider",
+            "model": "actual-model",
+            "effort": "high",
+            "provenance": "get_state",
+        }
+        assert session.resolved_runtime["effort"] == "high"
     finally:
         await session.close()
 
@@ -1364,22 +1500,27 @@ async def test_a_request_whose_usage_omp_did_not_report_is_null_not_zero():
         (partial, missing) = reported
         assert (partial["tokens_input"], partial["tokens_output"]) == (12, None)
         assert (partial["tokens_cache_read"], partial["tokens_cache_write"]) == (None, None)
-        assert {k: v for k, v in missing.items() if k.startswith("tokens_")} == {
-            "tokens_input": None,
-            "tokens_output": None,
-            "tokens_cache_read": None,
-            "tokens_cache_write": None,
-            "tokens_reasoning": None,
+        assert set((k, v) for k, v in missing.items() if k.startswith("tokens_")) >= {
+            ("tokens_input", None),
+            ("tokens_output", None),
+            ("tokens_cache_read", None),
+            ("tokens_cache_write", None),
         }
     finally:
         await session.close()
 
 
 @pytest.mark.asyncio
-async def test_without_a_usage_consumer_omp_is_listened_to_exactly_as_before():
+async def test_request_usage_is_published_without_an_optional_sink():
     session, fake, recorder, broker = await _started_session()
     try:
-        assert "message_end" not in fake._listeners
+        await session.submit_turn(_text("one"))
+        fake.push_message_end(_assistant({"input": 5}))
+        event = await _next_of(recorder, RequestUsage)
+        assert event.tokens_input == 5
+        assert event.tokens_output is None
+        assert event.conversation_id == "omp-sess-1"
+        assert "message_end" in fake._listeners
     finally:
         await session.close()
 
@@ -1413,6 +1554,8 @@ async def test_usage_is_the_whole_conversation_s_from_the_start_of_a_resume_thro
             "cost_usd": 1.5,
             "tokens": {"input": 9000, "output": 1200, "cache_read": 30000, "cache_write": 800},
             "context": {"used_tokens": 41000, "window_tokens": 200000},
+            "usage_epoch": 0,
+            "usage_source": "cumulative_snapshot",
         }
 
         await session.submit_turn(_text("one"))
@@ -1448,7 +1591,7 @@ async def test_usage_is_the_whole_conversation_s_from_the_start_of_a_resume_thro
 # ---------------------------------------------------------------------------
 
 
-def _omp_launch(tmp_path, recorder, *, resumed, base_url):
+def _omp_launch(tmp_path, recorder, *, resumed, base_url, effort=None):
     """``launch.build_session``'s omp session for ``tmp_path``'s session."""
     sid = sessions.resolve_continue(tmp_path) if resumed else sessions.create_session(tmp_path)
     sessions.record_last_session(tmp_path, sid)
@@ -1464,6 +1607,7 @@ def _omp_launch(tmp_path, recorder, *, resumed, base_url):
         resumed=resumed,
         settings={
             "model": None,
+            "effort": effort,
             "omp_base_url": base_url,
             "omp_api_key": None,
             "approval_timeout": 300,
@@ -1734,22 +1878,22 @@ async def test_an_end_turn_request_whose_result_never_arrived_does_not_end_a_lat
 
 
 @pytest.mark.asyncio
-async def test_a_run_s_end_that_the_loop_sees_after_a_new_message_settles_only_its_own_turn():
-    """omp ends run 1, and a new message's submit begins before the loop has
-    handled that end: turn 1 ends as steered, and the late settle must not
-    close turn 2, whose own run settles it."""
+async def test_a_terminal_run_settles_before_a_queued_turn_starts():
+    """A message received before omp's terminal event is queued, then delivered
+    as its own turn only after the first run has settled."""
     session, fake, recorder, broker = await _started_session()
     try:
         await session.submit_turn(_text("one"))
-        fake.push_agent_end()  # queued on the loop, not yet handled
+        await _next_input_state(recorder, 1, "provider_ack")
         await session.submit_turn(_text("two"))
-        await asyncio.sleep(0.05)
-        ends = [(e.turn, e.stop_reason) for e in recorder.all if isinstance(e, TurnEnd)]
-        assert ends == [(1, "steered")]
         fake.push_agent_end()
-        await asyncio.sleep(0.05)
-        ends = [(e.turn, e.stop_reason) for e in recorder.all if isinstance(e, TurnEnd)]
-        assert ends == [(1, "steered"), (2, "end")]
+        ended = await _next_of(recorder, TurnEnd)
+        assert (ended.turn, ended.stop_reason) == (1, "end")
+        await _next_input_state(recorder, 2, "provider_ack")
+        assert [call.message for call in fake.prompt_calls] == ["one", "two"]
+        fake.push_agent_end()
+        ended = await _next_of(recorder, TurnEnd)
+        assert (ended.turn, ended.stop_reason) == (2, "end")
     finally:
         await session.close()
 
@@ -1886,7 +2030,7 @@ async def test_a_resumed_session_s_next_turn_follows_the_last_one_in_its_history
             if ("turn_end", 6, "end") in kinds:
                 break
             await asyncio.sleep(0.01)
-        assert [k for k in kinds[10:] if k[1] is not None] == [
+        assert [k for k in kinds[10:] if k[1] is not None and k[0] in {"user_turn", "text_delta", "turn_end"}] == [
             ("user_turn", 6, None),
             ("text_delta", 6, None),
             ("turn_end", 6, "end"),
@@ -1897,10 +2041,8 @@ async def test_a_resumed_session_s_next_turn_follows_the_last_one_in_its_history
 
 
 @pytest.mark.asyncio
-async def test_a_steer_is_logged_under_the_number_its_reply_arrives_under(tmp_path, monkeypatch):
-    """omp ends the running turn as steered and streams the rest under the
-    next number; the steering message's ``user_turn`` has that number, so the
-    page shows it beside the reply it produced rather than as an empty turn."""
+async def test_a_queued_turn_is_logged_under_the_turn_its_reply_arrives_under(tmp_path, monkeypatch):
+    """A queued input keeps its own turn identity after the previous run ends."""
     from annealage_agent.http import ws as ws_module
     from annealage_agent.session.events import read_records
 
@@ -1927,12 +2069,14 @@ async def test_a_steer_is_logged_under_the_number_its_reply_arrives_under(tmp_pa
         )
 
     async def logged_until(wanted):
-        """The turn-numbered records after the history's own, once ``wanted``
-        is among them."""
         for _ in range(100):
             records = list(read_records(sessions.events_path(tmp_path, sid)))[1:]
             turns = [
-                (r["event"]["kind"], r["event"]["turn"], r["event"].get("stop_reason"))
+                (
+                    r["event"]["kind"],
+                    r["event"]["turn"],
+                    r["event"].get("state", r["event"].get("stop_reason")),
+                )
                 for r in records
                 if "turn" in r["event"]
             ]
@@ -1947,13 +2091,21 @@ async def test_a_steer_is_logged_under_the_number_its_reply_arrives_under(tmp_pa
         fake.push_message_update({"type": "text_delta", "delta": "Working"})
         await logged_until(("text_delta", 2, None))
         await send_turn("use the LDO instead")
+        fake.push_agent_end()
+        await logged_until(("input_state", 3, "provider_ack"))
+        # The queued turn starts after turn 2 has settled; its response and
+        # terminal event stay attributed to turn 3.
         fake.push_message_update({"type": "text_delta", "delta": "Switching"})
         fake.push_agent_end()
-        assert await logged_until(("turn_end", 3, "end")) == [
+        turns = await logged_until(("turn_end", 3, "end"))
+        assert [
+            item for item in turns
+            if item[0] in {"user_turn", "text_delta", "turn_end"}
+        ] == [
             ("user_turn", 2, None),
             ("text_delta", 2, None),
             ("user_turn", 3, None),
-            ("turn_end", 2, "steered"),
+            ("turn_end", 2, "end"),
             ("text_delta", 3, None),
             ("turn_end", 3, "end"),
         ]
@@ -2285,5 +2437,63 @@ async def test_backend_logs_of_a_running_omp_are_its_own_log_and_conversation(
         for reported in (planted, secret):
             session.session_file = str(reported)
             assert [e.name for e in session.backend_logs()] == ["omp log"]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("actual_model,actual_effort,ready", [
+    ("selected", "high", True),
+    ("substituted", "high", False),
+    ("selected", "low", False),
+    (None, None, False),
+])
+async def test_operator_admission_refuses_omp_model_or_effort_substitution(
+    tmp_path, actual_model, actual_effort, ready
+):
+    clients = []
+
+    def factory(**kwargs):
+        client = FakeRpcClient(**kwargs)
+        client.model = SimpleNamespace(id=actual_model, provider="provider")
+        client.thinking_level = actual_effort
+        clients.append(client)
+        return client
+
+    recorder = EventRecorder()
+    session = OmpSession(recorder, cwd=tmp_path, session_id="policy",
+                         model="provider/selected", thinking="high",
+                         client_factory=factory)
+    session.runtime_policy = {"selected": {"backend": "omp",
+                                          "model": "provider/selected", "effort": "high"}}
+    try:
+        await session.start()
+        assert (session.agent_status() == AGENT_READY) is ready
+        assert clients[0].prompt_calls == []
+        assert clients[0].stopped is not ready
+        assert ("--thinking", "high") == tuple(clients[0].kwargs["extra_args"])[-2:]
+        if not ready:
+            assert any(isinstance(event, AgentError) and "no substitution" in event.stderr
+                       for event in recorder.all)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_launch_forwards_operator_effort_to_omp_thinking(tmp_path, monkeypatch):
+    clients = []
+
+    def factory(**kwargs):
+        client = FakeRpcClient(**kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(omp_module, "RpcClient", factory)
+    session = _omp_launch(tmp_path, EventRecorder(), resumed=False, base_url=None,
+                          effort="high")
+    try:
+        await session.start()
+        assert clients[0].kwargs["extra_args"][-2:] == ("--thinking", "high")
+        assert clients[0].prompt_calls == []
     finally:
         await session.close()

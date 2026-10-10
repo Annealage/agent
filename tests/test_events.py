@@ -7,12 +7,13 @@ Nothing here needs asyncio; ``EventLog`` is plain, synchronous bookkeeping.
 which concrete event type is used.
 """
 
+import dataclasses
 import json
 
 import pytest
 
 from annealage_agent.session import events as events_module
-from annealage_agent.session.base import TextDelta, ToolUse, TurnEnd, UserTurn
+from annealage_agent.session.base import RequestUsage, TextDelta, ToolUse, TurnEnd, UserTurn
 from annealage_agent.session.events import RING_SIZE, EventLog
 
 
@@ -36,6 +37,69 @@ def test_append_assigns_increasing_seq_starting_at_one():
     assert log.append(_evt("b")) == 2
     assert log.append(_evt("c")) == 3
     assert log.current_seq == 3
+
+
+def test_request_usage_is_insert_once_by_position_and_conflicts_are_diagnosed(capsys):
+    log = EventLog()
+    event = RequestUsage(
+        event_id="s:c:0:1:1",
+        session_id="s",
+        conversation_id="c",
+        usage_epoch=0,
+        turn_index=1,
+        request_n=1,
+        backend="omp",
+        model="m",
+        provider="p",
+        provider_request_id=None,
+        cost_usd=None,
+        cost_source=None,
+        tokens_input=8,
+        tokens_output=None,
+        tokens_cache_read=None,
+        tokens_cache_write=None,
+        tokens_reasoning=None,
+        ts="first",
+    )
+    assert log.append(event) == 1
+    assert log.append(dataclasses.replace(event, ts="redelivered")) == 1
+    assert log.append(dataclasses.replace(event, tokens_input=9)) == 1
+    assert log.current_seq == 1
+    assert len(log.replay(None).events) == 1
+    assert "conflicting request_usage event" in capsys.readouterr().err
+
+
+def test_request_usage_identity_survives_event_log_recovery(tmp_path):
+    path = tmp_path / "events.jsonl"
+    event = RequestUsage(
+        event_id="s:c:0:1:1",
+        session_id="s",
+        conversation_id="c",
+        usage_epoch=0,
+        turn_index=1,
+        request_n=1,
+        backend="omp",
+        model=None,
+        provider=None,
+        provider_request_id=None,
+        cost_usd=None,
+        cost_source=None,
+        tokens_input=8,
+        tokens_output=None,
+        tokens_cache_read=None,
+        tokens_cache_write=None,
+        tokens_reasoning=None,
+        ts="first",
+    )
+    first = EventLog(str(path))
+    assert first.append(event) == 1
+    first.close()
+
+    recovered = EventLog(str(path))
+    assert recovered.append(dataclasses.replace(event, ts="redelivered")) == 1
+    assert recovered.current_seq == 1
+    assert len(recovered.replay(None).events) == 1
+    recovered.close()
 
 
 def test_seq_is_monotonic_across_a_restart_of_the_log_object(tmp_path):
@@ -177,6 +241,35 @@ def test_a_gap_the_file_cannot_fill_is_reported(tmp_path):
     path.unlink()
 
     assert restarted.replay(0).truncated is True
+
+
+@pytest.mark.parametrize("missing", [1, 2, 3])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.asyncio
+async def test_restart_replay_reports_missing_records_even_when_latest_seq_survives(
+    tmp_path, missing, asynchronous
+):
+    path = tmp_path / "events.jsonl"
+    log = EventLog(str(path))
+    for text in ("a", "b", "c", "d"):
+        log.append(_evt(text))
+    log.close()
+    records = path.read_text(encoding="utf-8").splitlines()
+    path.write_text(
+        "\n".join(line for line in records if json.loads(line)["seq"] != missing) + "\n",
+        encoding="utf-8",
+    )
+
+    restarted = EventLog(str(path))
+    try:
+        replay = await restarted.replay_async(0) if asynchronous else restarted.replay(0)
+        assert replay.through == 4
+        assert replay.truncated is True
+        assert "".join(event["text"] for _seq, event in replay.events) == (
+            "abcd".replace("abcd"[missing - 1], "")
+        )
+    finally:
+        restarted.close()
 
 
 def test_the_file_and_the_ring_join_with_no_seq_skipped_or_repeated(tmp_path, monkeypatch):

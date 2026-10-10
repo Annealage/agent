@@ -983,11 +983,10 @@ class CodexSession:
         self, payload: TurnCompletedNotification, viewer: Optional[str]
     ) -> None:
         turn = payload.turn
-        # Codex has no per-turn cost figure comparable to the Claude API's
-        # total_cost_usd (subscription billing does not meter a turn this
-        # way); 0.0 is an honest "not applicable" rather than a guess.
+        # Codex uses subscription billing and does not report a per-turn
+        # price; None preserves that unknown rather than implying zero cost.
         stop_reason, self._stop_reason = self._stop_reason or turn.status.value, None
-        self._emit(TurnEnd(turn=self._turn, stop_reason=stop_reason, cost_usd=0.0, viewer=viewer))
+        self._emit(TurnEnd(turn=self._turn, stop_reason=stop_reason, cost_usd=None, viewer=viewer))
         if self._token_usage is not None:
             self._emit(_usage(self._token_usage, viewer))
 

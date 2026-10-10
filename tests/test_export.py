@@ -154,6 +154,18 @@ def test_a_text_transcript_reads_as_the_conversation_the_human_s_side_included()
     assert "images/wall.png" in text
 
 
+
+def test_automatic_turn_transcript_is_not_attributed_to_a_human():
+    event = UserTurn(
+        turn=1,
+        blocks=[{"type": "text", "text": "Continue scoped work."}],
+        automation_source="loom_root_continuation",
+    )
+    text = events.render_transcript([_rec(1, event)], fmt="markdown", include="text")
+    assert "Automatic workflow continuation" in text
+    assert "Human" not in text
+    assert "Continue scoped work." in text
+
 def test_render_transcript_markdown_full_includes_tool_input_and_result_and_cost():
     records = [
         _rec(1, ToolUse(turn=1, tool_use_id="t1", name="read_file", input={"path": "a.json"})),

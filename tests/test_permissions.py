@@ -69,6 +69,29 @@ async def _pending_request(broker, events, tool_name="Edit", input_data=None):
     return task, request
 
 
+async def test_a_changed_authority_denies_a_delayed_allow():
+    class Guard:
+        source = "project-a"
+
+        def capture(self, tool_name, input_data):
+            return self.source
+
+        def validate(self, token, tool_name, input_data):
+            return token == self.source
+
+    guard = Guard()
+    broker, events = _broker(request_guard=guard)
+    broker.viewer_connected()
+    task, request = await _pending_request(broker, events, input_data={"path": "part.py"})
+
+    guard.source = "project-b"
+    await broker.decide(request.request_id, "allow")
+    decision = await task
+
+    assert decision.allow is False
+    assert "authority changed" in decision.message
+
+
 def _assert_allow(result):
     assert isinstance(result, Decision)
     assert result.allow is True

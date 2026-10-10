@@ -146,6 +146,7 @@ class EventLog:
         #: summary (``AgentHolder``) watches them. One that raises is
         #: reported and never stops the append.
         self.observers: list = []
+        self._request_usage: dict = {}
         if self._path is not None:
             self._seq = self._recover_seq()
             self._fd = os.open(str(self._path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -184,9 +185,23 @@ class EventLog:
                 if not isinstance(event, dict):
                     continue
                 kind = event.get("kind")
+                if kind == "request_usage":
+                    event_id = event.get("event_id")
+                    if isinstance(event_id, str):
+                        self._request_usage[event_id] = (
+                            _usage_identity(event),
+                            record.get("seq", highest),
+                        )
                 if kind == "usage":
                     self.last_usage = {
-                        key: event.get(key) for key in ("cost_usd", "tokens", "context")
+                        key: event.get(key)
+                        for key in (
+                            "cost_usd",
+                            "tokens",
+                            "context",
+                            "usage_epoch",
+                            "usage_source",
+                        )
                     }
                     continue
                 if kind == "session_reset":
@@ -227,9 +242,22 @@ class EventLog:
         this module has no other dependency on that class, so a caller
         with some other object shaped the same way works identically.
         """
+        wire = event.to_wire()
+        if wire.get("kind") == "request_usage":
+            event_id = wire.get("event_id")
+            if isinstance(event_id, str):
+                existing = self._request_usage.get(event_id)
+                if existing is not None:
+                    previous, previous_seq = existing
+                    if previous != _usage_identity(wire):
+                        sys.stderr.write(
+                            "warning: conflicting request_usage event for %s; duplicate ignored\n"
+                            % event_id
+                        )
+                    return previous_seq
+                self._request_usage[event_id] = (_usage_identity(wire), self._seq + 1)
         self._seq += 1
         seq = self._seq
-        wire = event.to_wire()
         self._ring.append((seq, wire))
         if self._fd is not None:
             line = json.dumps({"seq": seq, "event": wire}) + "\n"
@@ -259,7 +287,7 @@ class EventLog:
         neither, and ``Replay.through`` says where the next replay starts.
         """
         plan = self._plan(last_seq)
-        gap = self._read_between(plan.after, plan.before) if plan.before is not None else []
+        gap = self._read_between(plan.after, plan.before) if plan.before is not None else None
         return plan.replay(gap)
 
     async def replay_async(self, last_seq: Optional[int]) -> Replay:
@@ -270,7 +298,7 @@ class EventLog:
         the file (``append`` writes the line before it returns), so appends
         while the thread reads change nothing it returns."""
         plan = self._plan(last_seq)
-        gap = []
+        gap = None
         if plan.before is not None:
             gap = await asyncio.to_thread(self._read_between, plan.after, plan.before)
         return plan.replay(gap)
@@ -299,9 +327,9 @@ class EventLog:
         before = oldest if last_seq < oldest - 1 else None
         return _ReplayPlan(after=last_seq, before=before, ring=ring, through=self._seq)
 
-    def _read_between(self, after: int, before: int) -> List[Tuple[int, dict]]:
-        """The file's records with ``after < seq < before``, coalesced; none
-        for a log with no file.
+    def _read_between(self, after: int, before: int) -> "_ReplayGap":
+        """The file's records with ``after < seq < before``, coalesced, and
+        whether any sequence in that interval is unavailable.
 
         The file is in seq order (this class is its one writer), so reading
         stops at the first record the ring already holds. Every record below
@@ -309,15 +337,20 @@ class EventLog:
         in the same call that puts the event in the ring.
         """
         if self._path is None:
-            return []
+            return _ReplayGap([], truncated=True)
         records = []
+        reached = after
+        truncated = False
         for record in read_records(self._path):
             seq = record["seq"]
             if seq >= before:
                 break
             if seq > after:
+                if seq != reached + 1:
+                    truncated = True
+                reached = seq
                 records.append((seq, record["event"]))
-        return _coalesce(records)
+        return _ReplayGap(_coalesce(records), truncated or reached != before - 1)
 
     def close(self) -> None:
         """Close the append-only file descriptor, if one is open.
@@ -333,6 +366,12 @@ class EventLog:
 
 
 @dataclasses.dataclass(frozen=True)
+class _ReplayGap:
+    events: List[Tuple[int, dict]]
+    truncated: bool
+
+
+@dataclasses.dataclass(frozen=True)
 class _ReplayPlan:
     """One replay's parts, fixed by ``EventLog._plan``: the ring's events
     after ``after``, and, when ``before`` is set, the file's records with
@@ -343,14 +382,17 @@ class _ReplayPlan:
     ring: List[Tuple[int, dict]]
     through: int
 
-    def replay(self, gap: List[Tuple[int, dict]]) -> Replay:
+    def replay(self, gap: Optional[_ReplayGap]) -> Replay:
         if self.before is None:
             return Replay(events=self.ring, truncated=False, through=self.through)
-        reached = gap[-1][0] if gap else self.after
         return Replay(
-            events=gap + self.ring, truncated=reached < self.before - 1, through=self.through
+            events=gap.events + self.ring, truncated=gap.truncated, through=self.through
         )
 
+
+def _usage_identity(event: dict) -> dict:
+    """Compare positional usage payloads without volatile observation time."""
+    return {key: value for key, value in event.items() if key != "ts"}
 
 def _coalesce(records: List[Tuple[int, dict]]) -> List[Tuple[int, dict]]:
     """``records`` with each run of consecutive same-turn ``text_delta``
@@ -466,9 +508,8 @@ def _render_jsonl(kept: list) -> str:
     return "".join(json.dumps(record) + "\n" for record in kept)
 
 
-def _human_lines(blocks) -> List[str]:
-    """A ``user_turn``'s blocks as a blockquote headed with who said it: the
-    text as typed, line for line, and an attached image as its path."""
+def _human_lines(blocks, automation_source=None) -> List[str]:
+    """Render a human or explicitly sourced automatic turn as a blockquote."""
     body: List[str] = []
     for block in blocks if isinstance(blocks, list) else ():
         if not isinstance(block, dict):
@@ -477,7 +518,10 @@ def _human_lines(blocks) -> List[str]:
             body.extend(str(block.get("text", "")).splitlines() or [""])
         elif block.get("type") == "image_path":
             body.append("[image: %s]" % block.get("path", ""))
-    return ["> **Human:**"] + [("> " + line) if line else ">" for line in body]
+    author = ("Automatic workflow continuation"
+              if automation_source == "loom_root_continuation"
+              else "Automatic turn" if automation_source else "Human")
+    return ["> **%s:**" % author] + [("> " + line) if line else ">" for line in body]
 
 
 def _render_markdown(kept: list, include: str, session_id, project_dir, exported_at) -> str:
@@ -520,7 +564,7 @@ def _render_markdown(kept: list, include: str, session_id, project_dir, exported
 
         if kind == "user_turn":
             lines.append("")
-            lines.extend(_human_lines(event.get("blocks")))
+            lines.extend(_human_lines(event.get("blocks"), event.get("automation_source")))
         elif kind == "tool_use":
             lines.append("")
             lines.append("Tool call: %s" % event.get("name", ""))
@@ -557,10 +601,10 @@ def _render_markdown(kept: list, include: str, session_id, project_dir, exported
                 lines.append("```")
         elif kind == "turn_end":
             cost = event.get("cost_usd")
-            cost = cost if isinstance(cost, (int, float)) else 0.0
+            cost_label = "$%.4f" % cost if isinstance(cost, (int, float)) else "unknown"
             lines.append("")
             lines.append(
-                "Turn %s ended: %s, cost $%.4f" % (turn, event.get("stop_reason", ""), cost)
+                "Turn %s ended: %s, cost %s" % (turn, event.get("stop_reason", ""), cost_label)
             )
             open_turn = None
 

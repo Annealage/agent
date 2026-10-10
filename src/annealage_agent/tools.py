@@ -388,13 +388,43 @@ class ToolServer:
     which opens its own connection as a proxied call does.
     """
 
-    def __init__(self, tools, *, grading, bus, paused_message, remote=()):
+    def __init__(
+        self,
+        tools,
+        *,
+        grading,
+        bus,
+        paused_message,
+        remote=(),
+        request_guard=None,
+        never_remembered=(),
+    ):
+        """Build one session's tool server.
+
+        ``request_guard`` optionally implements ``capture(tool_name, args)``
+        and ``validate(token, tool_name, args)``. The permission broker uses
+        it to bind a write approval to the authority present when its card was
+        requested and reject a stale approval before allowing the call through.
+
+        ``never_remembered`` names product tools whose transport approval must
+        be fresh on every call. Unlike ``asks_the_human``, this keeps their
+        grading and transport gate unchanged. Bare names are expanded for all
+        backend broker names; legacy standing grants are ignored by the broker.
+        """
         _verify(tools, grading)
+        self.request_guard = request_guard if request_guard is not None else getattr(
+            bus, "request_guard", None
+        )
         installed = product.current()
         self.name = installed.mcp_server_name
         self.asks_the_human = tuple(
             t.name for t in tools if getattr(t.handler, _ASKS_THE_HUMAN, False)
         )
+        never_remembered = tuple(never_remembered)
+        unknown = set(never_remembered) - {t.name for t in tools}
+        if unknown:
+            raise ValueError("never_remembered names are not tools: %s" % ", ".join(sorted(unknown)))
+        self._never_remembered = tuple(dict.fromkeys((*self.asks_the_human, *never_remembered)))
         moved = set(self.asks_the_human)
         self.grading = Grading(
             read=tuple(n for n in grading.read if n not in moved) + self.asks_the_human,
@@ -473,12 +503,11 @@ class ToolServer:
 
     @property
     def never_remembered(self):
-        """The names no "always allow" may cover: every ``asks_the_human``
-        tool, namespaced (as Claude, ``/mcp`` and the handler itself ask the
-        broker) and bare (as omp's host-tool gate does), for the session's
-        ``PermissionBroker`` (``launch.py``). Only the product's own tools
-        can be among them: a remote's are proxies, which never ask."""
-        return tuple(namespaced(self.name, n) for n in self.asks_the_human) + self.asks_the_human
+        """The names no "always allow" may cover: ``asks_the_human`` tools
+        and explicitly non-rememberable product tools, namespaced (as Claude
+        and ``/mcp`` ask) and bare (as omp's host-tool gate does), for the
+        session's ``PermissionBroker`` (``launch.py``)."""
+        return tuple(namespaced(self.name, n) for n in self._never_remembered) + self._never_remembered
 
     @property
     def remote_instructions(self):

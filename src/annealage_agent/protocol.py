@@ -147,6 +147,7 @@ def build_hello(
     usage: Optional[dict] = None,
     upload_actions: Optional[list] = None,
     models: Optional[list] = None,
+    resolved_runtime: Optional[dict] = None,
 ) -> dict:
     """The greeting sent once, immediately after a successful upgrade.
 
@@ -193,6 +194,9 @@ def build_hello(
     ``models`` are the models the backend listed for the model field to
     suggest, as the last ``AgentModelsAvailable`` said (empty before then, or
     when the backend cannot list them).
+
+    ``resolved_runtime`` is metadata the backend itself reported (null before
+    then), never the startup configuration requested by the caller.
     """
     return {
         "v": PROTOCOL_VERSION,
@@ -210,6 +214,7 @@ def build_hello(
             "usage": usage,
             "upload_actions": list(upload_actions or ()),
             "models": list(models or ()),
+            "resolved_runtime": resolved_runtime,
         },
         "protocol": PROTOCOL_VERSION,
     }

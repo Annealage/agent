@@ -132,7 +132,7 @@ class SessionInfo:
     sdk_session_id: Optional[str]
     started_at: Optional[str]
     turn_count: int
-    cost_usd: float
+    cost_usd: Optional[float]
     first_user_text: Optional[str]
     omp_session_file: Optional[str] = None
 
@@ -162,15 +162,18 @@ def _turn_stats(path: Path) -> tuple:
     """``(turn_count, cost_usd)`` derived from an ``events.jsonl``.
 
     Counts and sums ``turn_end`` events only; every other kind is
-    irrelevant to either figure. A line that fails to parse is skipped
-    rather than raising, matching ``EventLog._recover_seq``'s tolerance of
-    a torn trailing line from a process killed mid write: such a line was
-    never delivered to a client either, so skipping it costs nothing a
-    reader of this history could have already seen. Missing file reads as
+    irrelevant to either figure. If any turn's cost is unknown, the session
+    total is unknown too rather than a partial sum presented as total spend.
+    A session with no completed turns has a known zero cost. A line that fails
+    to parse is skipped rather than raising, matching ``EventLog._recover_seq``'s
+    tolerance of a torn trailing line from a process killed mid write: such a
+    line was never delivered to a client either, so skipping it costs nothing
+    a reader of this history could have already seen. Missing file reads as
     no turns yet, not an error.
     """
     turn_count = 0
     cost_usd = 0.0
+    cost_unknown = False
     try:
         f = open(path, "r", encoding="utf-8")
     except OSError:
@@ -185,9 +188,11 @@ def _turn_stats(path: Path) -> tuple:
             if isinstance(event, dict) and event.get("kind") == "turn_end":
                 turn_count += 1
                 cost = event.get("cost_usd")
-                if isinstance(cost, (int, float)):
+                if isinstance(cost, (int, float)) and not isinstance(cost, bool):
                     cost_usd += cost
-    return turn_count, cost_usd
+                else:
+                    cost_unknown = True
+    return turn_count, None if cost_unknown else cost_usd
 
 
 def create_session(project_dir, sid: Optional[str] = None) -> str:
@@ -234,6 +239,31 @@ def set_omp_session_file(project_dir, sid: str, session_file: str) -> None:
     meta = _read_json(path) or {"session_id": sid}
     meta["omp_session_file"] = session_file
     _write_json_atomic(path, meta)
+
+
+def get_runtime_policy(project_dir, sid: str) -> Optional[dict]:
+    """Read host-admitted runtime settings; absence is not historical evidence."""
+    if get_session_info(project_dir, sid) is None:
+        raise ValueError("Cannot read runtime policy for an unknown session")
+    meta = _read_json(meta_path(project_dir, sid))
+    record = meta.get("runtime_policy") if isinstance(meta, dict) else None
+    if record is not None and not isinstance(record, dict):
+        raise ValueError("Stored runtime policy must be an object")
+    return record
+
+
+def set_runtime_policy(project_dir, sid: str, record: dict) -> None:
+    """Freeze the first host admission in the existing session metadata."""
+    if get_session_info(project_dir, sid) is None:
+        raise ValueError("Cannot admit runtime policy for an unknown session")
+    path = meta_path(project_dir, sid)
+    meta = _read_json(path)
+    previous = meta.get("runtime_policy")
+    if previous is not None and previous != record:
+        raise ValueError("Session runtime policy is already frozen")
+    if previous is None:
+        meta["runtime_policy"] = record
+        _write_json_atomic(path, meta)
 
 
 def record_first_user_text(project_dir, sid: str, text: str) -> None:

@@ -22,7 +22,7 @@ from annealage_agent import datum
 from annealage_agent.uploads import UploadAction, check_upload_actions
 
 # The tools Datum lists, written out by hand rather than read from the module
-# under test (probed 2026-09-26).
+# under test (including the request tools discovered 2026-10-09).
 LOOKUPS = (
     "getting_started",
     "search_parts",
@@ -114,9 +114,13 @@ def fake():
 
 
 def _tools(tmp_path, url):
-    return build_toy_tools(
-        SimpleNamespace(paused=False), tmp_path, "sess-1", remote=(datum.remote(url),)
+    from annealage_agent.remote_actions import RemoteActionStore
+
+    bus = SimpleNamespace(paused=False)
+    bus.remote_action_store = RemoteActionStore(
+        tmp_path / "remote-actions.json", project_id=str(tmp_path), session="sess-1"
     )
+    return build_toy_tools(bus, tmp_path, "sess-1", remote=(datum.remote(url),))
 
 
 def test_the_remote_is_datum_under_the_ds_wiki_key():
@@ -128,7 +132,7 @@ def test_the_remote_is_datum_under_the_ds_wiki_key():
     assert remote.headers is None
 
 
-def test_every_lookup_is_read_grade_and_submitting_is_the_only_write():
+def test_every_lookup_is_read_grade_and_submitting_and_requesting_are_write():
     grading = datum.remote("http://x/mcp").grading
     assert grading.read == LOOKUPS
     assert grading.view == ()
@@ -178,6 +182,26 @@ async def test_a_lookup_reaches_datum_and_primes_it(fake, tmp_path):
     result = await proxied["search_parts"].handler({"query": "RP2040"})
     assert result["content"][0]["text"] == 'search_parts {"query": "RP2040"}'
     assert fake.calls[-1] == ("search_parts", {"query": "RP2040"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "arguments", "write"),
+    (
+        ("request_datasheet", {"mpn": "TPS54302"}, True),
+        ("get_request_status", {"request_id": 123}, False),
+    ),
+)
+async def test_request_and_polling_tools_are_discovered_graded_and_forwarded(
+    fake, tmp_path, name, arguments, write
+):
+    tools = _tools(tmp_path, fake.url)
+    spec = tools.remote_tables()["ds-wiki"][name]
+    assert spec.write is write
+    assert ("mcp__ds-wiki__" + name in tools.pre_allowed) is (not write)
+    result = await spec.handler(arguments)
+    assert result["content"][0]["text"] == "%s %s" % (name, json.dumps(arguments))
+    assert fake.calls[-1] == (name, arguments)
 
 
 def test_the_upload_action_files_a_datasheet_under_the_products_tag():

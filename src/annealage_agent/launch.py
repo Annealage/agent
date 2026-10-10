@@ -97,7 +97,8 @@ def build_session(
         # their requests are never remembered, and a grant for one of their
         # names already in permissions.toml is ignored. A bus with no tool
         # server has none.
-        never_remembered=bus.tools.never_remembered if bus.tools is not None else (),
+        never_remembered=getattr(bus.tools, "never_remembered", ()) if bus.tools is not None else (),
+        request_guard=getattr(bus.tools, "request_guard", None) if bus.tools is not None else None,
     )
     # app.py reads this back once build_session returns, to gate a
     # write-class tool call arriving through /mcp with the exact same
@@ -176,6 +177,7 @@ def build_session(
             session_id=session_id,
             broker=broker,
             model=settings["model"],
+            thinking=settings["effort"],
             base_url=settings["omp_base_url"],
             api_key=settings["omp_api_key"],
             # Mirrors SdkSession's mcp_servers=bus.tools.mcp_servers:
@@ -215,6 +217,7 @@ def build_session(
         # reach the broker above and therefore the human.
         mcp_servers=bus.tools.mcp_servers,
         allowed_tools=bus.tools.pre_allowed,
+        builtin_tools=getattr(bus, "builtin_tools", None),
         model=settings["model"],
         effort=settings["effort"],
         permission_mode=settings["permission_mode"],

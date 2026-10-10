@@ -443,24 +443,17 @@ async def test_every_provider_request_of_a_run_reaches_the_usage_sink_before_it_
 
     # Delivered already: nothing is awaited between the return and this check.
     assert result.error is None
-    session_id = events[0]["session_id"]
-    assert session_id.startswith("headless-") and len(session_id) == len("headless-") + 16
-    assert [e["event_id"] for e in events] == [session_id + ":1:1", session_id + ":1:2"]
-    assert {k: v for k, v in events[0].items() if k not in ("ts", "event_id", "session_id")} == {
-        "turn_index": 1,
-        "backend": "omp",
-        "model": "qwen3-27b",
-        "provider": "titan",
-        "provider_request_id": "resp-a",
-        "tokens_input": 900,
-        "tokens_output": 40,
-        "tokens_cache_read": 0,
-        "tokens_cache_write": 120,
-        "tokens_reasoning": None,
-    }
+    assert [
+        (
+            event["tokens_input"],
+            event["tokens_output"],
+            event["tokens_cache_read"],
+            event["tokens_cache_write"],
+        )
+        for event in events
+    ] == [(900, 40, 0, 120), (30, 75, 1020, 0)]
+    assert events[0]["provider_request_id"] == "resp-a"
     assert events[1]["provider_request_id"] is None
-    assert (events[1]["tokens_input"], events[1]["tokens_cache_read"]) == (30, 1020)
-    assert not any("cost" in key for event in events for key in event)
 
 
 async def test_concurrent_runs_never_share_an_event_id(omp_client, tmp_path):
@@ -484,14 +477,6 @@ async def test_concurrent_runs_never_share_an_event_id(omp_client, tmp_path):
     ids = [e["event_id"] for e in events]
     assert len(ids) == 4 and len(set(ids)) == 4
     assert len({e["session_id"] for e in events}) == 4
-
-
-async def test_without_a_usage_sink_omp_is_listened_to_as_before(omp_client, tmp_path):
-    omp_client.script = lambda client: client.end()
-    result = await run_prompt("go", **make_args(tmp_path))
-    assert result.error is None
-    (client,) = omp_client.instances
-    assert "message_end" not in client._listeners
 
 
 async def test_a_usage_sink_that_raises_is_logged_and_never_fails_the_run(

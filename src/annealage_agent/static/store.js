@@ -54,10 +54,9 @@
  *   chat          {turns, pendingUser, pending, agentStatus, model, models,
  *                  banner, attachments, usage}
  *                 the whole chat pane's state.
- *                 `turns` is one record per turn number, `{turn, user,
- *                 text, tools, stopReason, costUsd, complete}`, built up
- *                 as user_turn/text_delta/tool_use/tool_result/turn_end
- *                 events arrive; `tools` is `[{tool_use_id, name, input,
+ *                 `{turn, user, text, tools, stopReason, costUsd, complete,
+ *                 inputState, inputDetail}`, built by conversation and
+ *                 input_state events; `tools` is `[{tool_use_id, name, input,
  *                 result}]` with `result` null until a tool_result names
  *                 that tool_use_id. `user` is the blocks the human sent as
  *                 that turn, from its `user_turn` event: the one source of
@@ -318,10 +317,29 @@ function ensureTurn(chat, turn) {
     tools: Object.freeze([]),
     stopReason: null,
     costUsd: null,
+    usageEpoch: null,
+    usageSource: null,
     complete: false,
+    inputState: null,
+    inputDetail: null,
   });
   const turns = Object.freeze([...chat.turns, record]);
   return { turns, idx: turns.length - 1 };
+}
+
+function setChatInputState(turn, stateName, detail = null) {
+  commit(() => {
+    const chat = state.chat;
+    const { turns, idx } = ensureTurn(chat, turn);
+    const nextTurns = Object.freeze(
+      turns.map((t, i) => (
+        i === idx
+          ? Object.freeze({ ...t, inputState: stateName, inputDetail: detail })
+          : t
+      )),
+    );
+    state = { ...state, chat: Object.freeze({ ...chat, turns: nextTurns }) };
+  }, ["chat"]);
 }
 
 // `pendingUser` without the entry for `clientId`, or unchanged when it has
@@ -331,16 +349,16 @@ function withoutPending(pendingUser, clientId) {
   return kept.length === pendingUser.length ? pendingUser : Object.freeze(kept);
 }
 
-// A `user_turn` event: what the human sent as `turn`, whichever tab sent it.
-// When this tab did, `clientId` is its own name for the message, and the
-// pending entry it was holding is retired here, in the same change that
-// shows the message, so the two are never both counted.
-function setChatUserTurn(turn, blocks, clientId = null) {
+// A `user_turn` event: a human-authored turn or an explicitly sourced
+// automatic turn. Its origin is retained beside the blocks through replay.
+function setChatUserTurn(turn, blocks, clientId = null, automationSource = null) {
   commit(() => {
     const chat = state.chat;
     const { turns, idx } = ensureTurn(chat, turn);
     const nextTurns = Object.freeze(
-      turns.map((t, i) => (i === idx ? Object.freeze({ ...t, user: blocks }) : t)),
+      turns.map((t, i) => (i === idx
+        ? Object.freeze({ ...t, user: blocks, automationSource })
+        : t)),
     );
     const pendingUser = withoutPending(chat.pendingUser, clientId);
     state = { ...state, chat: Object.freeze({ ...chat, turns: nextTurns, pendingUser }) };
@@ -396,14 +414,26 @@ function setChatToolResult(toolUseId, isError, text) {
   }, ["chat"]);
 }
 
-function endChatTurn(turn, stopReason, costUsd, tokens = null) {
+function endChatTurn(
+  turn, stopReason, costUsd, tokens = null, usageEpoch = null, usageSource = null,
+) {
   commit(() => {
     const chat = state.chat;
     const { turns, idx } = ensureTurn(chat, turn);
     const nextTurns = Object.freeze(
-      turns.map((t, i) =>
-        i === idx ? Object.freeze({ ...t, stopReason, costUsd, tokens, complete: true }) : t,
-      ),
+      turns.map((t, i) => (
+        i === idx
+          ? Object.freeze({
+            ...t,
+            stopReason,
+            costUsd,
+            tokens,
+            usageEpoch,
+            usageSource,
+            complete: true,
+          })
+          : t
+      )),
     );
     state = { ...state, chat: Object.freeze({ ...chat, turns: nextTurns }) };
   }, ["chat"]);
@@ -716,6 +746,7 @@ export const store = Object.freeze({
   setConnection,
   setPaused,
   setChatUserTurn,
+  setChatInputState,
   appendChatTextDelta,
   addChatToolUse,
   setChatToolResult,

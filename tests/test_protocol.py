@@ -152,9 +152,18 @@ def test_build_hello_round_trips():
             "upload_actions": [],
             # Empty until the backend lists the models it can switch to.
             "models": [],
+            "resolved_runtime": None,
         },
         "protocol": PROTOCOL_VERSION,
     }
+
+
+def test_build_hello_carries_host_upload_actions():
+    actions = [{"name": "review", "label": "Review", "accepts": ["application/pdf"]}]
+    frame = build_hello(
+        7, "sess-1", "sdk-1", "/tmp/proj", "ready", upload_actions=actions
+    )
+    assert frame["session"]["upload_actions"] == actions
     assert _roundtrip(frame) == frame
 
 
@@ -170,6 +179,22 @@ def test_build_hello_carries_the_starting_model():
 def test_build_hello_allows_no_sdk_session_id_yet():
     frame = build_hello(0, "sess-1", None, "/tmp/proj", "connecting")
     assert frame["session"]["sdk_session_id"] is None
+    assert _roundtrip(frame) == frame
+
+
+def test_build_hello_carries_backend_reported_runtime_metadata():
+    runtime = {
+        "backend": "omp",
+        "provider": "titan",
+        "model": "qwen3-27b",
+        "effort": None,
+        "provenance": "assistant_message",
+    }
+    frame = build_hello(
+        7, "sess-1", None, "/tmp/proj", "ready", resolved_runtime=runtime
+    )
+
+    assert frame["session"]["resolved_runtime"] == runtime
     assert _roundtrip(frame) == frame
 
 

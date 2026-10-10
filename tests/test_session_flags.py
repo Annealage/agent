@@ -92,15 +92,17 @@ def test_the_listing_carries_every_session_with_its_turns_cost_and_opening_text(
         turn_events=(0.5, 1.25),
     )
     _write_session(tmp_path, "sid-b", "2026-08-02T00:00:00Z")
+    _write_session(tmp_path, "sid-c", "2026-08-03T00:00:00Z", turn_events=(0.5, None))
 
     infos = {info.session_id: info for info in sessions.list_sessions(tmp_path)}
 
-    assert sorted(infos) == ["sid-a", "sid-b"]
+    assert sorted(infos) == ["sid-a", "sid-b", "sid-c"]
     assert infos["sid-a"].turn_count == 2
     assert infos["sid-a"].cost_usd == 1.75
     assert infos["sid-a"].first_user_text == "please check this note"
     assert infos["sid-b"].turn_count == 0
     assert infos["sid-b"].cost_usd == 0.0
+    assert infos["sid-c"].cost_usd is None
 
 
 def test_the_listing_of_a_project_with_no_sessions_is_empty(tmp_path):

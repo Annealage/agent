@@ -25,6 +25,8 @@ how many ``asyncio.sleep(0)`` hops the fake protocol layers need.
 
 import asyncio
 import json
+import os
+from types import SimpleNamespace
 
 import pytest
 from claude_agent_sdk import (
@@ -44,6 +46,7 @@ from annealage_agent.session.base import (
     AgentError,
     AgentModelChanged,
     AgentModelsAvailable,
+    AgentRuntimeResolved,
     AgentStatus,
     SessionReset,
     TextDelta,
@@ -257,6 +260,35 @@ async def test_the_models_the_cli_reports_at_initialise_are_published():
 
 
 @pytest.mark.asyncio
+async def test_runtime_metadata_comes_only_from_the_sdk_init_report():
+    session, transport, recorder = await _started_session(model="requested-model")
+    try:
+        session._handle_system(
+            SimpleNamespace(subtype="init", data={"session_id": "actual-session"})
+        )
+        assert not any(isinstance(event, AgentRuntimeResolved) for event in recorder.all)
+
+        session._handle_system(
+            SimpleNamespace(
+                subtype="init",
+                data={"session_id": "actual-session", "model": "actual-model", "effort": "high"},
+            )
+        )
+        runtime = [event for event in recorder.all if isinstance(event, AgentRuntimeResolved)]
+        assert {
+            key: value for key, value in runtime[-1].to_wire().items() if value is not None
+        } == {
+            "kind": "agent_runtime_resolved",
+            "backend": "claude",
+            "model": "actual-model",
+            "effort": "high",
+            "provenance": "sdk_init",
+        }
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_a_malformed_model_list_still_leaves_the_session_ready():
     """The list only feeds suggestions: an initialise response whose
     ``models`` is not a list of entries costs those and nothing else."""
@@ -345,6 +377,106 @@ async def test_options_wired_into_the_real_client():
         # honours a `.mcp.json` in the served directory, whose entries name
         # commands to spawn.
         assert options.strict_mcp_config is True
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_turn_rejects_custom_transport_before_disconnect():
+    session, transport, _recorder = await _started_session()
+    session.sdk_session_id = "prior-session"
+    try:
+        with pytest.raises(RuntimeError, match="SDK-managed transport"):
+            await session.submit_bounded_turn(
+                [{"type": "text", "text": "continue"}],
+                max_budget_usd=0.2,
+                reservation_id="reservation-1",
+                on_admitted=lambda: None,
+            )
+        assert transport.connected and not transport.closed
+        assert session.root_budget_metadata()["inflight"] is False
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_turn_resumes_same_session_with_native_budget_and_one_prompt(
+    monkeypatch, tmp_path
+):
+    original_grace = sdk_module._NATIVE_TERMINAL_TIMEOUT
+    metadata_during_query = []
+    clients = []
+
+    class ManagedClient:
+        def __init__(self, options, transport=None):
+            self.options = options
+            self.messages = asyncio.Queue()
+            self.sent = []
+            self.closed = False
+            clients.append(self)
+
+        async def connect(self):
+            pass
+
+        async def get_server_info(self):
+            return {"session_id": "prior-session", "model": "sonnet"}
+
+        async def query(self, prompt):
+            async for message in prompt:
+                self.sent.append(message)
+            metadata_during_query.append(session.root_budget_metadata())
+            # Normal execution must not use the post-cancellation settlement grace.
+            monkeypatch.setattr(sdk_module, "_NATIVE_TERMINAL_TIMEOUT", 0)
+            self.messages.put_nowait(
+                sdk_module.ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="prior-session",
+                    stop_reason="end_turn",
+                    total_cost_usd=0.12,
+                )
+            )
+
+        async def receive_messages(self):
+            while True:
+                message = await self.messages.get()
+                if message is None:
+                    return
+                monkeypatch.setattr(sdk_module, "_NATIVE_TERMINAL_TIMEOUT", original_grace)
+                yield message
+
+        async def disconnect(self):
+            self.closed = True
+            self.messages.put_nowait(None)
+
+    monkeypatch.setattr(sdk_module, "ClaudeSDKClient", ManagedClient)
+    session = SdkSession(
+        lambda _event: None, cwd=tmp_path, session_id="bounded-resume", model="sonnet"
+    )
+    await session.start()
+    session.sdk_session_id = "prior-session"
+    try:
+        await session.submit_bounded_turn(
+            [{"type": "text", "text": "continue"}],
+            max_budget_usd=0.5,
+            reservation_id="root-1",
+            on_admitted=lambda: None,
+        )
+        assert len(clients) == 3  # initial, budgeted resume, restored unbudgeted resume
+        assert clients[1].options.resume == "prior-session"
+        assert clients[1].options.max_budget_usd == 0.5
+        assert clients[1].sent == [
+            {
+                "type": "user",
+                "message": {"role": "user", "content": [{"type": "text", "text": "continue"}]},
+            }
+        ]
+        assert clients[2].options.resume == "prior-session"
+        assert clients[2].options.max_budget_usd is None
+        assert session.root_budget_metadata()["inflight"] is False
     finally:
         await session.close()
 
@@ -526,7 +658,7 @@ async def test_tool_use_and_its_result_become_tool_use_and_tool_result_events():
     These arrive on the pump independently of anything this session sent,
     exactly as they would after a turn was already sent by some other
     means, so this test pushes them straight in rather than going through
-    ``submit_turn`` (which has its own defect, pinned separately below).
+    ``submit_turn``.
     """
     session, transport, recorder = await _started_session()
     try:
@@ -579,32 +711,7 @@ async def test_tool_use_and_its_result_become_tool_use_and_tool_result_events():
 
 @pytest.mark.asyncio
 async def test_submit_turn_sends_the_turn_to_the_real_client():
-    """Pinning a defect, left failing on purpose: ``submit_turn`` never
-    successfully delivers a turn to a real ``ClaudeSDKClient``.
-
-    ``submit_turn`` calls ``self._client.query({"type": "user", ...})``,
-    a plain dict. ``ClaudeSDKClient.query()``'s ``prompt`` parameter is
-    typed ``str | AsyncIterable[dict]``: it checks
-    ``isinstance(prompt, str)`` and, when that is false, falls through to
-    ``async for msg in prompt:`` on the assumption that anything else
-    passed in is already an async iterable of messages. A plain dict has
-    no ``__aiter__``, so that line raises
-    ``TypeError: 'async for' requires an object with __aiter__ method,
-    got dict`` before a single byte reaches the transport.
-
-    ``submit_turn``'s own ``except Exception as exc: self._fail(exc, ...)``
-    then treats that TypeError as an agent failure: it marks the whole
-    session unavailable and emits an ``AgentError``, rather than the turn
-    reaching the model. Every call to ``submit_turn`` against the real SDK
-    hits this; ``session/fake.py``'s stand-in never calls
-    ``ClaudeSDKClient.query()`` at all, so nothing exercises this path
-    outside a test built on the real client, which is what this file is
-    for.
-
-    Once fixed (wrapping the message in a one-item async generator, or
-    passing the string form ``query()`` accepts directly), this assertion
-    should hold: the session stays ready and the wire carries the turn.
-    """
+    """A submitted turn reaches the real SDK client over the fake transport."""
     session, transport, recorder = await _started_session()
     try:
         await session.submit_turn([{"type": "text", "text": "please look"}])
@@ -612,6 +719,58 @@ async def test_submit_turn_sends_the_turn_to_the_real_client():
         sent = transport.written[-1]
         assert sent["type"] == "user"
         assert sent["message"]["content"] == [{"type": "text", "text": "please look"}]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_an_active_sdk_turn_refuses_browser_input_without_consuming_notes_or_number():
+    from annealage_agent.http import ws as ws_module
+    from annealage_agent.session.events import EventLog
+    from annealage_agent.viewers import ViewerBus
+
+    session, transport, recorder = await _started_session()
+    bus, log = ViewerBus(None, url="http://127.0.0.1/"), EventLog()
+    sent = []
+
+    class Socket:
+        async def send(self, payload):
+            sent.append(json.loads(payload))
+
+    class Registry:
+        async def broadcast(self, frame):
+            pass
+
+    async def submit(text, client_id):
+        await ws_module._submit_turn(
+            Socket(),
+            SimpleNamespace(tab_id="tab", human=None),
+            Registry(),
+            log,
+            {"blocks": [{"type": "text", "text": text}], "client_id": client_id},
+            session,
+            bus,
+        )
+
+    try:
+        await submit("first", "c1")
+        bus.queue_note("Keep this until the next accepted turn.")
+        await submit("busy", "c2")
+        assert [(frame["type"], frame.get("client_id")) for frame in sent] == [("refused", "c2")]
+        assert bus.turn == 1
+        assert [event["turn"] for _seq, event in log.replay(0).events] == [1]
+        assert [
+            frame["message"]["content"] for frame in transport.written if frame["type"] == "user"
+        ] == [[{"type": "text", "text": "first"}]]
+
+        transport.push(_result(0.01))
+        await _turn_end_and_usage(recorder)
+        await submit("next", "c3")
+        assert bus.turn == 2
+        assert (
+            "Keep this until the next accepted turn."
+            in (transport.written[-1]["message"]["content"][0]["text"])
+        )
     finally:
         await session.close()
 
@@ -661,10 +820,7 @@ async def test_result_message_becomes_turn_end_with_its_cost():
     """A ``ResultMessage`` becomes a ``TurnEnd`` event carrying the stop
     reason and the per-turn cost the plan says belongs in the UI.
 
-    Pushed straight in rather than following a real ``submit_turn`` call
-    (which has its own defect, pinned separately below): this test is
-    about what the pump does with a ``result`` message, not about how one
-    gets sent.
+    Pushed straight in to isolate result handling from prompt delivery.
     """
     session, transport, recorder = await _started_session()
     try:
@@ -889,6 +1045,8 @@ async def test_usage_after_a_result_is_the_cli_s_running_total_for_the_conversat
             "cost_usd": 0.0339,
             "tokens": {"input": 928, "output": 126, "cache_read": 29218, "cache_write": 14733},
             "context": {"used_tokens": 14664, "window_tokens": 200000},
+            "usage_epoch": 0,
+            "usage_source": "cumulative_snapshot",
         }
 
         # The next result's totals replace these; they are not added to them.
@@ -972,8 +1130,9 @@ async def test_a_turn_end_carries_the_turn_s_own_share_of_the_running_totals():
     """Each result carries the conversation's running totals (checked against
     the real CLI: 0.0327 then 0.0348 over two turns of one process), so a
     ``TurnEnd`` is what those grew by since the result before, while the
-    ``Usage`` after it stays the totals themselves. Totals that fall mean the
-    CLI started counting again, so they are that turn's own figures."""
+    ``Usage`` after it stays the totals themselves. A lower or absent total
+    invalidates that field's delta; unknown attribution is never zero.
+    """
     session, transport, recorder = await _started_session()
     try:
         session._turn = 1
@@ -1001,16 +1160,18 @@ async def test_a_turn_end_carries_the_turn_s_own_share_of_the_running_totals():
 
         session._turn = 3
         transport.push(_result(0.01, {"claude-haiku-4-5": _model_usage(20, 5, 0, 300)}))
-        end, _usage = await _turn_end_and_usage(recorder)
-        assert end.cost_usd == pytest.approx(0.01)
-        assert end.tokens == {"input": 20, "output": 5, "cache_read": 0, "cache_write": 300}
+        end, usage = await _turn_end_and_usage(recorder)
+        assert end.cost_usd is None
+        assert end.tokens is None
+        assert (end.usage_epoch, end.usage_source) == (1, "counter_regression")
+        assert usage.usage_epoch == 1
 
-        # A result that reports neither costs nothing known and counts no
-        # tokens; the next is still measured from the last totals reported.
+        # A result that reports no cost or tokens leaves per-turn figures unknown.
+        # The next result is differenced against the last known totals.
         session._turn = 4
         transport.push(_result(None))
         end, _usage = await _turn_end_and_usage(recorder)
-        assert (end.cost_usd, end.tokens) == (0.0, None)
+        assert (end.cost_usd, end.tokens) == (None, None)
         session._turn = 5
         transport.push(_result(0.04, {"claude-haiku-4-5": _model_usage(25, 9, 100, 300)}))
         end, _usage = await _turn_end_and_usage(recorder)
@@ -1021,11 +1182,31 @@ async def test_a_turn_end_carries_the_turn_s_own_share_of_the_running_totals():
 
 
 @pytest.mark.asyncio
-async def test_a_resumed_conversation_s_first_turn_is_measured_from_its_usage_so_far():
-    """The CLI restores its totals on a resume (checked against the real CLI:
-    a resumed process's first result was 0.0039, the 0.0019 before it plus
-    the turn), so the first ``TurnEnd`` is that result less the usage the
-    session was given, not the whole conversation again."""
+async def test_resumed_usage_without_history_establishes_unknown_first_turn_baseline():
+    session, transport, recorder = await _started_session(resume="prior-sdk")
+    try:
+        session._turn = 3
+        transport.push(_init("prior-sdk"))
+        transport.push(_result(0.10, {"claude-haiku-4-5": _model_usage(100, 20, 500, 30)}))
+        first, usage = await _turn_end_and_usage(recorder)
+        assert first.cost_usd is None
+        assert all(value is None for value in first.tokens.values())
+        assert usage.cost_usd == 0.10
+        assert usage.tokens["input"] == 100
+
+        session._turn = 4
+        transport.push(_result(0.15, {"claude-haiku-4-5": _model_usage(130, 28, 700, 30)}))
+        second, _usage = await _turn_end_and_usage(recorder)
+        assert second.cost_usd == pytest.approx(0.05)
+        assert second.tokens == {"input": 30, "output": 8, "cache_read": 200, "cache_write": 0}
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_conversation_preserves_unknown_token_baselines_per_field():
+    """A resumed field with no prior counter cannot be attributed, even if the
+    first result reports a value; fields with known baselines remain deltas."""
     before = {
         "cost_usd": 0.0019,
         "tokens": {"input": 10, "output": 73, "cache_read": None, "cache_write": 900},
@@ -1038,7 +1219,7 @@ async def test_a_resumed_conversation_s_first_turn_is_measured_from_its_usage_so
         transport.push(_result(0.0039, {"claude-haiku-4-5": _model_usage(20, 113, 1000, 1200)}))
         end, usage = await _turn_end_and_usage(recorder)
         assert end.cost_usd == pytest.approx(0.002)
-        assert end.tokens == {"input": 10, "output": 40, "cache_read": 1000, "cache_write": 300}
+        assert end.tokens == {"input": 10, "output": 40, "cache_read": None, "cache_write": 300}
         assert usage.cost_usd == 0.0039
         assert not any(isinstance(e, SessionReset) for e in recorder.all)
     finally:
@@ -1536,6 +1717,7 @@ def test_launch_builds_the_claude_session_with_the_tool_servers_pre_allowed_list
         tools=build_toy_tools(_StubBus(), tmp_path, session_id),
         broker=None,
         url="http://127.0.0.1:8765/",
+        builtin_tools=[],
     )
     session = launch.build_session(
         "claude",
@@ -1549,6 +1731,7 @@ def test_launch_builds_the_claude_session_with_the_tool_servers_pre_allowed_list
         mcp_port=8765,
         agent_token="agent",
     )
+    assert session._builtin_tools == []
     allowed = session._build_options().allowed_tools
     assert allowed == EXPECTED_PRE_ALLOWED_TOOLS
     for name in EXPECTED_NEVER_PRE_ALLOWED:
@@ -1678,3 +1861,205 @@ def test_backend_logs_are_this_sessions_transcript_and_the_clis_stderr(tmp_path,
         ("Claude stderr", None),
     ]
     assert logs[1].text == "Invalid API key · Please run /login"
+
+
+def test_linux_process_identity_reads_kernel_identity_for_current_process():
+    """The ownership fields come from /proc, not a caller-provided PID record."""
+    if not os.path.exists("/proc/self/stat"):
+        pytest.skip("Linux /proc is required for native process identity")
+    assert sdk_module._linux_process_identity(os.getpid(), "not-the-child-marker") is None
+    identity = sdk_module._linux_process_identity(os.getpid())
+    assert identity is not None
+    assert identity["pid"] == os.getpid()
+    assert identity["uid"] == os.stat("/proc/%d" % os.getpid()).st_uid
+    assert (
+        identity["boot_id"]
+        == open("/proc/sys/kernel/random/boot_id", encoding="ascii").read().strip()
+    )
+    assert isinstance(identity["starttime"], int) and identity["starttime"] > 0
+
+
+@pytest.mark.asyncio
+async def test_shutdown_refuses_a_new_turn_after_the_interrupted_turn_finishes():
+    session, transport, recorder = await _started_session()
+    waiting, release = asyncio.Event(), asyncio.Event()
+    original_write = transport.write
+
+    async def controlled_write(data):
+        obj = json.loads(data)
+        if obj.get("type") == "control_request" and obj["request"].get("subtype") == "interrupt":
+            waiting.set()
+            await release.wait()
+        await original_write(data)
+
+    transport.write = controlled_write
+    await session.submit_turn([{"type": "text", "text": "first turn"}])
+    closing = asyncio.create_task(session.close())
+    try:
+        await asyncio.wait_for(waiting.wait(), 2)
+        transport.push(_result(0.01))
+        assert isinstance(await recorder.next(), TurnEnd)
+        assert session.turn_refusal() is not None
+        await session.submit_turn([{"type": "text", "text": "must not dispatch"}])
+        assert any(isinstance(event, AgentError) for event in recorder.all)
+        assert sum(row.get("type") == "user" for row in transport.written) == 1
+    finally:
+        release.set()
+        await asyncio.wait_for(closing, 3)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_image_expansion_settles_without_sending(monkeypatch):
+    import threading
+
+    session, transport, recorder = await _started_session()
+    started, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def expand(blocks, cwd):
+        loop.call_soon_threadsafe(started.set)
+        release.wait(2)
+        return blocks
+
+    monkeypatch.setattr(sdk_module.turn_images, "expand_turn_blocks", expand)
+    sending = asyncio.create_task(session.submit_turn([{"type": "text", "text": "held"}]))
+    closing = None
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        closing = asyncio.create_task(session.close())
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(sending, 2)
+        await asyncio.wait_for(closing, 2)
+        assert not any(row.get("type") == "user" for row in transport.written)
+        ends = [event for event in recorder.all if isinstance(event, TurnEnd)]
+        assert len(ends) == 1 and ends[0].stop_reason == "not_sent"
+        assert any(isinstance(event, AgentError) for event in recorder.all)
+    finally:
+        release.set()
+        await asyncio.gather(sending, *([closing] if closing else []), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_during_image_expansion_is_not_sent_and_next_input_can_run(monkeypatch):
+    import threading
+
+    session, transport, recorder = await _started_session()
+    entered, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def expand(blocks, cwd):
+        loop.call_soon_threadsafe(entered.set)
+        release.wait(2)
+        return blocks
+
+    monkeypatch.setattr(sdk_module.turn_images, "expand_turn_blocks", expand)
+    sending = asyncio.create_task(session.submit_turn([{"type": "text", "text": "stopped"}]))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await session.interrupt()
+        release.set()
+        await asyncio.wait_for(sending, 2)
+        terminal = await recorder.next()
+        assert isinstance(terminal, TurnEnd) and terminal.stop_reason == "not_sent"
+        assert isinstance(await recorder.next(), AgentError)
+        assert not any(row.get("type") == "user" for row in transport.written)
+        await session.submit_turn([{"type": "text", "text": "after interruption"}])
+        transport.push(_result(0.01))
+        terminal = await recorder.next()
+        assert isinstance(terminal, TurnEnd) and terminal.stop_reason == "end_turn"
+        frames = [row for row in transport.written if row.get("type") == "user"]
+        assert [row["message"]["content"] for row in frames] == [
+            [{"type": "text", "text": "after interruption"}]
+        ]
+    finally:
+        release.set()
+        await asyncio.gather(sending, return_exceptions=True)
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_bounded_reconnect_never_sends_the_reserved_prompt(monkeypatch, tmp_path):
+    entered, release = asyncio.Event(), asyncio.Event()
+    clients, events = [], []
+
+    normal_result = asyncio.Event()
+
+    def record(event):
+        events.append(event)
+        if isinstance(event, TurnEnd) and event.stop_reason == "end_turn":
+            normal_result.set()
+
+    class ManagedClient:
+        def __init__(self, options, transport=None):
+            self.options = options
+            self.messages = asyncio.Queue()
+            self.sent = []
+            clients.append(self)
+
+        async def connect(self):
+            if self.options.max_budget_usd is not None:
+                entered.set()
+                await release.wait()
+
+        async def get_server_info(self):
+            return {"session_id": "held-native-cli", "model": "sonnet"}
+
+        async def interrupt(self):
+            pass
+
+        async def query(self, prompt):
+            async for message in prompt:
+                self.sent.append(message)
+            self.messages.put_nowait(
+                sdk_module.ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="held-native-cli",
+                    stop_reason="end_turn",
+                    total_cost_usd=0.12,
+                )
+            )
+
+        async def receive_messages(self):
+            while True:
+                message = await self.messages.get()
+                if message is None:
+                    return
+                yield message
+
+        async def disconnect(self):
+            self.messages.put_nowait(None)
+
+    monkeypatch.setattr(sdk_module, "ClaudeSDKClient", ManagedClient)
+    session = SdkSession(record, cwd=tmp_path, session_id="held-native", model="sonnet")
+    await session.start()
+    session.sdk_session_id = "held-native-cli"
+    sending = asyncio.create_task(
+        session.submit_bounded_turn(
+            [{"type": "text", "text": "stopped before dispatch"}],
+            max_budget_usd=0.5,
+            reservation_id="interrupted-root",
+            on_admitted=lambda: None,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await session.interrupt()
+        release.set()
+        with pytest.raises(RuntimeError):
+            await sending
+        assert not any(client.sent for client in clients)
+        assert [event.stop_reason for event in events if isinstance(event, TurnEnd)] == ["not_sent"]
+        await session.submit_turn([{"type": "text", "text": "fresh explicit input"}])
+        await asyncio.wait_for(normal_result.wait(), 2)
+        assert clients[-1].sent[0]["message"]["content"] == [
+            {"type": "text", "text": "fresh explicit input"}
+        ]
+    finally:
+        release.set()
+        await asyncio.gather(sending, return_exceptions=True)
+        await session.close()

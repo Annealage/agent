@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 import re
 import secrets
 import sys
@@ -185,6 +186,7 @@ class PermissionBroker:
         viewer_url: Optional[str] = None,
         no_viewer_grace: float = DEFAULT_NO_VIEWER_GRACE,
         never_remembered=(),
+        request_guard=None,
     ):
         # Beside the module-wide NEVER_REMEMBERED; see the comment there.
         self._never_remembered: FrozenSet[str] = frozenset(never_remembered)
@@ -198,6 +200,7 @@ class PermissionBroker:
         # back, or None when at least one viewer is present or the grace period
         # has already elapsed.
         self._no_viewer_timer = None
+        self._request_guard = request_guard
         self._shutdown = False
         self._next_id = 1
         # Every request id this broker gives out carries this, so a new
@@ -282,23 +285,39 @@ class PermissionBroker:
         what leaves the page, and no "always allow" is offered or kept for
         it. Both reach the card on the ``PermissionRequest``.
 
-        Every branch below returns a ``Decision``, and the two checks
-        before a request is ever created (already granted, no viewer to
-        ask) run with no ``await`` between them and this method's entry, so
-        nothing else on this event loop can change either answer out from
-        under this call before it commits to one.
+        Shutdown and no-viewer refusals happen before host authority is
+        captured. For a granted tool, its captured authority is revalidated
+        before the grant is returned; for a prompted tool, it is revalidated
+        immediately after the human decision and before the backend sees it.
         """
         if self._shutdown:
             return Decision(allow=False, message=_deny_message(_DENY_SHUTDOWN_TEMPLATE))
+        if self._viewer_count == 0 and not (
+            action is None
+            and tool_name in self._granted_tools
+            and tool_name not in self._never_remembered
+        ):
+            return Decision(allow=False, message=self._no_viewer_message())
+        guard_token = None
+        if self._request_guard is not None:
+            try:
+                guard_token = await self._guard_call("capture", tool_name, input_data)
+            except Exception as exc:
+                sys.stderr.write(
+                    "warning: failed to capture request authority for %r: %r\n"
+                    % (tool_name, exc)
+                )
+                return Decision(
+                    allow=False, message="the tool call's authority could not be verified"
+                )
         if (
             action is None
             and tool_name in self._granted_tools
             and tool_name not in self._never_remembered
         ):
-            return Decision(allow=True, remember_tool=tool_name)
-        if self._viewer_count == 0:
-            return Decision(allow=False, message=self._no_viewer_message())
-
+            return await self._validate_guard(
+                Decision(allow=True, remember_tool=tool_name), guard_token, tool_name, input_data
+            )
         request_id = "%s%d" % (self._id_prefix, self._next_id)
         self._next_id += 1
         future: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -320,29 +339,18 @@ class PermissionBroker:
             try:
                 self._on_event(event)
             except Exception as exc:
-                # on_event is the wiring layer's own broadcast path
-                # (EventLog.append plus ViewerRegistry.broadcast); a bug
-                # there must not turn into this coroutine raising, which
-                # is exactly the infrastructure-error failure fact 14
-                # warns against. The request never reached a browser, so
-                # there is nothing to wait for; deny at once instead of
-                # awaiting a future nothing will ever resolve.
+                # If the request never reached a viewer, nothing can resolve it.
                 sys.stderr.write(
                     "error: failed to emit permission_request %r for %r: %r\n"
                     % (request_id, tool_name, exc)
                 )
                 return Decision(allow=False, message=_DENY_EMIT_FAILED_TEMPLATE)
             try:
-                return await asyncio.wait_for(future, timeout=self._timeout)
+                decision = await asyncio.wait_for(future, timeout=self._timeout)
+                return await self._validate_guard(
+                    decision, guard_token, tool_name, input_data
+                )
             except asyncio.TimeoutError:
-                # asyncio.wait_for has already cancelled `future` (it
-                # wraps any bare Future the same way it would a Task);
-                # this method's own Deny is returned directly rather than
-                # inspecting that future's now-cancelled state, so a
-                # decide() that was mid-flight when the deadline hit and
-                # loses the race against it is told "already decided" by
-                # its own done() check, not by a value read off a future
-                # this method has already stopped trusting.
                 self._outcomes[request_id] = OUTCOME_TIMEOUT
                 return Decision(
                     allow=False,
@@ -366,6 +374,29 @@ class PermissionBroker:
                     "warning: failed to emit permission_resolved %r (%s): %r\n"
                     % (request_id, outcome, exc)
                 )
+
+    async def _guard_call(self, method, *args):
+        """Call an optional host authority guard without fixing its sync mode."""
+        result = getattr(self._request_guard, method)(*args)
+        return await result if inspect.isawaitable(result) else result
+
+    async def _validate_guard(self, decision, token, tool_name, input_data):
+        if not decision.allow or self._request_guard is None:
+            return decision
+        try:
+            valid = await self._guard_call("validate", token, tool_name, input_data)
+        except Exception as exc:
+            sys.stderr.write(
+                "warning: failed to revalidate request authority for %r: %r\n"
+                % (tool_name, exc)
+            )
+            valid = False
+        if not valid:
+            return Decision(
+                allow=False,
+                message="the tool call's authority changed while approval was pending; request it again",
+            )
+        return decision
 
     # -- resolving a request ------------------------------------------------
 

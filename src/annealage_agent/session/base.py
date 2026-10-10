@@ -266,25 +266,76 @@ class PermissionResolved(AgentEvent):
 
 @dataclasses.dataclass(frozen=True)
 class TurnEnd(AgentEvent):
-    """A turn ended. ``cost_usd`` is what this turn cost, 0.0 where the
-    backend reports none; ``tokens``, where the backend reports them (omp,
-    Claude), is this turn's ``{"input", "output", "cache_read",
-    "cache_write"}`` token counts. Both of those backends report running
-    totals for the conversation, so these are a total less the one before.
-    ``stop_reason`` is the backend's own, or one of the session's:
-    ``steered`` (omp: the human sent another message while this turn was
-    running, and the agent carries on under the next turn number),
-    ``rejected`` (the backend refused the message that started it) or
-    ``ended_by_tool`` (a tool result carried ``end_turn``, ``tools.ok``)."""
+    """A turn ended. ``cost_usd`` and individual ``tokens`` may be unknown.
+    For cumulative backends they are valid only where both snapshots belong
+    to the same usage epoch and both figures are known; a reset/regression
+    makes affected attribution ``None``. ``stop_reason`` is the backend's
+    own, or one of the session's: ``steered``, ``rejected`` or
+    ``ended_by_tool``."""
 
     kind: ClassVar[str] = "turn_end"
     turn: int
     stop_reason: str
-    cost_usd: float
+    cost_usd: Optional[float]
     viewer: Optional[str] = None
     tokens: Optional[dict] = None
+    usage_epoch: Optional[int] = None
+    usage_source: Optional[str] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class RequestUsage(AgentEvent):
+    """One assistant provider request's message-local usage observation."""
+
+    kind: ClassVar[str] = "request_usage"
+    event_id: str
+    session_id: str
+    conversation_id: str
+    usage_epoch: int
+    turn_index: int
+    request_n: int
+    backend: str
+    model: Optional[str]
+    provider: Optional[str]
+    provider_request_id: Optional[str]
+    cost_usd: Optional[float]
+    cost_source: Optional[str]
+    tokens_input: Optional[int]
+    tokens_output: Optional[int]
+    tokens_cache_read: Optional[int]
+    tokens_cache_write: Optional[int]
+    tokens_reasoning: Optional[int]
+    ts: str
+    usage_source: str = "message_usage"
+
+    def to_wire(self) -> dict:
+        data = super().to_wire()
+        for field in (
+            "cost_usd",
+            "cost_source",
+            "model",
+            "provider",
+            "provider_request_id",
+            "tokens_input",
+            "tokens_output",
+            "tokens_cache_read",
+            "tokens_cache_write",
+            "tokens_reasoning",
+        ):
+            data[field] = getattr(self, field)
+        return data
+
+
+
+@dataclasses.dataclass(frozen=True)
+class InputState(AgentEvent):
+    """Lifecycle of a human input sent to a backend."""
+
+    kind: ClassVar[str] = "input_state"
+    input_id: str
+    turn: int
+    state: str
+    detail: Optional[str] = None
 #: The token counts a ``Usage`` reports.
 USAGE_TOKEN_KEYS = ("input", "output", "cache_read", "cache_write")
 
@@ -312,6 +363,8 @@ class Usage(AgentEvent):
     tokens: Optional[dict] = None
     context: Optional[dict] = None
     viewer: Optional[str] = None
+    usage_epoch: Optional[int] = None
+    usage_source: Optional[str] = None
 
     def to_wire(self) -> dict:
         data = {"kind": self.kind, **self.snapshot()}
@@ -323,11 +376,16 @@ class Usage(AgentEvent):
         """The figures alone, as the ``hello`` frame's ``session.usage``
         carries them."""
         tokens = self.tokens or {}
-        return {
+        data = {
             "cost_usd": self.cost_usd,
             "tokens": {key: tokens.get(key) for key in USAGE_TOKEN_KEYS},
             "context": dict(self.context) if self.context is not None else None,
         }
+        if self.usage_epoch is not None:
+            data["usage_epoch"] = self.usage_epoch
+        if self.usage_source is not None:
+            data["usage_source"] = self.usage_source
+        return data
 
 
 def context_figures(used_tokens, window_tokens) -> Optional[dict]:
@@ -433,6 +491,18 @@ class AgentModelsAvailable(AgentEvent):
 
 
 @dataclasses.dataclass(frozen=True)
+class AgentRuntimeResolved(AgentEvent):
+    """Runtime identity reported by the backend itself, never a requested value."""
+
+    kind: ClassVar[str] = "agent_runtime_resolved"
+    backend: str
+    provider: Optional[str]
+    model: Optional[str]
+    effort: Optional[str]
+    provenance: str
+
+
+@dataclasses.dataclass(frozen=True)
 class SessionReset(AgentEvent):
     """Emitted when a requested resume (``-c``/``-r``) fails and the
     session falls back to starting fresh instead (plan section 3.4)."""
@@ -502,7 +572,7 @@ class UserTurn(AgentEvent):
     optimistic copy. ``turn`` is ``bus.turn`` after ``begin_turn``, which is
     the number every backend gives the reply (a steer's included).
 
-    ``blocks`` are the human's, never the product's notes ``begin_turn`` puts
+    ``blocks`` are the sender's, never the product's notes ``begin_turn`` puts
     in front of them, and an image is its ``image_path`` block, a path under
     the served directory: the pixels stay in the file, out of the log. ``by``
     is the sender's login, when they were signed in by one. In hosted mode
@@ -510,6 +580,10 @@ class UserTurn(AgentEvent):
     snapshot taken with it (attribution only); a turn logged before they
     existed has a login or nothing, which is legacy attribution and never
     authorisation.
+
+    ``automation_source`` is the explicit, product-originated source for
+    automatic turns; it is absent on human turns and is never inferred from
+    ``by=None``.
     """
 
     kind: ClassVar[str] = "user_turn"
@@ -520,6 +594,7 @@ class UserTurn(AgentEvent):
     by: Optional[str] = None
     principal_id: Optional[str] = None
     display: Optional[str] = None
+    automation_source: Optional[str] = None
 
 
 #: Every event kind the agent layer emits itself. A product's own event
@@ -535,11 +610,14 @@ GENERIC_EVENTS = (
     PermissionResolved,
     TurnEnd,
     Usage,
+    RequestUsage,
+    InputState,
     PauseChanged,
     ViewerPrimary,
     AgentStatus,
     AgentModelChanged,
     AgentModelsAvailable,
+    AgentRuntimeResolved,
     SessionReset,
     AgentError,
     ReviewChanged,
@@ -628,25 +706,19 @@ class AgentSession(Protocol):
     an inbound product frame (Mesh's ``state``), because a browser's report
     of its own view is viewer state, not agent state, and belongs wherever a tool
     call reads "the current view" from, not here.
-
-    A session never touches a WebSocket, an ``EventLog`` or a
-    ``ViewerRegistry`` directly; it only calls ``on_event`` from its
-    constructor for every event it produces. Whatever builds a session
-    (``http/ws.py`` or ``app.py``) is responsible for making that callback
-    append to an ``EventLog`` and broadcast through a ``ViewerRegistry``.
-
-    ``backend_logs()`` lists the backend's own logs for this session
-    (``BackendLog``) for the page's Agent log section, ``GET /agent/logs`` and
-    the diagnostics block. Every session implements it; one whose backend
-    writes nothing of its own returns an empty list.
-
-    Three optional members, outside the Protocol so a session without them
+    Optional members, outside the Protocol so a session without them
     (a test's fake, an older product's) still is one, and read with
     ``getattr`` where they are used:
 
-    - ``steers``: true when a turn sent while one is running redirects it
-      (omp) rather than waiting behind it; the ``hello`` frame reports it so
-      the page labels its Send button.
+    - ``steers``: true only when a turn sent while another runs is explicitly
+      supported; the ``hello`` frame reports it. Otherwise a backend may queue
+      inputs or refuse them through local admission.
+    - ``turn_refusal()``: synchronously return a refusal reason or None for
+      a new manual input. The browser dispatcher checks this before counting,
+      logging, or consuming notes (SDK active turn, OMP full queue).
+    - ``resolved_runtime``: actual backend-reported provider/model/effort
+      metadata, or None until the backend reports it. Requested settings are
+      never used as actual runtime identity.
     - ``end_turn_after_tool()``: a tool result asked to end the turn
       (``tools.ok(..., end_turn=True)``, via ``ViewerBus.request_end_turn``).
       Called from inside the tool's handler, before its result reaches the

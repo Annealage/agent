@@ -55,12 +55,16 @@ for what is watched and why that is the boundary.
 from __future__ import annotations
 
 import asyncio
+import math
+import os
 import platform
 import re
 import shutil
 import sys
+import uuid
 import warnings
-from typing import Any, Optional, Tuple, Union
+from contextlib import nullcontext
+from typing import Any, Callable, Optional, Tuple, Union
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -94,6 +98,7 @@ from .base import (
     AgentError,
     AgentModelChanged,
     AgentModelsAvailable,
+    AgentRuntimeResolved,
     AgentStatus,
     SandboxStatus,
     SessionReset,
@@ -152,9 +157,46 @@ _SANDBOX_MISSING_RE = re.compile(
 # logging warnings while the human waited for a reply that will never come.
 _MAX_CONSECUTIVE_PARSE_FAILURES = 5
 
-# Kept so a stderr burst from a wedged child cannot grow without bound while
-# still leaving enough context to be worth reporting in an AgentError.
 _STDERR_KEEP_LINES = 200
+
+# A cancelled native query gets a short grace period to report its terminal
+# result. Neither control operation may hold the caller indefinitely.
+_NATIVE_INTERRUPT_TIMEOUT = 2.0
+_NATIVE_TERMINAL_TIMEOUT = 5.0
+_NATIVE_STOP_TIMEOUT = 2.0
+
+
+def _positive_int(value, name: str) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("%s must be a positive integer or None" % name)
+    return value
+
+
+def _linux_process_identity(pid: int, owner_uuid: Optional[str] = None) -> Optional[dict]:
+    """Read kernel-owned identity fields for one currently existing process."""
+    try:
+        proc_dir = "/proc/%d" % pid
+        with open(os.path.join(proc_dir, "stat"), encoding="ascii") as stat_file:
+            stat = stat_file.read()
+        fields = stat[stat.rfind(")") + 2 :].split()
+        starttime = int(fields[19])
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as boot_file:
+            boot_id = boot_file.read().strip()
+        uid = os.stat(proc_dir).st_uid
+        if owner_uuid is not None:
+            with open(os.path.join(proc_dir, "environ"), "rb") as environ_file:
+                environment = environ_file.read(65536)
+            marker = b"LOOM_CHILD_OWNER=" + owner_uuid.encode("ascii")
+            if marker not in environment.split(b"\0"):
+                return None
+    except (OSError, IndexError, ValueError, UnicodeError):
+        return None
+    if not boot_id:
+        return None
+    return {"pid": pid, "uid": uid, "boot_id": boot_id, "starttime": starttime}
+
 
 # The SDK warns, on every ``connect()``, that ``can_use_tool`` will not be
 # consulted for the tools in ``allowed_tools``. Pre-allowing the product tools that
@@ -206,11 +248,10 @@ class SdkSession:
     (prompt, replies, tool arguments and results) is not written under
     ``~/.claude/projects`` and cannot be resumed; a headless run uses it.
 
-    ``usage`` is what a resumed conversation had used before this session,
-    in ``Usage.snapshot()``'s shape (launch passes the event log's last
-    ``usage``), or None. The CLI's results carry the conversation's running
-    totals, which it restores on a resume, so a ``TurnEnd``'s own figures
-    are a result's totals less the ones before it, these for the first.
+    ``usage`` is the resumed conversation's prior ``Usage.snapshot()`` from
+    the event log, or None. CLI results carry running totals restored on
+    resume. Turn attribution is fieldwise; missing values and counter
+    regressions remain unknown rather than zero or a negative delta.
     """
 
     def __init__(
@@ -237,13 +278,27 @@ class SdkSession:
         setting_sources=SETTING_SOURCES,
         builtin_tools=None,
         persist_session=True,
+        max_budget_usd=None,
+        native_max_turns=None,
+        on_owner=None,
+        owner_context=None,
     ):
+        native_max_turns = _positive_int(native_max_turns, "native_max_turns")
+        if max_budget_usd is not None and (
+            isinstance(max_budget_usd, bool)
+            or not isinstance(max_budget_usd, (int, float))
+            or not math.isfinite(max_budget_usd)
+            or max_budget_usd <= 0
+        ):
+            raise ValueError("max_budget_usd must be finite and positive")
         self._on_event = on_event
         self.cwd = str(cwd)
         self.session_id = session_id
         self.sdk_session_id = None
         self._broker = broker
         self._model = model
+        self.resolved_runtime = None
+        self._runtime_identity = None
         self._effort = effort
         self._permission_mode = permission_mode
         self._resume = resume
@@ -251,21 +306,27 @@ class SdkSession:
         self._setting_sources = tuple(setting_sources)
         self._builtin_tools = list(builtin_tools) if builtin_tools is not None else None
         self._persist_session = bool(persist_session)
+        self._max_budget_usd = max_budget_usd
+        self._native_max_turns = native_max_turns
         self._mcp_servers = mcp_servers or {}
         self._allowed_tools = tuple(allowed_tools)
         self._transport = transport
         self._on_sdk_session_id = on_sdk_session_id
+        self._on_owner = on_owner
+        self._owner_context = dict(owner_context) if owner_context is not None else None
+        self._owner_uuid = (
+            uuid.uuid4().hex if on_owner is not None and owner_context is not None else None
+        )
+        self._owned_process = None
+        self._owned_process_identity = None
+        self._native_owner = None
+        self._owner_termination_reported = False
         # The digest the startup gate accepted for this directory's Claude
         # configuration. None means no gate ran, which is the case for tests
         # that drive this class directly, and installs no tripwire.
         self._trusted_config_digest = trusted_config_digest
         self._config_change_reported = False
-        # The product's session context (Product.session_context). The SDK's
-        # default system prompt is empty (it passes --system-prompt ""), so
-        # this becomes the whole of it, and a session with none keeps that.
         self._instructions = instructions or None
-        # The app's write-protected patterns (create_app's write_protected,
-        # through launch.build_session); None takes the product's.
         self._write_protected = (
             tuple(write_protected)
             if write_protected is not None
@@ -276,11 +337,8 @@ class SdkSession:
         self._client = None
         self._pump_task = None
         self._closing = False
-        # The last turn of a resumed session's history (launch passes
-        # bus.turn), so the next one continues its numbering.
+        self._interrupt_epoch = 0
         self._turn = int(turn)
-        # Set by end_turn_after_tool; the next tool result delivered to the
-        # model interrupts the turn, and that turn ends as ended_by_tool.
         self._end_turn_pending = False
         self._stop_reason = None
         # Why the last result said it failed (``ResultMessage.is_error``: an API
@@ -288,27 +346,356 @@ class SdkSession:
         # for a clean one. Set before that result's ``TurnEnd`` is emitted;
         # ``headless.run_prompt`` reads it there.
         self.last_result_error: Optional[str] = None
+        self.last_result_num_turns: Optional[int] = None
         # Set by ``interrupt`` until the turn's result arrives: that result is
         # marked an error, but one this side asked for.
         self._interrupted = False
         # The model and prompt size (tokens) of the last main-conversation API
         # call, which is how full the context window is (``_usage``).
         self._last_call: Optional[Tuple[str, int]] = None
-        # The conversation's running totals as of the last result (or, before
-        # the first, the resumed conversation's), which the next result's are
-        # differenced against for its turn's own figures (``_turn_figures``).
-        self._totals = _totals_of(usage)
-        # Whether the first init has been compared with the conversation asked
-        # to resume: the CLI sends an init every turn, and only the first says
-        # whether the resume took.
+        # A resumed conversation without recovered counters is not a fresh one.
+        # Its first cumulative result establishes a baseline, not turn spend.
+        self._totals = _totals_of({} if resume and usage is None else usage)
+        self._usage_epoch = 0
         self._resume_checked = False
         self._stderr_lines = []
-        # Predicted now so the banner, printed once at startup, is right on a
-        # machine that plainly cannot sandbox. Corrected by the child if it
-        # reports its own list.
         self._sandbox_missing = missing_sandbox_dependencies() if self._sandbox_requested else ()
         self._sandbox_child_reported = False
         self._viewers_seen = 0
+        self._session_budget_cap_usd = max_budget_usd
+        self._submission_lock = asyncio.Lock()
+        self._active_turn: Optional[asyncio.Future] = None
+        self._last_turn_cost: Optional[float] = None
+        self._root_budget_reservation_id: Optional[str] = None
+        self._root_budget_reserved_usd: Optional[float] = None
+        self._root_budget_active = False
+        self._native_termination_outcome: Optional[str] = None
+        fields = getattr(ClaudeAgentOptions, "__dataclass_fields__", {})
+        self._native_budget_supported = "max_budget_usd" in fields
+        self._native_turns_supported = "max_turns" in fields
+        if native_max_turns is not None and not self._native_turns_supported:
+            raise RuntimeError("installed Claude Agent SDK has no native max_turns option")
+
+    def root_budget_metadata(self) -> dict:
+        """Actual native budget/turn capability and current reservation state."""
+        runtime = self.resolved_runtime or {}
+        return {
+            "native_budget_supported": self._native_budget_supported,
+            "native_turns_supported": self._native_turns_supported,
+            "native_max_turns": self._native_max_turns,
+            "turn_semantics": "native model turns (not network retries or invoice count)",
+            "native_termination_outcome": self._native_termination_outcome,
+            "inflight": self._root_budget_active,
+            "inflight_reserved_usd": (
+                self._root_budget_reserved_usd if self._root_budget_active else None
+            ),
+            "session_cap_usd": self._session_budget_cap_usd,
+            "reservation_id": (
+                self._root_budget_reservation_id if self._root_budget_active else None
+            ),
+            "backend": runtime.get("backend", "claude"),
+            "model": runtime.get("model"),
+        }
+
+    async def submit_bounded_turn(
+        self,
+        blocks: list,
+        *,
+        max_budget_usd: float,
+        viewer: Optional[str] = None,
+        reservation_id: str,
+        on_admitted: Callable[[], None],
+        max_turns: Optional[int] = None,
+        dispatch_context_factory=None,
+    ) -> dict:
+        """Continue this SDK conversation for one native-budgeted root turn.
+
+        This deliberately disconnects and resumes the same SDK session because
+        ClaudeAgentOptions' budget is fixed at client initialization. No prompt
+        is sent until the resumed session id is verified. A send error is
+        ambiguous and is never retried.
+        """
+        if (
+            isinstance(max_budget_usd, bool)
+            or not isinstance(max_budget_usd, (int, float))
+            or not math.isfinite(max_budget_usd)
+            or max_budget_usd <= 0
+        ):
+            raise ValueError("max_budget_usd must be finite and positive")
+        if not isinstance(reservation_id, str) or not reservation_id:
+            raise ValueError("reservation_id must be a non-empty string")
+        if not callable(on_admitted):
+            raise ValueError("on_admitted must be callable")
+        max_turns = _positive_int(max_turns, "max_turns")
+        if not self._native_budget_supported:
+            raise RuntimeError("installed Claude Agent SDK has no native max_budget_usd option")
+        if max_turns is not None and not self._native_turns_supported:
+            raise RuntimeError("installed Claude Agent SDK has no native max_turns option")
+        if dispatch_context_factory is not None and not callable(dispatch_context_factory):
+            raise ValueError("dispatch_context_factory must be callable or None")
+        async with self._submission_lock:
+            if self._closing or self._client is None or self._status != AGENT_READY:
+                raise RuntimeError("SDK session is not ready for a bounded turn")
+            if self._active_turn is not None and not self._active_turn.done():
+                raise RuntimeError("cannot start a bounded turn while another turn is active")
+            if self._broker is not None and self._broker.pending_requests():
+                raise RuntimeError(
+                    "cannot resume for a bounded turn while human permission cards are pending"
+                )
+            expected_id = self.sdk_session_id
+            if not expected_id:
+                raise RuntimeError("cannot bound a turn before the SDK session id is known")
+            configured_model = self._model
+            current_model = (self.resolved_runtime or {}).get("model")
+            if configured_model and current_model and configured_model != current_model:
+                raise RuntimeError(
+                    "configured model %r does not match observed SDK model %r"
+                    % (configured_model, current_model)
+                )
+            previous_budget = self._max_budget_usd
+            previous_turns = self._native_max_turns
+            effective_budget = (
+                min(float(max_budget_usd), previous_budget)
+                if previous_budget is not None
+                else float(max_budget_usd)
+            )
+            effective_turns = (
+                min(max_turns, previous_turns)
+                if max_turns and previous_turns
+                else (max_turns if max_turns is not None else previous_turns)
+            )
+            submission_started = False
+            completion = None
+            detached = False
+            dispatch_context = None
+            context_entered = False
+            self._root_budget_active = True
+            self._root_budget_reservation_id = reservation_id
+            self._root_budget_reserved_usd = effective_budget
+            interrupt_epoch = self._interrupt_epoch
+            try:
+                if self._transport is not None:
+                    raise RuntimeError(
+                        "bounded turns require the SDK-managed transport so a fresh native "
+                        "client can resume the conversation"
+                    )
+                on_admitted()
+                await self._disconnect_native_client()
+                detached = True
+                dispatch_context = (
+                    dispatch_context_factory()
+                    if dispatch_context_factory is not None
+                    else nullcontext()
+                )
+                dispatch_context.__enter__()
+                context_entered = True
+                await self._reconnect_native(expected_id, effective_budget, effective_turns)
+                self._capture_native_process()
+                # The pump is active before query, and the active Future is
+                # installed before submission so an immediate Result is seen.
+                completion = asyncio.get_running_loop().create_future()
+                self._active_turn = completion
+                self._turn += 1
+                expanded = await asyncio.get_running_loop().run_in_executor(
+                    None, turn_images.expand_turn_blocks, blocks, self.cwd
+                )
+                if self._closing or self._interrupt_epoch != interrupt_epoch:
+                    completion.set_result(None)
+                    self._emit(TurnEnd(turn=self._turn, stop_reason="not_sent", cost_usd=None))
+                    raise RuntimeError("SDK bounded prompt was stopped before submission; not sent")
+                submission_started = True
+                try:
+                    await self._client.query(
+                        _one_message(
+                            {
+                                "type": "user",
+                                "message": {"role": "user", "content": expanded},
+                            }
+                        )
+                    )
+                    actual_cost = await asyncio.shield(completion)
+                except asyncio.TimeoutError:
+                    await self._interrupt_and_settle(completion)
+                    raise
+                except asyncio.CancelledError:
+                    await self._interrupt_and_settle(completion)
+                    raise
+                return {
+                    "actual_cost_usd": actual_cost,
+                    "reservation_id": reservation_id,
+                    "actual_num_turns": self.last_result_num_turns,
+                    "native_max_turns": effective_turns,
+                    "turn_semantics": "native model turns",
+                    "native_turns_supported": self._native_turns_supported,
+                }
+            finally:
+                if context_entered:
+                    dispatch_context.__exit__(*sys.exc_info())
+                    context_entered = False
+                if completion is not None and self._active_turn is completion:
+                    self._active_turn = None
+                # Restore the ordinary client only when no prompt was sent or
+                # the native result reached its terminal boundary. An
+                # ambiguous send is never retried or made unbounded.
+                terminal = not submission_started or (completion is not None and completion.done())
+                try:
+                    if (
+                        terminal
+                        and detached
+                        and not self._closing
+                        and self.sdk_session_id == expected_id
+                    ):
+                        await self._reconnect_native(expected_id, previous_budget, previous_turns)
+                    elif submission_started and not terminal:
+                        self._set_status(AGENT_UNAVAILABLE)
+                except Exception as exc:
+                    self._fail(exc, viewer=viewer)
+                if terminal:
+                    self._root_budget_active = False
+                    self._root_budget_reserved_usd = None
+                    self._root_budget_reservation_id = None
+
+    async def _disconnect_native_client(self) -> None:
+        """Disconnect the ordinary session before entering root automation scope."""
+        pump = self._pump_task
+        if pump is not None and not pump.done():
+            pump.cancel()
+            await asyncio.wait({pump}, timeout=_NATIVE_STOP_TIMEOUT)
+        client = self._client
+        if client is None:
+            return
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=_NATIVE_STOP_TIMEOUT)
+        except Exception:
+            await self._terminate_owned_cli()
+            self._client = None
+            self._set_status(AGENT_UNAVAILABLE)
+            raise
+        self._client = None
+        self._pump_task = None
+
+    async def _interrupt_and_settle(self, completion) -> None:
+        """Bound interrupt and result settlement; leave unresolved cost reserved."""
+        client = self._client
+        if client is not None:
+            try:
+                await asyncio.wait_for(client.interrupt(), timeout=_NATIVE_INTERRUPT_TIMEOUT)
+            except Exception:
+                pass
+        if completion.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(completion), timeout=_NATIVE_TERMINAL_TIMEOUT)
+        except Exception:
+            pass
+        if not completion.done():
+            stopped = await self._terminate_owned_cli()
+            self._native_termination_outcome = "stopped" if stopped else "unverified"
+            if self._owner_uuid is not None and not self._owner_termination_reported:
+                self._owner_termination_reported = True
+                self._notify_owner(
+                    {
+                        "event": "native_termination",
+                        "owner_uuid": self._owner_uuid,
+                        "outcome": self._native_termination_outcome,
+                    }
+                )
+            self._set_status(AGENT_UNAVAILABLE)
+
+    async def _reconnect_native(
+        self, expected_id: str, budget: Optional[float], max_turns: Optional[int]
+    ) -> None:
+        old_pump = self._pump_task
+        if old_pump is not None and not old_pump.done():
+            old_pump.cancel()
+            await asyncio.wait({old_pump}, timeout=_NATIVE_STOP_TIMEOUT)
+        old_client = self._client
+        if old_client is not None:
+            try:
+                await asyncio.wait_for(old_client.disconnect(), timeout=_NATIVE_STOP_TIMEOUT)
+            except Exception:
+                await self._terminate_owned_cli()
+                self._client = None
+                self._set_status(AGENT_UNAVAILABLE)
+                raise
+        self._client = None
+        self._resume = expected_id
+        self._max_budget_usd = budget
+        self._native_max_turns = max_turns
+        self.resolved_runtime = None
+        self._runtime_identity = None
+        client = ClaudeSDKClient(options=self._build_options(), transport=self._transport)
+        self._client = client
+        try:
+            await asyncio.wait_for(client.connect(), timeout=_NATIVE_TERMINAL_TIMEOUT)
+            self._capture_native_process()
+            info = (
+                await asyncio.wait_for(client.get_server_info(), timeout=_NATIVE_TERMINAL_TIMEOUT)
+                or {}
+            )
+            observed_id = info.get("session_id")
+            observed_model = info.get("model")
+            if observed_id != expected_id:
+                raise RuntimeError(
+                    "SDK resume returned session %r; expected %r" % (observed_id, expected_id)
+                )
+            if self._model and observed_model and observed_model != self._model:
+                raise RuntimeError(
+                    "configured model %r does not match resumed SDK model %r"
+                    % (self._model, observed_model)
+                )
+        except BaseException:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=_NATIVE_STOP_TIMEOUT)
+            except BaseException:
+                stopped = await self._terminate_owned_cli()
+                self._native_termination_outcome = "stopped" if stopped else "unverified"
+            self._client = None
+            self._set_status(AGENT_UNAVAILABLE)
+            raise
+        self._set_status(AGENT_READY)
+        self._pump_task = asyncio.ensure_future(self._pump())
+
+    def _owned_cli_is_current(self) -> bool:
+        process = self._owned_process
+        client = self._client
+        transport = getattr(client, "_transport", None)
+        if (
+            process is None
+            or self._transport is not None
+            or type(transport).__module__ != "claude_agent_sdk._internal.transport.subprocess_cli"
+            or getattr(transport, "_process", None) is not process
+        ):
+            return False
+        pid = getattr(process, "pid", None)
+        if isinstance(pid, bool) or not isinstance(pid, int):
+            return False
+        identity = _linux_process_identity(pid, self._owner_uuid)
+        return identity is not None and identity == self._owned_process_identity
+
+    async def _terminate_owned_cli(self) -> bool:
+        """Stop and reap only the captured SDK CLI, verifying identity each time."""
+        process = self._owned_process
+        if process is None:
+            return False
+        if getattr(process, "returncode", None) is not None:
+            return True
+        if not self._owned_cli_is_current():
+            return False
+        try:
+            process.terminate()
+            await asyncio.wait_for(process.wait(), timeout=_NATIVE_STOP_TIMEOUT)
+        except asyncio.TimeoutError:
+            if not self._owned_cli_is_current():
+                return False
+            try:
+                process.kill()
+                await asyncio.wait_for(process.wait(), timeout=_NATIVE_STOP_TIMEOUT)
+            except (asyncio.TimeoutError, Exception):
+                return getattr(process, "returncode", None) is not None
+        except Exception:
+            return getattr(process, "returncode", None) is not None
+        return getattr(process, "returncode", None) is not None
 
     # -- AgentSession surface ------------------------------------------------
 
@@ -365,6 +752,16 @@ class SdkSession:
             self._broker.viewer_disconnected()
             self._viewers_seen -= 1
 
+    def turn_refusal(self) -> Optional[str]:
+        """Expose manual-turn admission before the caller counts or logs it."""
+        if self._closing:
+            return "SDK session is closing; this turn was not sent"
+        if self._submission_lock.locked() or (
+            self._active_turn is not None and not self._active_turn.done()
+        ):
+            return "wait for the active turn to finish before submitting another"
+        return None
+
     async def submit_turn(self, blocks: list, viewer: Optional[str] = None) -> None:
         """Send one user turn, given as content blocks, to the model.
 
@@ -383,32 +780,57 @@ class SdkSession:
         runs in an executor rather than blocking this coroutine or the pump
         reading the same loop.
         """
-        if self._client is None or self._status != AGENT_READY:
-            self._emit(
-                AgentError(
-                    stderr=self._recent_stderr(),
-                    remediation=turn_not_sent(self._status),
-                    viewer=viewer,
+        async with self._submission_lock:
+            if self._closing or self._client is None or self._status != AGENT_READY:
+                self._emit(
+                    AgentError(
+                        stderr=self._recent_stderr(),
+                        remediation=turn_not_sent(self._status),
+                        viewer=viewer,
+                    )
                 )
             )
             return
-        self._turn += 1
-        self._interrupted = False
-        try:
-            loop = asyncio.get_running_loop()
-            expanded = await loop.run_in_executor(
-                None, turn_images.expand_turn_blocks, blocks, self.cwd
-            )
-            await self._client.query(
-                _one_message(
-                    {
-                        "type": "user",
-                        "message": {"role": "user", "content": expanded},
-                    }
+        if self._active_turn is not None and not self._active_turn.done():
+            self._emit(
+                AgentError(
+                    stderr="a turn is already active; this turn was not sent",
+                    remediation="wait for the active turn to finish before submitting another",
+                    viewer=viewer,
                 )
-            )
-        except Exception as exc:
-            self._fail(exc, viewer=viewer)
+                return
+            completion = asyncio.get_running_loop().create_future()
+            self._active_turn = completion
+            self._turn += 1
+            interrupt_epoch = self._interrupt_epoch
+            try:
+                loop = asyncio.get_running_loop()
+                expanded = await loop.run_in_executor(
+                    None, turn_images.expand_turn_blocks, blocks, self.cwd
+                )
+                if self._closing or self._interrupt_epoch != interrupt_epoch:
+                    self._active_turn = None
+                    completion.set_result(None)
+                    self._emit(TurnEnd(turn=self._turn, stop_reason="not_sent", cost_usd=None))
+                    self._emit(
+                        AgentError(
+                            stderr="SDK input was stopped before prompt submission; this turn was not sent",
+                            remediation="This turn was not sent; wait for the session to be ready, then send a new message.",
+                            viewer=viewer,
+                        )
+                    )
+                    return
+                await self._client.query(
+                    _one_message(
+                        {
+                            "type": "user",
+                            "message": {"role": "user", "content": expanded},
+                        }
+                    )
+                )
+            except Exception as exc:
+                self._active_turn = None
+                self._fail(exc, viewer=viewer)
 
     async def decide_permission(
         self, request_id: str, decision: str, message: str = "", by: Optional[str] = None
@@ -434,6 +856,7 @@ class SdkSession:
             )
 
     async def interrupt(self) -> None:
+        self._interrupt_epoch += 1
         if self._client is None:
             return
         self._interrupted = True
@@ -453,22 +876,96 @@ class SdkSession:
         self._end_turn_pending = True
 
     async def set_model(self, model: str) -> None:
-        """Switch the live conversation to ``model``, no reconnect.
-
-        ``ClaudeSDKClient.set_model`` is a genuine control-plane call that
-        takes effect on the already-connected session (confirmed by reading
-        ``claude_agent_sdk/_internal/query.py``'s own ``set_model``, which
-        sends a ``{"subtype": "set_model", "model": model}`` control request
-        over the wire this client already holds open) -- unlike a resumed
-        session, nothing here closes or restarts ``self._client``.
-        """
-        if model == self._model:
-            return
-        await self._client.set_model(model)
-        self._model = model
-        self._emit(AgentModelChanged(model=model))
+        """Change the live model without racing a bounded root continuation."""
+        async with self._submission_lock:
+            if self._closing or self._client is None or self._status != AGENT_READY:
+                raise RuntimeError("SDK session is not ready to change model")
+            if model == self._model:
+                return
+            await self._client.set_model(model)
+            self._model = model
+            self._emit(AgentModelChanged(model=model))
 
     # -- lifecycle -----------------------------------------------------------
+
+    def _capture_native_process(self) -> None:
+        """Capture only the actual SDK-managed CLI process and kernel identity."""
+        self._owned_process = None
+        self._owned_process_identity = None
+        if self._transport is not None:
+            return
+        transport = getattr(self._client, "_transport", None)
+        if type(transport).__module__ != "claude_agent_sdk._internal.transport.subprocess_cli":
+            return
+        process = getattr(transport, "_process", None)
+        pid = getattr(process, "pid", None)
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return
+        identity = _linux_process_identity(pid, self._owner_uuid)
+        if identity is None:
+            return
+        self._owned_process = process
+        self._owned_process_identity = identity
+        if self._owner_uuid is None:
+            return
+        context = self._owner_context
+        if not isinstance(context, dict) or set(context) != {
+            "run_id",
+            "project_id",
+            "source",
+            "epoch",
+        }:
+            return
+        if any(
+            not isinstance(context[key], str) or not context[key]
+            for key in ("run_id", "project_id", "source")
+        ):
+            return
+        if isinstance(context["epoch"], bool) or not isinstance(context["epoch"], int):
+            return
+        self._native_owner = {
+            **context,
+            "owner_uuid": self._owner_uuid,
+            **identity,
+        }
+        self._notify_owner({"event": "native_owner", "native_owner": self._native_owner})
+
+    def _capture_native_owner(self) -> None:
+        self._capture_native_process()
+
+    def _notify_owner(self, event: dict) -> None:
+        if self._on_owner is None:
+            return
+        try:
+            self._on_owner(event)
+        except Exception as exc:
+            sys.stderr.write("warning: native owner observer failed: %r\n" % (exc,))
+
+    def _report_owner_termination(self) -> None:
+        if self._owner_uuid is None or self._owner_termination_reported:
+            return
+        self._owner_termination_reported = True
+        stopped = False
+        process = self._owned_process
+        if process is not None:
+            try:
+                stopped = process.returncode is not None
+            except Exception:
+                stopped = False
+            if not stopped:
+                try:
+                    os.stat("/proc/%d" % process.pid)
+                except FileNotFoundError:
+                    stopped = True
+                except OSError:
+                    pass
+        self._notify_owner(
+            {
+                "event": "native_termination",
+                "owner_uuid": self._owner_uuid,
+                "outcome": "stopped" if stopped else "unverified",
+            }
+        )
 
     async def start(self) -> None:
         """Connect the client and start the pump; never raise.
@@ -480,7 +977,9 @@ class SdkSession:
         try:
             self._client = ClaudeSDKClient(options=self._build_options(), transport=self._transport)
             await self._client.connect()
+            self._capture_native_owner()
         except Exception as exc:
+            self._report_owner_termination()
             self._client = None
             self._fail(exc)
             return
@@ -510,20 +1009,32 @@ class SdkSession:
 
     async def close(self) -> None:
         self._closing = True
-        if self._broker is not None:
-            # Before the client goes: a request still awaiting a decision has to
-            # be denied while there is still a socket to carry the event, and
-            # while the SDK call it belongs to can still receive the result.
-            self._broker.shutdown()
-        if self._pump_task is not None and not self._pump_task.done():
-            self._pump_task.cancel()
-        if self._client is not None:
-            try:
-                await self._client.disconnect()
-            except Exception as exc:
-                sys.stderr.write("warning: agent client did not disconnect cleanly: %r\n" % (exc,))
-        self._client = None
-        self._set_status(AGENT_UNAVAILABLE)
+        try:
+            if self._broker is not None:
+                # Deny a request still awaiting a decision before disconnecting.
+                self._broker.shutdown()
+            if (
+                self._active_turn is not None
+                and not self._active_turn.done()
+                and self._client is not None
+            ):
+                await self.interrupt()
+            async with self._submission_lock:
+                try:
+                    if self._pump_task is not None and not self._pump_task.done():
+                        self._pump_task.cancel()
+                    if self._client is not None:
+                        try:
+                            await self._client.disconnect()
+                        except Exception as exc:
+                            sys.stderr.write(
+                                "warning: agent client did not disconnect cleanly: %r\n" % (exc,)
+                            )
+                finally:
+                    self._client = None
+                    self._set_status(AGENT_UNAVAILABLE)
+        finally:
+            self._report_owner_termination()
 
     async def _can_use_tool(
         self, tool_name: str, input_data: dict, context: ToolPermissionContext
@@ -559,6 +1070,8 @@ class SdkSession:
             # would choose processes to run.
             "strict_mcp_config": True,
         }
+        if self._owner_uuid is not None and self._transport is None and sys.platform == "linux":
+            kwargs["env"] = {"LOOM_CHILD_OWNER": self._owner_uuid}
         if self._sandbox_requested:
             kwargs["sandbox"] = dict(SANDBOX_SETTINGS)
         if self._builtin_tools is not None:
@@ -579,6 +1092,10 @@ class SdkSession:
             kwargs["can_use_tool"] = self._can_use_tool
         if self._model:
             kwargs["model"] = self._model
+        if self._max_budget_usd is not None:
+            kwargs["max_budget_usd"] = self._max_budget_usd
+        if self._native_max_turns is not None:
+            kwargs["max_turns"] = self._native_max_turns
         if self._instructions:
             kwargs["system_prompt"] = self._instructions
         if self._effort:
@@ -832,8 +1349,9 @@ class SdkSession:
                 asyncio.ensure_future(self.interrupt())
             return
         if isinstance(message, ResultMessage):
+            self.last_result_num_turns = _count(getattr(message, "num_turns", None))
             self._remember_sdk_session(getattr(message, "session_id", None))
-            cost, tokens = self._turn_figures(message)
+            cost, tokens, usage_source = self._turn_figures(message)
             # An interrupted turn also ends as an error result, but one the
             # human or a tool asked for, so it is no failure.
             interrupted = self._interrupted or getattr(message, "terminal_reason", None) in (
@@ -843,10 +1361,6 @@ class SdkSession:
             self._interrupted = False
             self.last_result_error = None if interrupted else _result_error(message)
             if self.last_result_error:
-                # The CLI ends a failed turn (an expired login, an API error,
-                # the turn limit) with an ordinary result whose text is the
-                # only reason given, so without this the chat sees a turn end
-                # and nothing else.
                 self._emit(
                     AgentError(
                         stderr=self.last_result_error,
@@ -862,44 +1376,79 @@ class SdkSession:
                     or "end_turn",
                     cost_usd=cost,
                     tokens=tokens,
+                    usage_epoch=self._usage_epoch,
+                    usage_source=usage_source,
                 )
             )
             self._stop_reason = None
             self._emit(self._usage(message))
+            self._last_turn_cost = cost
+            active = self._active_turn
+            if active is not None and not active.done():
+                active.set_result(cost)
             return
         if isinstance(message, ConversationResetMessage):
             # The conversation was replaced: its context fill is unknown until
             # the next call reports one, and the CLI's running totals start
             # again from nothing.
             self._last_call = None
+            self._usage_epoch += 1
             self._totals = _totals_of(None)
             return
         if isinstance(message, SystemMessage):
             self._handle_system(message)
             return
 
-    def _turn_figures(self, message: ResultMessage) -> Tuple[float, Optional[dict]]:
-        """This turn's cost and tokens from a result: its running totals less
-        the previous ones (``self._totals``), which then become these. A total
-        below the one before it means the CLI started counting again, so it is
-        this turn's figure itself. A figure the result does not report is 0.0
-        for the cost and None for a token count, and its total stays as it was."""
+    def _turn_figures(self, message: ResultMessage) -> Tuple[Optional[float], Optional[dict], str]:
+        """Attribute this turn from running totals; a reset makes all its
+        derived fields unknown and starts a fresh usage epoch."""
         before_cost, before_tokens = self._totals
-        cost = 0.0
-        if isinstance(message.total_cost_usd, (int, float)):
-            cost = max(0.0, _since(float(message.total_cost_usd), before_cost))
-            before_cost = float(message.total_cost_usd)
+        raw_cost = message.total_cost_usd
+        current_cost = (
+            float(raw_cost)
+            if isinstance(raw_cost, (int, float))
+            and not isinstance(raw_cost, bool)
+            and raw_cost >= 0
+            else None
+        )
         totals = _summed_tokens(message.model_usage)
+        regressed = (
+            current_cost is not None and before_cost is not None and current_cost < before_cost
+        )
+        if totals is not None:
+            regressed = regressed or any(
+                total is not None and before_tokens[key] is not None and total < before_tokens[key]
+                for key, total in totals.items()
+            )
+
+        if regressed:
+            self._usage_epoch += 1
+            self._totals = (
+                current_cost,
+                {key: totals[key] if totals is not None else None for key, _field in _TOKEN_FIELDS},
+            )
+            return None, None, "counter_regression"
+
+        cost = (
+            current_cost - before_cost
+            if current_cost is not None and before_cost is not None
+            else None
+        )
+        if current_cost is not None:
+            before_cost = current_cost
         tokens = None
         if totals is not None:
             tokens = {}
             before_tokens = dict(before_tokens)
             for key, total in totals.items():
-                tokens[key] = None if total is None else max(0, _since(total, before_tokens[key]))
+                previous = before_tokens[key]
+                tokens[key] = (
+                    total - previous if total is not None and previous is not None else None
+                )
                 if total is not None:
                     before_tokens[key] = total
         self._totals = (before_cost, before_tokens)
-        return cost, tokens
+        return cost, tokens, "cumulative_turn_delta"
 
     def _usage(self, message: ResultMessage) -> Usage:
         """``Usage`` from a result: the CLI's running totals for the
@@ -915,6 +1464,8 @@ class SdkSession:
             cost_usd=message.total_cost_usd,
             tokens=_summed_tokens(message.model_usage),
             context=context,
+            usage_epoch=self._usage_epoch,
+            usage_source="cumulative_snapshot",
         )
 
     def _handle_stream_event(self, message: StreamEvent) -> None:
@@ -945,6 +1496,34 @@ class SdkSession:
         """
         data = message.data or {}
         self._remember_sdk_session(data.get("session_id"))
+        if message.subtype == "init":
+            actual_model = data.get("model")
+            actual_effort = data.get("effort")
+            if isinstance(actual_model, str) or isinstance(actual_effort, str):
+                runtime = AgentRuntimeResolved(
+                    backend="claude",
+                    provider=None,
+                    model=actual_model if isinstance(actual_model, str) else None,
+                    effort=actual_effort if isinstance(actual_effort, str) else None,
+                    provenance="sdk_init",
+                )
+                identity = (
+                    runtime.backend,
+                    runtime.provider,
+                    runtime.model,
+                    runtime.effort,
+                    runtime.provenance,
+                )
+                if identity != self._runtime_identity:
+                    self._runtime_identity = identity
+                    self.resolved_runtime = {
+                        "backend": runtime.backend,
+                        "provider": runtime.provider,
+                        "model": runtime.model,
+                        "effort": runtime.effort,
+                        "provenance": runtime.provenance,
+                    }
+                    self._emit(runtime)
         if message.subtype == "compact_boundary":
             # The context was compacted: the last call's prompt no longer says
             # how full it is, so the fill is unknown until the next call.
@@ -955,6 +1534,7 @@ class SdkSession:
             if reported and reported != self._resume:
                 # A new conversation, whose totals start from nothing.
                 self._totals = _totals_of(None)
+                self._usage_epoch += 1
                 self._emit(
                     SessionReset(
                         reason="asked to resume %s and the agent started %s instead; "
@@ -1202,23 +1782,16 @@ def _summed_tokens(model_usage) -> Optional[dict]:
     return {key: _sum_counts(models, field) for key, field in _TOKEN_FIELDS}
 
 
-def _totals_of(usage: Optional[dict]) -> Tuple[float, dict]:
-    """The running totals ``SdkSession._turn_figures`` differences against,
-    from a ``Usage.snapshot()`` (any figure of which may be None, as 0), or
-    nothing used for None."""
-    usage = usage or {}
+def _totals_of(usage: Optional[dict]) -> Tuple[Optional[float], dict]:
+    """Return known running totals; only an absent start history means zero."""
+    if usage is None:
+        return 0.0, {key: 0 for key, _field in _TOKEN_FIELDS}
     cost = usage.get("cost_usd")
     tokens = usage.get("tokens") or {}
     return (
-        float(cost) if isinstance(cost, (int, float)) else 0.0,
-        {key: _count(tokens.get(key)) or 0 for key, _field in _TOKEN_FIELDS},
+        float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+        {key: _count(tokens.get(key)) for key, _field in _TOKEN_FIELDS},
     )
-
-
-def _since(total, before):
-    """A running total's growth since ``before``, or the total itself when it
-    is lower, which means counting started again."""
-    return total if total < before else total - before
 
 
 def _sum_counts(models: list, field: str) -> Optional[int]:

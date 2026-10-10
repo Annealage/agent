@@ -722,6 +722,20 @@ async def test_the_pause_switch_reports_only_a_real_change():
     assert bus.paused is False
 
 
+
+async def test_pause_observer_receives_authenticated_source_before_publication():
+    bus = ViewerBus(ViewerRegistry(), url="http://127.0.0.1:8765/#t=tok")
+    source = object()
+    observed = []
+
+    async def on_pause(paused, human):
+        observed.append((paused, human))
+
+    bus.on_pause(on_pause)
+    assert bus.set_paused(True) is True
+    await bus.notify_pause(bus.paused, source)
+    assert observed == [(True, source)]
+
 async def test_a_primary_change_reaches_every_viewer_behind_events_already_published():
     """A session publishes by appending and scheduling the broadcast; a
     ``viewer_primary`` announced before that broadcast has run must still
@@ -756,3 +770,25 @@ async def test_a_turn_s_sender_given_by_login_is_the_human_with_that_login():
     assert (bus.turn_human, bus.turn_by) == (Human(login="sam@example.com"), "sam@example.com")
     bus.begin_turn([])
     assert (bus.turn_human, bus.turn_by) == (Human(), None)
+
+
+async def test_automatic_turn_origin_is_visible_before_sweep_and_abort_restores_turn():
+    from annealage_agent.session.base import UserTurn
+
+    bus = ViewerBus(ViewerRegistry(), url="http://127.0.0.1:1/")
+    observed = []
+    bus.on_turn_start(lambda _turn: observed.append(
+        (bus.turn_automation_source, bus.turn_human)))
+    bus.queue_note("queued for the next real turn")
+    bus.begin_turn([], automation_source="loom_root_continuation")
+    assert bus.turn == 1
+    assert observed == [("loom_root_continuation", None)]
+    assert bus.turn_human is None
+    assert UserTurn(turn=bus.turn, blocks=[], automation_source=bus.turn_automation_source).to_wire()[
+        "automation_source"
+    ] == "loom_root_continuation"
+    assert bus.abort_unsubmitted_turn(bus.turn) is True
+    assert bus.turn == 0
+    assert bus.turn_automation_source is None
+    assert bus.begin_turn([{"type": "text", "text": "human"}])[0]["text"].find(
+        "queued for the next real turn") >= 0

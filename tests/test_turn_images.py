@@ -69,7 +69,7 @@ class FakeTransport(Transport):
         self.written.append(obj)
         if obj.get("type") == "control_request":
             subtype = obj["request"].get("subtype")
-            if subtype == "initialize":
+            if subtype in ("initialize", "interrupt"):
                 self._queue.put_nowait(
                     {
                         "type": "control_response",

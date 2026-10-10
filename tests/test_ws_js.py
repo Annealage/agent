@@ -106,6 +106,12 @@ ws.deliver(hello(40, "s2", false));
 ws.deliver(delta(1, "other"));
 out.otherSessionReplay = agent.slice();
 
+const restricted = initWs({ indicator: null, allowModelChange: false });
+const restrictedSocket = sockets[3];
+restrictedSocket.open();
+out.restrictedModelSend = restricted.send({ type: "set_model", model: "wrong" });
+out.restrictedPauseSend = restricted.send({ type: "pause", paused: true });
+out.restrictedFrames = restrictedSocket.sent.map((frame) => frame.type);
 console.log(JSON.stringify(out));
 process.exit(0);
 """
@@ -152,6 +158,12 @@ def test_a_reconnect_offers_its_position_with_its_session(observed):
 def test_another_session_s_replay_is_taken_from_the_start(observed):
     assert observed["otherSessionHello"] == {"last_seq": 7, "session_id": "s1"}
     assert observed["otherSessionReplay"] == [["text_delta", "other", True]]
+
+
+def test_runtime_restricted_pages_cannot_send_model_switches(observed):
+    assert observed["restrictedModelSend"] is False
+    assert observed["restrictedPauseSend"] is True
+    assert observed["restrictedFrames"] == ["hello", "pause"]
 
 
 # --- the token across a reload ---------------------------------------------------

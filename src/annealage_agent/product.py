@@ -95,6 +95,11 @@ parentheses are Annealage Mesh's, as an example:
     front end registers nothing for a key to be shown and edited. Applying a
     ``load``-effect value to the page is the product front end's own job
     (Mesh's ``main.js`` passes ``initSettings`` an ``onLoad`` hook for it).
+``browser_runtime_controls``
+    Whether the browser can change backend/model/effort. When false, the
+    settings API omits and rejects those writes, and the WebSocket refuses
+    ``set_model``; the operator's trusted launch and configuration remain
+    unaffected.
 ``events``
     The product's own ``AgentEvent`` subclasses (Mesh: ``models_changed``),
     registered by ``install`` so a kind that collides with a generic one is
@@ -193,6 +198,11 @@ class Product:
     doctor_command: Optional[str] = None
     codex_install_hint: Optional[str] = None
     session_context: Optional[Callable[..., Any]] = None
+
+    # Whether a browser may change the run's backend/model/effort through
+    # settings or the live model picker. Products that configure runtime only
+    # through the operator's trusted launch/configuration set this false.
+    browser_runtime_controls: bool = True
 
     @property
     def server_header(self):

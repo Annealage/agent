@@ -318,6 +318,31 @@ async def test_a_fresh_connection_after_a_live_model_switch_sees_the_new_model(s
     assert hello["session"]["agent"] == "unavailable"
 
 
+
+async def test_a_fresh_connection_gets_backend_reported_runtime_metadata(served_dir):
+    from annealage_agent.session.base import AgentRuntimeResolved
+
+    app, session = _app_with_fake_session(served_dir, settings={"model": "requested-model"})
+    session.emit(
+        AgentRuntimeResolved(
+            backend="omp",
+            provider="titan",
+            model="actual-model",
+            effort=None,
+            provenance="assistant_message",
+        )
+    )
+
+    hello = await _hello_of(app)
+    assert hello["session"]["model"] == "requested-model"
+    assert hello["session"]["resolved_runtime"] == {
+        "backend": "omp",
+        "provider": "titan",
+        "model": "actual-model",
+        "effort": None,
+        "provenance": "assistant_message",
+    }
+
 async def test_a_fresh_connection_gets_the_models_the_backend_listed(served_dir):
     """The list is published once, at session start, usually before any tab
     is open, so a later tab takes it from the hello, not from the replay."""
@@ -450,7 +475,10 @@ async def test_the_hello_carries_the_conversation_s_usage_across_a_restart(serve
         build_session=lambda on_event, *, bus: FakeSession(on_event, session_id=sid),
     )
     try:
-        assert (await _hello_of(restarted))["session"]["usage"] == latest
+        restored = (await _hello_of(restarted))["session"]["usage"]
+        assert restored["cost_usd"] == latest["cost_usd"]
+        assert restored["tokens"] == latest["tokens"]
+        assert restored["context"] == latest["context"]
     finally:
         restarted.agent_event_log.close()
 

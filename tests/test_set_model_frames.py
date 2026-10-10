@@ -19,6 +19,7 @@ adding anything to the question of what this layer does with the frame.
 import json
 
 import pytest
+from annealage_agent import protocol
 
 from annealage_agent.http import ws as ws_module
 from annealage_agent.session.fake import FakeSession
@@ -51,12 +52,15 @@ class _Conn:
 
 
 def _frame(model="claude-haiku-5"):
-    return {"v": 1, "type": "set_model", "model": model}
+    return {"v": protocol.PROTOCOL_VERSION, "type": "set_model", "model": model}
 
 
-async def _dispatch(session, frame):
+async def _dispatch(session, frame, *, browser_runtime_controls=True):
     sock = RecordingSocket()
-    await ws_module._dispatch(sock, _Conn(), StubRegistry(), None, "tok", frame, session)
+    await ws_module._dispatch(
+        sock, _Conn(), StubRegistry(), None, "tok", frame, session,
+        browser_runtime_controls=browser_runtime_controls,
+    )
     return sock.sent
 
 
@@ -65,6 +69,48 @@ async def test_a_set_model_frame_is_recorded_rather_than_refused_with_an_attribu
     sent = await _dispatch(session, _frame())
     assert sent == []
     assert session.set_model_calls == ["claude-haiku-5"]
+
+
+async def test_products_that_reserve_runtime_selection_refuse_model_frames():
+    session = FakeSession(lambda event: None)
+    sent = await _dispatch(session, _frame(), browser_runtime_controls=False)
+    assert sent[0]["type"] == "refused"
+    assert "configured by the operator" in sent[0]["reason"]
+    assert session.set_model_calls == []
+
+
+class IncomingSocket(RecordingSocket):
+    def __init__(self, frame):
+        super().__init__()
+        self.frames = [json.dumps(frame)]
+
+    async def receive(self):
+        if self.frames:
+            return self.frames.pop()
+        raise ConnectionError("end test connection")
+
+
+async def test_restricted_model_frame_is_refused_before_resuming_the_session():
+    class Holder:
+        session = None
+        bus = None
+
+        def __init__(self):
+            self.ensure_calls = 0
+
+        async def ensure(self, retry=False):
+            self.ensure_calls += 1
+
+    holder = Holder()
+    sock = IncomingSocket(_frame())
+    with pytest.raises(ConnectionError, match="end test connection"):
+        await ws_module._serve_connection(
+            sock, _Conn(), StubRegistry(), None, "tok", holder,
+            browser_runtime_controls=False,
+        )
+    assert holder.ensure_calls == 0
+    assert sock.sent[0]["type"] == "refused"
+    assert "configured by the operator" in sock.sent[0]["reason"]
 
 
 async def test_viewer_only_mode_answers_a_set_model_frame_rather_than_dropping_it():

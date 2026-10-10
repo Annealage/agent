@@ -303,3 +303,30 @@ async def test_an_action_naming_a_remote_the_tool_server_does_not_declare_is_ref
             build_session=lambda on_event, *, bus: None,
             upload_actions=(DATUM,),
         )
+
+
+async def test_authority_context_change_while_upload_card_is_open_prevents_dispatch(
+    app, remote
+):
+    client = make_test_client(app)
+    calls = 0
+
+    def context():
+        nonlocal calls
+        calls += 1
+        return {
+            "project_id": "a" * 64,
+            "source_manifest": "b" * 64,
+            "authority_epoch": 1 if calls == 1 else 2,
+        }
+
+    app.agent_bus.remote_action_context = context
+    uploaded = await _upload(client)
+    started = await _start(client, uploaded.json["upload"])
+    assert started.status_code == 202
+    card = await _next(app, "permission_request")
+    await app.agent_bus.broker.decide(card["request_id"], "allow")
+    ended = await _next(app, "upload_action")
+    assert ended["outcome"] == "failed"
+    assert "authority context changed" in ended["text"]
+    assert "submit" not in remote.calls

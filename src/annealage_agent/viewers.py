@@ -19,6 +19,7 @@ carries.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import sys
@@ -779,17 +780,22 @@ class ViewerBus:
         # log), so the next one continues the numbering rather than reusing 1.
         self._turn = int(turn)
         self._turn_at_open = self._turn
-        self._notes: list = []
-        # Who sent the turn now starting (begin_turn): an ``identity.Human``.
         self.turn_human: Optional[Any] = None
+        self.turn_automation_source: Optional[str] = None
+        self._notes: list = []
+        self._unsubmitted_turn: Optional[tuple[int, Any, Optional[str], tuple]] = None
         self._turn_start_callbacks: list = []
+        self._pause_callbacks: list = []
         self.end_turn_handler: Optional[Any] = None
-        # None: no app set it, so the session takes the product's patterns.
+        # None: no app set it, and the session takes the product's patterns.
         self.write_protected: Optional[tuple] = None
         # Set by the first ``begin_turn``: the app's remote-server retry waits
         # on it, so a remote unreachable at startup is tried again the moment
         # the session is first used rather than only on its timer.
         self.first_turn = asyncio.Event()
+        # Serialize browser admission through submission, including an awaited
+        # hosted recorder, so two tabs cannot both consume the same idle slot.
+        self.turn_submission_lock = asyncio.Lock()
 
     @property
     def url(self) -> str:
@@ -835,32 +841,51 @@ class ViewerBus:
         when the callback runs."""
         self._turn_start_callbacks.append(callback)
 
-    def begin_turn(self, blocks: list, by: Optional[Any] = None) -> list:
-        """Count one human turn, run the ``on_turn_start`` callbacks, and
-        return ``blocks`` with every queued note in front of them, as one text
-        block of its own marked as coming from the product rather than the
-        human. Clears the queue. ``http/ws.py`` calls it only once the turn is
-        going to a ready session, with ``by``, the sender's ``identity.Human``
-        (``Human()``, no login, for the browser token's holder), which is
-        ``turn_human`` from then until the next turn: what a product
-        attributes the turn's consequences to, by name (``turn_by`` is its
-        login, and ``UserTurn.by``, logged just after, the same login). ``by``
-        may be a login alone, taken as the ``Human`` with that login; ``None``
-        is the token's holder.
+    def on_pause(self, callback) -> None:
+        """Run ``callback(paused, human)`` for a changed viewer pause frame.
 
-        A note can carry text the product did not write (a remote MCP
-        server's own instructions, ``app.retry_remotes``), and a backend may
-        join the blocks into one message (omp's prompt text), so both marker
-        strings are neutralised inside the notes: nothing in a note can end
-        the note early and have what follows read as the human's."""
+        ``human`` is the authenticated identity attached to the WebSocket
+        connection; the bus does not infer authorship from agent content.
+        Callbacks may be synchronous or asynchronous.
+        """
+        self._pause_callbacks.append(callback)
+
+    async def notify_pause(self, paused: bool, human: Any) -> None:
+        """Await pause observers before the changed pause is published."""
+        for callback in list(self._pause_callbacks):
+            try:
+                result = callback(bool(paused), human)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                sys.stderr.write("warning: a pause observer failed: %r\n" % (exc,))
+
+
+
+    def begin_turn(self, blocks: list, by: Optional[Any] = None, *,
+                   automation_source: Optional[str] = None) -> list:
+        """Count one human or explicitly automated turn, then run start callbacks.
+
+        ``automation_source`` is absent on human turns. The supported explicit
+        source is ``loom_root_continuation``; it is published before callbacks
+        run so turn-start observers can distinguish it from a human message.
+        """
+        if automation_source not in {None, "loom_root_continuation"}:
+            raise ValueError("Unsupported automatic turn source")
+        self._unsubmitted_turn = (
+            self._turn, self.turn_human, self.turn_automation_source, ())
         self._turn += 1
-        if by is None or isinstance(by, str):
-            # Here, not at the top: identity imports http.ws, which imports
-            # this module.
-            from .identity import Human
+        self.turn_automation_source = automation_source
+        if automation_source is not None:
+            self.turn_human = None
+        else:
+            if by is None or isinstance(by, str):
+                # Here, not at the top: identity imports http.ws, which imports
+                # this module.
+                from .identity import Human
 
-            by = Human(login=by)
-        self.turn_human = by
+                by = Human(login=by)
+            self.turn_human = by
         self.first_turn.set()
         for callback in list(self._turn_start_callbacks):
             try:
@@ -868,12 +893,34 @@ class ViewerBus:
             except Exception as exc:
                 sys.stderr.write("warning: a turn-start callback failed: %r\n" % (exc,))
         notes, self._notes = self._notes, []
+        if self._unsubmitted_turn is not None:
+            previous, human, source, _ = self._unsubmitted_turn
+            self._unsubmitted_turn = (previous, human, source, tuple(notes))
         if not notes:
             return blocks
         opening = _NOTE_OPEN % product.current().title
         body = "\n\n".join(_neutralise_markers(note) for note in notes)
         text = "%s\n\n%s\n\n%s" % (opening, body, _NOTE_CLOSE)
         return [{"type": "text", "text": text}] + list(blocks)
+
+    def abort_unsubmitted_turn(self, turn: int) -> bool:
+        """Restore bus turn metadata if no UserTurn or provider prompt was sent."""
+        state = self._unsubmitted_turn
+        if state is None or self._turn != turn:
+            return False
+        previous, human, source, notes = state
+        self._turn = previous
+        self.turn_human = human
+        self.turn_automation_source = source
+        self._notes = list(notes) + self._notes
+        self._unsubmitted_turn = None
+        return True
+    def mark_turn_submitted(self, turn: int) -> bool:
+        """Discard the rollback snapshot once the turn is durably logged."""
+        if self._turn != turn or self._unsubmitted_turn is None:
+            return False
+        self._unsubmitted_turn = None
+        return True
 
     def attention(self, title: str, body: str) -> None:
         """Tell the human the agent needs them: a browser notification and a

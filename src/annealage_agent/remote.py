@@ -81,6 +81,7 @@ from mcp import ClientSession, MCPError
 from mcp.client.streamable_http import streamable_http_client
 
 from . import product
+from . import remote_actions
 from .tools import Grading, _wrap, fail, namespaced
 
 #: How long connecting, ``initialize``, the ``prime`` call and ``list_tools``
@@ -172,7 +173,7 @@ def connect(servers, *, product_server, bus, paused_message, retry=False):
         gated = set(grading.pause_gated)
         tools = tuple(
             _wrap(
-                _proxied(server, listed[name]),
+                _proxied(server, listed[name], bus),
                 bus=bus,
                 gated=name in gated,
                 paused_message=paused_message,
@@ -320,12 +321,25 @@ def _reason(exc, timeout):
     if isinstance(leaf, (httpx.TransportError, httpx2.TransportError, OSError)):
         return "%s: %s" % (type(leaf).__name__, leaf) if str(leaf) else type(leaf).__name__
     return None
+def _action_context(bus):
+    return _read_context(getattr(bus, "remote_action_context", None))
+
+
+def _read_context(callback, *args):
+    if not callable(callback):
+        return None
+    try:
+        value = callback(*args)
+    except Exception:
+        return None
+    return value if isinstance(value, dict) else None
+
 
 
 # -- proxied tools -------------------------------------------------------------
 
 
-def _proxied(server, tool):
+def _proxied(server, tool, bus=None):
     """An unwrapped ``SdkMcpTool`` calling ``tool`` on ``server``.
 
     Its schema is the remote's own, given an explicit ``properties`` so that
@@ -333,41 +347,91 @@ def _proxied(server, tool):
     than reading it as the ``{param: type}`` shorthand. omp refuses a tool
     with no description, so one without gets a plain one.
     """
-    schema = dict(tool.input_schema or {})
+    schema = dict(tool.inputSchema or {})
     schema.setdefault("type", "object")
     schema.setdefault("properties", {})
     description = (tool.description or "").strip() or "%s, on the %s MCP server" % (
-        tool.name,
-        server.name,
+        tool.name, server.name,
     )
     name = tool.name
 
     async def handler(args):
-        return await call(server, name, args)
+        context = _action_context(bus)
+        expected_context = context
+        if name in server.grading.write:
+            approval_context = getattr(bus, "remote_approval_context", None)
+            if callable(approval_context):
+                expected_context = _read_context(
+                    approval_context, server.name + "__" + name, args
+                )
+                store = getattr(bus, "remote_action_store", None)
+                if expected_context is None or store is None or not remote_actions.safe_context(
+                    expected_context, store.project
+                )["context_verified"]:
+                    return fail("remote write refused: its approved source context is unavailable or invalid")
+        return await call(
+            server, name, args, action_store=getattr(bus, "remote_action_store", None),
+            source="agent", read_only=name in server.grading.read,
+            context=context, expected_context=expected_context,
+            context_callback=getattr(bus, "remote_action_context", None),
+        )
 
     return SdkMcpTool(name=name, description=description, input_schema=schema, handler=handler)
 
 
-async def call(server, name, arguments):
-    """Call tool ``name`` on ``server`` (a ``RemoteServer``) with
-    ``arguments``, on a connection of its own, and return the result in
-    ``tools.ok``/``fail``'s shape: the remote's own failure, or one saying
-    whether the call reached the remote. Grades, gates and asks nothing;
-    that is the caller's (``_proxied``'s tool, wrapped by ``tools._wrap``, or
-    an upload action the human approved, ``uploads.py``)."""
-    # Set once the connection is initialized, just before tools/call is
-    # sent: a failure before it means the call never reached the remote,
-    # one after it that the remote may have acted on it.
+async def call(
+    server, name, arguments, *, action_store=None, source="agent", read_only=False,
+    approval=None, context=None, expected_context=None, context_callback=None,
+):
+    """Call a remote tool, durably recording non-read-only intent before send."""
+    invocation = None
+    if not read_only:
+        if action_store is None:
+            return fail("remote write refused: durable action ledger is unavailable")
+        if expected_context is not None:
+            before = remote_actions.safe_context(expected_context, action_store.project)
+            current = remote_actions.safe_context(context, action_store.project)
+            if before != current:
+                return fail("remote write refused because its approved authority context changed")
+        try:
+            invocation, blocked = action_store.begin(
+                server.name, name, arguments, source=source, approval=approval, context=context
+            )
+        except Exception:
+            return fail(
+                "remote write refused: durable action ledger could not reserve it; nothing was sent"
+            )
+        if blocked:
+            return fail(
+                "%s on %s has an unresolved prior invocation (%s); it was not sent again. "
+                "Ask the human to inspect and explicitly reconcile action %s."
+                % (name, server.name, blocked["outcome"], blocked["id"])
+            )
     sent = False
+    stale_context = False
     result = None
     try:
         with anyio.fail_after(CALL_TIMEOUT):
             async with _session(server) as (session, _):
-                sent = True
-                result = await _call(session, name, arguments)
-    except Exception as exc:
+                current_context = _read_context(context_callback) if callable(context_callback) else context
+                if invocation and expected_context is not None:
+                    stale_context = (
+                        remote_actions.safe_context(expected_context, action_store.project)
+                        != remote_actions.safe_context(current_context, action_store.project)
+                    )
+                if not stale_context:
+                    if invocation:
+                        action_store.dispatching(invocation)
+                    sent = True
+                    result = await _call(session, name, arguments)
+    except BaseException as exc:
+        if invocation:
+            action_store.outcome(invocation, "uncertain" if sent else "not_sent")
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         if result is not None:
-            # Only closing the connection failed; the call itself answered.
+            if invocation:
+                action_store.outcome(invocation, "uncertain" if result.isError else "reported_result")
             return _result(server.name, name, result)
         leaf = _leaf(exc)
         if sent and isinstance(leaf, MCPError):
@@ -380,19 +444,22 @@ async def call(server, name, arguments):
         if sent:
             return fail(
                 "%s was sent to the %s MCP server but no answer came back (%s), so it "
-                "may or may not have happened; check before retrying, and if it keeps "
-                "failing, tell the human and carry on without it" % (name, server.name, reason)
+                "may or may not have happened; check before retrying. Invocation %s is blocked."
+                % (name, server.name, reason, invocation["id"] if invocation else "unrecorded")
             )
         return fail(
-            "%s did not run: the %s MCP server could not be reached (%s). Try again "
-            "shortly; if it keeps failing, tell the human and carry on without it"
+            "%s did not run: the %s MCP server could not be reached (%s). Try again shortly."
             % (name, server.name, reason)
         )
+    if stale_context:
+        action_store.outcome(invocation, "not_sent")
+        return fail("remote write refused because its approved authority context changed")
+    if invocation:
+        action_store.outcome(invocation, "uncertain" if result.isError else "reported_result")
     return _result(server.name, name, result)
 
 
 def _result(server_name, tool_name, result):
-    """A remote ``CallToolResult`` in ``tools.ok``/``fail``'s shape."""
     content = []
     omitted = []
     for block in result.content:

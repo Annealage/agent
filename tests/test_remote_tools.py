@@ -118,14 +118,22 @@ class FakeRemote:
                 return types.CallToolResult(
                     isError=True, content=[types.TextContent(type="text", text="no such part")]
                 )
-            elif name == "store":
+            if name == "slow":
+                await anyio.sleep(2)
+            if name == "store":
+                if arguments["text"] == "error":
+                    return types.CallToolResult(
+                        isError=True, content=[types.TextContent(type="text", text="remote error")]
+                    )
                 self.stored.append(arguments["text"])
-                content = [types.TextContent(type="text", text="stored")]
-            else:
-                if name == "slow":
+                if arguments["text"] == "uncertain":
                     await anyio.sleep(2)
-                content = [types.TextContent(type="text", text="done")]
-            return types.CallToolResult(content=content)
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text="stored")]
+                )
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="done")]
+            )
 
         server = Server(
             "fake", instructions=INSTRUCTIONS, on_list_tools=list_tools, on_call_tool=call_tool
@@ -170,6 +178,12 @@ def bus():
 
 
 def _tools(bus, tmp_path, *remote):
+    if not hasattr(bus, "remote_action_store"):
+        from annealage_agent.remote_actions import RemoteActionStore
+
+        bus.remote_action_store = RemoteActionStore(
+            tmp_path / "remote-actions.json", project_id=str(tmp_path), session="sess-1"
+        )
     return build_toy_tools(bus, tmp_path, "sess-1", remote=remote)
 
 
@@ -673,3 +687,188 @@ async def test_hosted_remote_calls_use_declared_operation_not_tool_grade(fake, b
     stored = await table["store"].handler({"text": "allowed"})
     assert stored["content"][0]["text"] == "stored"
     assert fake.stored == ["allowed"]
+
+
+@pytest.mark.asyncio
+async def test_written_remote_action_times_out_and_is_not_replayed_after_restart(
+    fake, tmp_path, monkeypatch
+):
+    from annealage_agent.remote_actions import RemoteActionStore
+
+    path = tmp_path / "actions.jsonl"
+    store = RemoteActionStore(path, project_id=str(tmp_path), session="sess")
+    server = _fake(fake)
+    monkeypatch.setattr(remote_module, "CALL_TIMEOUT", 0.8)
+    args = {"text": "uncertain"}
+
+    first_task = asyncio.create_task(remote_module.call(server, "store", args, action_store=store))
+    deadline = time.monotonic() + 1
+    while not fake.stored:
+        assert time.monotonic() < deadline
+        await asyncio.sleep(0.01)
+    concurrent = await remote_module.call(server, "store", args, action_store=store)
+    assert concurrent["is_error"] is True
+    assert "was not sent again" in _text(concurrent)
+    first = await first_task
+    assert first["is_error"] is True
+    assert fake.stored == ["uncertain"]
+    assert store.status()[0]["outcome"] == "uncertain"
+
+    restarted = RemoteActionStore(path, project_id=str(tmp_path), session="sess")
+    second = await remote_module.call(server, "store", args, action_store=restarted)
+    assert second["is_error"] is True
+    assert "was not sent again" in _text(second)
+    assert fake.stored == ["uncertain"]
+
+
+@pytest.mark.asyncio
+async def test_connection_failure_leaves_write_retryable(fake, tmp_path, monkeypatch):
+    from annealage_agent.remote_actions import RemoteActionStore
+
+    monkeypatch.setattr(remote_module, "CALL_TIMEOUT", 0.2)
+    server = RemoteServer("fake", "http://127.0.0.1:1/mcp", FAKE_GRADING)
+    store = RemoteActionStore(
+        tmp_path / "retry.json", project_id=str(tmp_path), session="sess"
+    )
+    args = {"text": "safe-before-connect"}
+    failed = await remote_module.call(server, "store", args, action_store=store)
+    assert failed["is_error"] is True
+    assert "did not run" in _text(failed)
+    assert store.status()[0]["outcome"] == "not_sent"
+
+    retried = await remote_module.call(_fake(fake), "store", args, action_store=store)
+    assert retried["content"][0]["text"] == "stored"
+    assert fake.stored == ["safe-before-connect"]
+
+
+@pytest.mark.asyncio
+async def test_changed_approved_authority_context_refuses_remote_dispatch(fake, tmp_path):
+    from annealage_agent.remote_actions import RemoteActionStore
+
+    store = RemoteActionStore(
+        tmp_path / "context.json", project_id=str(tmp_path), session="sess"
+    )
+    approved = {
+        "project_id": "a" * 64,
+        "source_manifest": "b" * 64,
+        "authority_epoch": 1,
+    }
+    current = dict(approved, authority_epoch=2)
+    result = await remote_module.call(
+        _fake(fake), "store", {"text": "must-not-send"}, action_store=store,
+        context=current, expected_context=approved,
+    )
+    assert result["is_error"] is True
+    assert "authority context changed" in _text(result)
+    assert fake.stored == []
+    assert store.status() == []
+
+
+@pytest.mark.asyncio
+async def test_remote_error_is_not_proof_that_write_had_no_effect(fake, tmp_path):
+    from annealage_agent.remote_actions import RemoteActionStore
+
+    store = RemoteActionStore(
+        tmp_path / "error.json", project_id=str(tmp_path), session="sess"
+    )
+    server = _fake(fake)
+    args = {"text": "error"}
+    first = await remote_module.call(server, "store", args, action_store=store)
+    assert first["is_error"] is True
+    assert store.status()[0]["outcome"] == "uncertain"
+    retry = await remote_module.call(server, "store", args, action_store=store)
+    assert retry["is_error"] is True
+    assert "was not sent again" in _text(retry)
+    assert fake.calls.count("store") == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_intent_reserves_before_connection_and_sends_once(
+    fake, tmp_path, monkeypatch
+):
+    from annealage_agent.remote_actions import RemoteActionStore
+
+    store = RemoteActionStore(
+        tmp_path / "concurrent.json", project_id=str(tmp_path), session="sess"
+    )
+    server = _fake(fake)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_session = remote_module._session
+
+    @contextlib.asynccontextmanager
+    async def delayed_session(remote):
+        entered.set()
+        await release.wait()
+        async with real_session(remote) as session:
+            yield session
+
+    monkeypatch.setattr(remote_module, "_session", delayed_session)
+    args = {"text": "one-write"}
+    first = asyncio.create_task(remote_module.call(server, "store", args, action_store=store))
+    await entered.wait()
+    second = await remote_module.call(server, "store", args, action_store=store)
+    assert second["is_error"] is True
+    assert "was not sent again" in _text(second)
+    release.set()
+    await first
+    assert fake.stored == ["one-write"]
+
+
+@pytest.mark.asyncio
+async def test_client_cancellation_after_remote_write_records_unknown_and_blocks_replay(
+    fake, tmp_path
+):
+    from annealage_agent.remote_actions import RemoteActionStore
+
+    store = RemoteActionStore(
+        tmp_path / "cancel.json", project_id=str(tmp_path), session="sess"
+    )
+    server = _fake(fake)
+    args = {"text": "uncertain"}
+    task = asyncio.create_task(remote_module.call(server, "store", args, action_store=store))
+    deadline = time.monotonic() + 5
+    while not fake.stored:
+        assert time.monotonic() < deadline
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.status()[0]["outcome"] == "uncertain"
+    retry = await remote_module.call(server, "store", args, action_store=store)
+    assert retry["is_error"] is True
+    assert "was not sent again" in _text(retry)
+    assert fake.stored == ["uncertain"]
+
+
+@pytest.mark.asyncio
+async def test_write_proxy_consumes_preapproval_context_by_canonical_remote_name(
+    fake, bus, tmp_path
+):
+    current = {
+        "project_id": "a" * 64,
+        "source_manifest": "c" * 64,
+        "authority_epoch": 1,
+    }
+    approved = dict(current, source_manifest="b" * 64)
+    captured = []
+    bus.remote_action_context = lambda: current
+
+    def consume(tool_name, arguments):
+        captured.append((tool_name, arguments))
+        return approved
+
+    bus.remote_approval_context = consume
+    tools = _tools(bus, tmp_path, _fake(fake))
+    result = await tools.remote_tables()["fake"]["store"].handler({"text": "stale"})
+    assert result["is_error"] is True
+    assert "authority context changed" in _text(result)
+    assert captured == [("fake__store", {"text": "stale"})]
+    assert fake.stored == []
+
+@pytest.mark.asyncio
+async def test_write_without_durable_ledger_is_refused_before_network(fake):
+    result = await remote_module.call(_fake(fake), "store", {"text": "no-ledger"})
+    assert result["is_error"] is True
+    assert "durable action ledger is unavailable" in _text(result)
+    assert fake.stored == []

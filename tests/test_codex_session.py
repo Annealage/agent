@@ -791,7 +791,9 @@ async def test_usage_at_a_turn_end_is_the_thread_s_running_token_totals_with_no_
             turn_id, _token_usage_update(turn_id, (9000, 6000, 700, 9700), 5200, 258400)
         )
         fake.push_turn_completed(turn_id)
-        assert isinstance(await recorder.next(), TurnEnd)
+        end = await recorder.next()
+        assert isinstance(end, TurnEnd)
+        assert end.cost_usd is None
         usage = await recorder.next()
         assert isinstance(usage, Usage)
         assert usage.to_wire() == {

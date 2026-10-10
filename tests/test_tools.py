@@ -149,6 +149,82 @@ async def test_no_write_class_tool_is_pre_allowed(project):
         assert namespaced("toy", name) not in pre_allowed
 
 
+@pytest.mark.parametrize("broker_name", ("add_note", "mcp__toy__add_note"))
+async def test_nonrememberable_write_keeps_its_gate_and_gets_fresh_cards(
+    project, tmp_path, broker_name
+):
+    from annealage_agent.session.base import PermissionRequest
+    from annealage_agent.session.permissions import PermissionBroker
+
+    bus = FakeBus()
+    real = build_toy_tools(bus, project)
+    server = ToolServer(
+        list(real.tools),
+        grading=real.grading,
+        bus=bus,
+        paused_message=TOY_PAUSED_MESSAGE,
+        never_remembered=("add_note",),
+    )
+    assert server.asks_the_human == ()
+    assert server.grading == real.grading
+    assert server.tool_table()["add_note"].write is True
+    assert server.host_tool_table()["add_note"].write is True
+    assert "mcp__toy__add_note" not in server.pre_allowed
+    assert set(server.never_remembered) == {"add_note", "mcp__toy__add_note"}
+
+    grants = tmp_path / "permissions.toml"
+    original = 'allow_always_tools = ["add_note", "mcp__toy__add_note", "Write"]\n'
+    grants.write_text(original, encoding="utf-8")
+    events = []
+    broker = PermissionBroker(
+        events.append, permissions_path=grants, never_remembered=server.never_remembered,
+        no_viewer_grace=0,
+    )
+    assert (await broker.ask(broker_name, {"text": "first"}, None)).allow is False
+    assert (await broker.ask("Write", {}, None)).allow is True
+    assert events == []
+    broker.viewer_connected()
+    try:
+        first = asyncio.create_task(broker.ask(broker_name, {"text": "first"}, None))
+        await asyncio.sleep(0)
+        card = events[-1]
+        assert isinstance(card, PermissionRequest)
+        assert card.rememberable is False
+        await broker.decide(card.request_id, "allow_always")
+        decision = await first
+        assert decision.allow is True
+        assert decision.remember_tool is None
+        assert grants.read_text(encoding="utf-8") == original
+
+        second = asyncio.create_task(broker.ask(broker_name, {"text": "second"}, None))
+        await asyncio.sleep(0)
+        fresh = events[-1]
+        assert isinstance(fresh, PermissionRequest)
+        assert fresh.request_id != card.request_id
+        assert fresh.rememberable is False
+        await broker.decide(fresh.request_id, "deny")
+        assert (await second).allow is False
+        broker.viewer_disconnected()
+        assert (await broker.ask(broker_name, {"text": "third"}, None)).allow is False
+
+        bus.paused = True
+        result = await server.tool_table()["add_note"].handler({"text": "paused"})
+        assert result["is_error"] is True
+        assert text_of(result) == TOY_PAUSED_MESSAGE
+        assert json.loads((project / NOTES_FILE).read_text(encoding="utf-8")) == ["first"]
+    finally:
+        broker.shutdown()
+
+
+async def test_nonrememberable_names_must_be_registered_product_tools(project):
+    real = build_toy_tools(FakeBus(), project)
+    with pytest.raises(ValueError, match="never_remembered names are not tools: absent"):
+        ToolServer(
+            list(real.tools), grading=real.grading, bus=FakeBus(),
+            paused_message=TOY_PAUSED_MESSAGE, never_remembered=("absent",),
+        )
+
+
 async def test_every_view_class_tool_is_pre_allowed_and_gated(project):
     """The decision that separates the two derived sets: these prompt for
     nothing, because the human is watching the screen they change, and the
