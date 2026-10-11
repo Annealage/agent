@@ -401,6 +401,10 @@ class OmpSession:
         self._running = False
         self._settling_turn: Optional[int] = None
         self._input_queue = deque()
+        self._automation_completion = None
+        self._automation_attempt_id = None
+        self._automation_context = None
+        self._automation_interrupted = False
         self._next_input_turn = self._turn
         self._active_input_id: Optional[str] = None
         # end_turn_after_tool's tool call ids, read on the reader thread once
@@ -501,6 +505,59 @@ class OmpSession:
             return "input queue is full; wait for a queued turn to finish"
         return None
 
+    def automation_metadata(self) -> dict:
+        return {
+            "inflight": self._automation_attempt_id is not None,
+            "attempt_id": self._automation_attempt_id,
+            **(self.resolved_runtime or {}),
+        }
+
+    async def submit_automated_turn(
+        self, blocks: list, *, attempt_id: str, on_admitted,
+        viewer=None, dispatch_context_factory=None,
+    ) -> dict:
+        """Submit one scope-bound turn and await its real terminal boundary."""
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ValueError("attempt_id must be a non-empty string")
+        if not callable(on_admitted):
+            raise ValueError("on_admitted must be callable")
+        if (self._client is None or self._status != AGENT_READY or self._closing
+                or self._running or self._input_queue
+                or self._automation_attempt_id is not None):
+            raise RuntimeError("OMP session is not idle for automated work")
+        if self._broker is not None and self._broker.pending_requests():
+            raise RuntimeError("human permission cards are pending")
+        from contextlib import nullcontext
+        from contextvars import copy_context
+
+        completion = asyncio.get_running_loop().create_future()
+        self._automation_attempt_id = attempt_id
+        self._automation_completion = completion
+        self._automation_interrupted = False
+        context = dispatch_context_factory() if dispatch_context_factory else nullcontext()
+        try:
+            with context:
+                self._automation_context = copy_context()
+                on_admitted()
+                await self.submit_turn(blocks, viewer=viewer)
+                terminal = await asyncio.shield(completion)
+                return {"attempt_id": attempt_id, "actual_cost_usd": terminal.cost_usd}
+        except BaseException:
+            try:
+                await asyncio.wait_for(self.interrupt(), timeout=5)
+                await asyncio.wait_for(asyncio.shield(completion), timeout=5)
+            except BaseException:
+                self._set_status(AGENT_UNAVAILABLE)
+            raise
+        finally:
+            # An unavailable session can still receive callbacks from a live
+            # native process. Keep their expired generation attached so host
+            # mutation guards reject them instead of treating them as manual.
+            if completion.done() and not completion.cancelled() and completion.exception() is None:
+                self._automation_context = None
+                self._automation_completion = None
+                self._automation_attempt_id = None
+
     async def submit_turn(self, blocks: list, viewer: Optional[str] = None) -> None:
         """Queue human inputs until the current backend turn reaches a boundary."""
         if self._client is None or self._status != AGENT_READY:
@@ -534,9 +591,16 @@ class OmpSession:
                 None, turn_images.expand_turn_blocks, blocks, self.cwd
             )
             message, images = _to_omp_prompt(expanded)
+            if self._automation_attempt_id is not None and (
+                self._automation_interrupted or self._closing
+            ):
+                raise RuntimeError("OMP automated prompt was stopped before submission; not sent")
             await self._run_blocking(self._client.prompt, message, images=images)
             self._emit(InputState(input_id, turn, "provider_ack"))
         except Exception as exc:
+            if self._automation_attempt_id is not None:
+                self._set_status(AGENT_UNAVAILABLE)
+                raise
             if _process_gone(exc):
                 self._fail(exc, viewer=viewer)
             else:
@@ -627,6 +691,8 @@ class OmpSession:
         on ``abort`` first would hang until the pending decision resolves on
         its own.
         """
+        if self._automation_attempt_id is not None:
+            self._automation_interrupted = True
         if self._client is None:
             return
         self._settle_queued_inputs("turn interrupted before provider submission")
@@ -827,27 +893,6 @@ class OmpSession:
             # A session that cannot read this still works; what it costs is
             # the hello frame's session id and a later -c resuming it.
             sys.stderr.write("warning: could not read the omp session state: %r\n" % (exc,))
-        admission = getattr(self, "runtime_policy", None)
-        if isinstance(admission, dict):
-            selected = admission["selected"]
-            actual = self.resolved_runtime or {}
-            expected_model = selected["model"]
-            expected_provider = None
-            if not self._base_url and "/" in expected_model:
-                expected_provider, expected_model = expected_model.split("/", 1)
-            if (
-                actual.get("model") != expected_model
-                or (expected_provider is not None and actual.get("provider") != expected_provider)
-                or (selected["effort"] is not None and actual.get("effort") != selected["effort"])
-            ):
-                try:
-                    await self._run_blocking(self._client.stop)
-                except Exception as exc:
-                    sys.stderr.write("warning: agent client did not close cleanly: %r\n" % (exc,))
-                self._client = None
-                self._discard_agent_dir()
-                self._fail(ValueError("OMP runtime does not match the admitted model/effort policy; no substitution is permitted"))
-                return
         self._usage = await self._read_usage()
         # A resumed conversation's figures are known before any turn; a new
         # one has used nothing yet, which the first turn's end reports.
@@ -1050,7 +1095,15 @@ class OmpSession:
                         raise RuntimeError(decision.message)
                 return await handler(dict(params))
 
-            result = asyncio.run_coroutine_threadsafe(run(), self._loop).result()
+            captured = self._automation_context
+            if self._automation_attempt_id is not None and captured is None:
+                raise RuntimeError("automated callback has no captured authority scope")
+            future = (
+                captured.copy().run(asyncio.run_coroutine_threadsafe, run(), self._loop)
+                if captured is not None
+                else asyncio.run_coroutine_threadsafe(run(), self._loop)
+            )
+            result = future.result()
             if result.get("is_error"):
                 raise RuntimeError(_content_to_text(result.get("content")))
             return {"content": result.get("content") or [], "details": {}}
@@ -1472,6 +1525,12 @@ class OmpSession:
         )
 
     def _emit(self, event) -> None:
+        completion = self._automation_completion
+        if isinstance(event, TurnEnd) and completion is not None and not completion.done():
+            if event.stop_reason in {"backend_exited", "rejected"}:
+                completion.set_exception(RuntimeError("automated turn outcome is unknown"))
+            else:
+                completion.set_result(event)
         try:
             self._on_event(event)
         except Exception as exc:

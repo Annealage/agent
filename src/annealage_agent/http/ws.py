@@ -720,10 +720,10 @@ async def _submit_turn_locked(ws, conn, registry, event_log, frame, session, bus
     client_id = frame.get("client_id")
     refusal_reader = getattr(bus, "manual_turn_refusal", None) if bus is not None else None
     blocked_reason = refusal_reader() if callable(refusal_reader) else None
-    budget_reader = getattr(session, "root_budget_metadata", None)
-    if blocked_reason is None and callable(budget_reader):
-        budget = budget_reader()
-        if isinstance(budget, dict) and budget.get("inflight") is True:
+    automation_reader = getattr(session, "automation_metadata", None)
+    if blocked_reason is None and callable(automation_reader):
+        automation = automation_reader()
+        if isinstance(automation, dict) and automation.get("inflight") is True:
             blocked_reason = "Automatic continuation is active; pause it or wait before sending a message."
     admission_reader = getattr(session, "turn_refusal", None)
     if blocked_reason is None and callable(admission_reader):

@@ -391,8 +391,8 @@ def _check_arguments(
         raise ValueError("tools must be a ToolSet, not %r" % (tools,))
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("prompt must be a non-empty string")
-    if not isinstance(model, str) or not model.strip():
-        raise ValueError("model must be a non-empty string: a headless run has no default")
+    if model is not None and (not isinstance(model, str) or not model.strip()):
+        raise ValueError("model must be None or a non-empty string")
     if max_budget_usd is not None:
         if (backend != "claude" or isinstance(max_budget_usd, bool)
                 or not isinstance(max_budget_usd, (int, float))
@@ -588,8 +588,8 @@ async def run_prompt(
     """Run ``prompt`` as one turn of a fresh agent session with ``tools``, and
     return its ``RunResult``. See the module docstring.
 
-    ``backend`` is ``"omp"`` or ``"claude"``; ``model`` is required (omp's
-    ``provider/model``, or a Claude model name). ``cwd`` is an existing
+    ``backend`` is ``"omp"`` or ``"claude"``; ``model`` optionally names omp's
+    ``provider/model`` or a Claude model; ``None`` uses the backend default. ``cwd`` is an existing
     directory, the caller's scratch space, used only as the backend's working
     directory. ``timeout`` is seconds for the whole run, start included: when it
     passes the session is closed and the result is ``error="timeout"``.
@@ -606,8 +606,7 @@ async def run_prompt(
     ``max_budget_usd`` is optional and Claude-only. When provided it is passed
     unchanged to the SDK's native query budget option, which can stop a query
     at its reported USD budget; it is not an invoice or exact-billing guarantee.
-    OMP has no corresponding native request/run cap, so a bounded caller must
-    refuse that backend before starting it.
+    OMP has no corresponding native request/run cap. Usage is observational.
     ``native_max_turns`` is optional and Claude-only. When set, the installed
     SDK's native ``max_turns`` option is consumed; this counts native model turns,
     not transport retries or invoices. ``RunResult`` exposes the configured cap,

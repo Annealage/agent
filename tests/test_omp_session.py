@@ -314,6 +314,129 @@ async def _started_session(*, viewer_count=1, tool_table=None, client_class=None
     return session, holder["fake"], recorder, broker
 
 
+@pytest.mark.asyncio
+async def test_automated_turn_completes_with_unknown_cost_and_scoped_callbacks():
+    from contextlib import contextmanager
+    from contextvars import ContextVar
+
+    authority = ContextVar("test_automation_authority", default=None)
+    seen = []
+
+    @contextmanager
+    def dispatch_context():
+        token = authority.set("grant")
+        try:
+            yield
+        finally:
+            authority.reset(token)
+
+    async def inspect_authority(_args):
+        seen.append(authority.get())
+        return {"content": [{"type": "text", "text": "observed"}]}
+
+    table = {
+        "inspect_authority": ToolSpec(
+            schema={"type": "object", "properties": {}},
+            description="observe callback context", handler=inspect_authority, write=False,
+        )
+    }
+    session, fake, recorder, broker = await _started_session(
+        model=None, base_url=None, tool_table=table,
+    )
+    fake.cost = None
+    admitted = asyncio.Event()
+    execution = asyncio.create_task(session.submit_automated_turn(
+        _text("continue"), attempt_id="root-attempt", on_admitted=admitted.set,
+        dispatch_context_factory=dispatch_context,
+    ))
+    try:
+        await asyncio.wait_for(admitted.wait(), 2)
+        while not fake.prompt_calls:
+            await asyncio.sleep(0)
+        assert session.automation_metadata()["inflight"]
+        await asyncio.get_running_loop().run_in_executor(
+            None, fake.tool("inspect_authority").execute, {}, SimpleNamespace(tool_call_id="read"),
+        )
+        assert seen == ["grant"]
+        fake.push_agent_end()
+        result = await asyncio.wait_for(execution, 2)
+        assert result == {"attempt_id": "root-attempt", "actual_cost_usd": None}
+        assert not session.automation_metadata()["inflight"]
+        assert authority.get() is None
+    finally:
+        if not execution.done():
+            execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_unsettled_automated_abort_keeps_expired_scope_on_late_write(monkeypatch):
+    from contextlib import contextmanager
+    from contextvars import ContextVar
+
+    authority = ContextVar("late_automation_authority", default=None)
+    active = set()
+    writes = []
+
+    @contextmanager
+    def dispatch_context():
+        active.add("generation-1")
+        token = authority.set("generation-1")
+        try:
+            yield
+        finally:
+            active.remove("generation-1")
+            authority.reset(token)
+
+    async def write(_args):
+        captured = authority.get()
+        if captured is not None and captured not in active:
+            raise RuntimeError("root automation attempt has ended; mutation refused")
+        writes.append("stale-write")
+        return {"content": [{"type": "text", "text": "written"}]}
+
+    table = {
+        "late_write": ToolSpec(
+            schema={"type": "object", "properties": {}},
+            description="scoped mutation", handler=write, write=True,
+        )
+    }
+    session, fake, recorder, broker = await _started_session(
+        model=None, base_url=None, tool_table=table, broker=None,
+    )
+
+    async def timed_out_interrupt():
+        raise asyncio.TimeoutError("native abort did not settle")
+
+    monkeypatch.setattr(session, "interrupt", timed_out_interrupt)
+    admitted = asyncio.Event()
+    execution = asyncio.create_task(session.submit_automated_turn(
+        _text("continue"), attempt_id="interrupted-attempt", on_admitted=admitted.set,
+        dispatch_context_factory=dispatch_context,
+    ))
+    try:
+        await asyncio.wait_for(admitted.wait(), 2)
+        while not fake.prompt_calls:
+            await asyncio.sleep(0)
+        execution.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+        assert session.agent_status() == AGENT_UNAVAILABLE
+        assert not fake.stopped
+        assert session.automation_metadata()["attempt_id"] == "interrupted-attempt"
+        with pytest.raises(RuntimeError, match="attempt has ended"):
+            await asyncio.get_running_loop().run_in_executor(
+                None, fake.tool("late_write").execute, {}, SimpleNamespace(tool_call_id="late"),
+            )
+        assert writes == []
+    finally:
+        if not execution.done():
+            execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
+        await session.close()
+
+
 # ---------------------------------------------------------------------------
 # startup: custom-provider config generation and the no-builtin-tools launch
 # ---------------------------------------------------------------------------
@@ -2442,39 +2565,37 @@ async def test_backend_logs_of_a_running_omp_are_its_own_log_and_conversation(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("actual_model,actual_effort,ready", [
-    ("selected", "high", True),
-    ("substituted", "high", False),
-    ("selected", "low", False),
-    (None, None, False),
+@pytest.mark.parametrize("actual_model,actual_effort", [
+    ("selected", "high"),
+    ("substituted", "high"),
+    ("selected", "low"),
+    (None, None),
 ])
-async def test_operator_admission_refuses_omp_model_or_effort_substitution(
-    tmp_path, actual_model, actual_effort, ready
+async def test_operator_model_and_effort_metadata_are_observational(
+    tmp_path, actual_model, actual_effort
 ):
     clients = []
 
     def factory(**kwargs):
         client = FakeRpcClient(**kwargs)
-        client.model = SimpleNamespace(id=actual_model, provider="provider")
+        client.model = SimpleNamespace(id=actual_model,
+                                       provider="provider" if actual_model is not None else None)
         client.thinking_level = actual_effort
         clients.append(client)
         return client
 
     recorder = EventRecorder()
-    session = OmpSession(recorder, cwd=tmp_path, session_id="policy",
+    session = OmpSession(recorder, cwd=tmp_path, session_id="startup",
                          model="provider/selected", thinking="high",
                          client_factory=factory)
-    session.runtime_policy = {"selected": {"backend": "omp",
-                                          "model": "provider/selected", "effort": "high"}}
     try:
         await session.start()
-        assert (session.agent_status() == AGENT_READY) is ready
+        assert session.agent_status() == AGENT_READY
         assert clients[0].prompt_calls == []
-        assert clients[0].stopped is not ready
+        assert not clients[0].stopped
         assert ("--thinking", "high") == tuple(clients[0].kwargs["extra_args"])[-2:]
-        if not ready:
-            assert any(isinstance(event, AgentError) and "no substitution" in event.stderr
-                       for event in recorder.all)
+        assert (session.resolved_runtime or {}).get("model") == actual_model
+        assert (session.resolved_runtime or {}).get("effort") == actual_effort
     finally:
         await session.close()
 

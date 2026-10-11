@@ -241,31 +241,6 @@ def set_omp_session_file(project_dir, sid: str, session_file: str) -> None:
     _write_json_atomic(path, meta)
 
 
-def get_runtime_policy(project_dir, sid: str) -> Optional[dict]:
-    """Read host-admitted runtime settings; absence is not historical evidence."""
-    if get_session_info(project_dir, sid) is None:
-        raise ValueError("Cannot read runtime policy for an unknown session")
-    meta = _read_json(meta_path(project_dir, sid))
-    record = meta.get("runtime_policy") if isinstance(meta, dict) else None
-    if record is not None and not isinstance(record, dict):
-        raise ValueError("Stored runtime policy must be an object")
-    return record
-
-
-def set_runtime_policy(project_dir, sid: str, record: dict) -> None:
-    """Freeze the first host admission in the existing session metadata."""
-    if get_session_info(project_dir, sid) is None:
-        raise ValueError("Cannot admit runtime policy for an unknown session")
-    path = meta_path(project_dir, sid)
-    meta = _read_json(path)
-    previous = meta.get("runtime_policy")
-    if previous is not None and previous != record:
-        raise ValueError("Session runtime policy is already frozen")
-    if previous is None:
-        meta["runtime_policy"] = record
-        _write_json_atomic(path, meta)
-
-
 def record_first_user_text(project_dir, sid: str, text: str) -> None:
     """Record a snippet of the first inbound turn, once, for ``-r``'s
     listing. A call after the first is a no-op: the field exists to answer

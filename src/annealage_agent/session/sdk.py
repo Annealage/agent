@@ -362,121 +362,71 @@ class SdkSession:
         self._sandbox_missing = missing_sandbox_dependencies() if self._sandbox_requested else ()
         self._sandbox_child_reported = False
         self._viewers_seen = 0
-        self._session_budget_cap_usd = max_budget_usd
         self._submission_lock = asyncio.Lock()
         self._active_turn: Optional[asyncio.Future] = None
         self._last_turn_cost: Optional[float] = None
-        self._root_budget_reservation_id: Optional[str] = None
-        self._root_budget_reserved_usd: Optional[float] = None
-        self._root_budget_active = False
+        self._automation_attempt_id: Optional[str] = None
+        self._automation_active = False
         self._native_termination_outcome: Optional[str] = None
         fields = getattr(ClaudeAgentOptions, "__dataclass_fields__", {})
-        self._native_budget_supported = "max_budget_usd" in fields
         self._native_turns_supported = "max_turns" in fields
         if native_max_turns is not None and not self._native_turns_supported:
             raise RuntimeError("installed Claude Agent SDK has no native max_turns option")
 
-    def root_budget_metadata(self) -> dict:
-        """Actual native budget/turn capability and current reservation state."""
-        runtime = self.resolved_runtime or {}
+    def automation_metadata(self) -> dict:
+        """Submission ownership and runtime provenance, never a spend gate."""
         return {
-            "native_budget_supported": self._native_budget_supported,
-            "native_turns_supported": self._native_turns_supported,
-            "native_max_turns": self._native_max_turns,
-            "turn_semantics": "native model turns (not network retries or invoice count)",
-            "native_termination_outcome": self._native_termination_outcome,
-            "inflight": self._root_budget_active,
-            "inflight_reserved_usd": (
-                self._root_budget_reserved_usd if self._root_budget_active else None
-            ),
-            "session_cap_usd": self._session_budget_cap_usd,
-            "reservation_id": (
-                self._root_budget_reservation_id if self._root_budget_active else None
-            ),
-            "backend": runtime.get("backend", "claude"),
-            "model": runtime.get("model"),
+            "inflight": self._automation_active,
+            "attempt_id": self._automation_attempt_id,
+            **(self.resolved_runtime or {}),
         }
 
-    async def submit_bounded_turn(
+    async def submit_automated_turn(
         self,
         blocks: list,
         *,
-        max_budget_usd: float,
         viewer: Optional[str] = None,
-        reservation_id: str,
+        attempt_id: str,
         on_admitted: Callable[[], None],
-        max_turns: Optional[int] = None,
         dispatch_context_factory=None,
     ) -> dict:
-        """Continue this SDK conversation for one native-budgeted root turn.
+        """Resume the conversation with scope bound to all native tool callbacks.
 
-        This deliberately disconnects and resumes the same SDK session because
-        ClaudeAgentOptions' budget is fixed at client initialization. No prompt
-        is sent until the resumed session id is verified. A send error is
-        ambiguous and is never retried.
+        Reconnection installs the dispatch context in the SDK pump. An
+        ambiguous send is never retried.
         """
-        if (
-            isinstance(max_budget_usd, bool)
-            or not isinstance(max_budget_usd, (int, float))
-            or not math.isfinite(max_budget_usd)
-            or max_budget_usd <= 0
-        ):
-            raise ValueError("max_budget_usd must be finite and positive")
-        if not isinstance(reservation_id, str) or not reservation_id:
-            raise ValueError("reservation_id must be a non-empty string")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ValueError("attempt_id must be a non-empty string")
         if not callable(on_admitted):
             raise ValueError("on_admitted must be callable")
-        max_turns = _positive_int(max_turns, "max_turns")
-        if not self._native_budget_supported:
-            raise RuntimeError("installed Claude Agent SDK has no native max_budget_usd option")
-        if max_turns is not None and not self._native_turns_supported:
-            raise RuntimeError("installed Claude Agent SDK has no native max_turns option")
         if dispatch_context_factory is not None and not callable(dispatch_context_factory):
             raise ValueError("dispatch_context_factory must be callable or None")
         async with self._submission_lock:
             if self._closing or self._client is None or self._status != AGENT_READY:
-                raise RuntimeError("SDK session is not ready for a bounded turn")
+                raise RuntimeError("SDK session is not ready for an automated turn")
             if self._active_turn is not None and not self._active_turn.done():
-                raise RuntimeError("cannot start a bounded turn while another turn is active")
+                raise RuntimeError("cannot start an automated turn while another turn is active")
             if self._broker is not None and self._broker.pending_requests():
                 raise RuntimeError(
-                    "cannot resume for a bounded turn while human permission cards are pending"
+                    "cannot resume for an automated turn while human permission cards are pending"
                 )
             expected_id = self.sdk_session_id
             if not expected_id:
-                raise RuntimeError("cannot bound a turn before the SDK session id is known")
-            configured_model = self._model
-            current_model = (self.resolved_runtime or {}).get("model")
-            if configured_model and current_model and configured_model != current_model:
-                raise RuntimeError(
-                    "configured model %r does not match observed SDK model %r"
-                    % (configured_model, current_model)
-                )
+                raise RuntimeError("cannot automate a turn before the SDK session id is known")
             previous_budget = self._max_budget_usd
             previous_turns = self._native_max_turns
-            effective_budget = (
-                min(float(max_budget_usd), previous_budget)
-                if previous_budget is not None
-                else float(max_budget_usd)
-            )
-            effective_turns = (
-                min(max_turns, previous_turns)
-                if max_turns and previous_turns
-                else (max_turns if max_turns is not None else previous_turns)
-            )
             submission_started = False
             completion = None
             detached = False
             dispatch_context = None
             context_entered = False
-            self._root_budget_active = True
-            self._root_budget_reservation_id = reservation_id
-            self._root_budget_reserved_usd = effective_budget
+            self._automation_active = True
+            self._automation_attempt_id = attempt_id
             interrupt_epoch = self._interrupt_epoch
             try:
                 if self._transport is not None:
                     raise RuntimeError(
-                        "bounded turns require the SDK-managed transport so a fresh native "
+                        "automated turns require the SDK-managed transport so a fresh native "
                         "client can resume the conversation"
                     )
                 on_admitted()
@@ -489,7 +439,7 @@ class SdkSession:
                 )
                 dispatch_context.__enter__()
                 context_entered = True
-                await self._reconnect_native(expected_id, effective_budget, effective_turns)
+                await self._reconnect_native(expected_id, None, None)
                 self._capture_native_process()
                 # The pump is active before query, and the active Future is
                 # installed before submission so an immediate Result is seen.
@@ -502,7 +452,7 @@ class SdkSession:
                 if self._closing or self._interrupt_epoch != interrupt_epoch:
                     completion.set_result(None)
                     self._emit(TurnEnd(turn=self._turn, stop_reason="not_sent", cost_usd=None))
-                    raise RuntimeError("SDK bounded prompt was stopped before submission; not sent")
+                    raise RuntimeError("SDK automated prompt was stopped before submission; not sent")
                 submission_started = True
                 try:
                     await self._client.query(
@@ -522,11 +472,9 @@ class SdkSession:
                     raise
                 return {
                     "actual_cost_usd": actual_cost,
-                    "reservation_id": reservation_id,
+                    "attempt_id": attempt_id,
                     "actual_num_turns": self.last_result_num_turns,
-                    "native_max_turns": effective_turns,
                     "turn_semantics": "native model turns",
-                    "native_turns_supported": self._native_turns_supported,
                 }
             finally:
                 if context_entered:
@@ -536,7 +484,7 @@ class SdkSession:
                     self._active_turn = None
                 # Restore the ordinary client only when no prompt was sent or
                 # the native result reached its terminal boundary. An
-                # ambiguous send is never retried or made unbounded.
+                # ambiguous send is never retried.
                 terminal = not submission_started or (completion is not None and completion.done())
                 try:
                     if (
@@ -551,9 +499,8 @@ class SdkSession:
                 except Exception as exc:
                     self._fail(exc, viewer=viewer)
                 if terminal:
-                    self._root_budget_active = False
-                    self._root_budget_reserved_usd = None
-                    self._root_budget_reservation_id = None
+                    self._automation_active = False
+                    self._automation_attempt_id = None
 
     async def _disconnect_native_client(self) -> None:
         """Disconnect the ordinary session before entering root automation scope."""
@@ -575,7 +522,7 @@ class SdkSession:
         self._pump_task = None
 
     async def _interrupt_and_settle(self, completion) -> None:
-        """Bound interrupt and result settlement; leave unresolved cost reserved."""
+        """Bound interrupt and terminal settlement; fence an unresolved outcome."""
         client = self._client
         if client is not None:
             try:
@@ -634,15 +581,9 @@ class SdkSession:
                 or {}
             )
             observed_id = info.get("session_id")
-            observed_model = info.get("model")
             if observed_id != expected_id:
                 raise RuntimeError(
                     "SDK resume returned session %r; expected %r" % (observed_id, expected_id)
-                )
-            if self._model and observed_model and observed_model != self._model:
-                raise RuntimeError(
-                    "configured model %r does not match resumed SDK model %r"
-                    % (self._model, observed_model)
                 )
         except BaseException:
             try:

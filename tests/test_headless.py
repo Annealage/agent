@@ -504,8 +504,8 @@ async def test_omp_request_timeout_is_rejected_for_claude(tmp_path):
     "overrides, message",
     [
         ({"backend": "gpt"}, "backend must be one of omp, claude"),
-        ({"model": ""}, "model must be a non-empty string"),
-        ({"model": None}, "model must be a non-empty string"),
+        ({"model": ""}, "model must be None or a non-empty string"),
+        ({"model": 3}, "model must be None or a non-empty string"),
         ({"timeout": 0}, "timeout must be"),
         ({"timeout": -3}, "timeout must be"),
         ({"timeout": None}, "timeout must be"),

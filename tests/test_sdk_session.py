@@ -382,25 +382,24 @@ async def test_options_wired_into_the_real_client():
 
 
 @pytest.mark.asyncio
-async def test_bounded_turn_rejects_custom_transport_before_disconnect():
+async def test_automated_turn_rejects_custom_transport_before_disconnect():
     session, transport, _recorder = await _started_session()
     session.sdk_session_id = "prior-session"
     try:
         with pytest.raises(RuntimeError, match="SDK-managed transport"):
-            await session.submit_bounded_turn(
+            await session.submit_automated_turn(
                 [{"type": "text", "text": "continue"}],
-                max_budget_usd=0.2,
-                reservation_id="reservation-1",
+                attempt_id="attempt-1",
                 on_admitted=lambda: None,
             )
         assert transport.connected and not transport.closed
-        assert session.root_budget_metadata()["inflight"] is False
+        assert session.automation_metadata()["inflight"] is False
     finally:
         await session.close()
 
 
 @pytest.mark.asyncio
-async def test_bounded_turn_resumes_same_session_with_native_budget_and_one_prompt(
+async def test_automated_turn_resumes_same_session_without_budget_and_one_prompt(
     monkeypatch, tmp_path
 ):
     original_grace = sdk_module._NATIVE_TERMINAL_TIMEOUT
@@ -424,7 +423,7 @@ async def test_bounded_turn_resumes_same_session_with_native_budget_and_one_prom
         async def query(self, prompt):
             async for message in prompt:
                 self.sent.append(message)
-            metadata_during_query.append(session.root_budget_metadata())
+            metadata_during_query.append(session.automation_metadata())
             # Normal execution must not use the post-cancellation settlement grace.
             monkeypatch.setattr(sdk_module, "_NATIVE_TERMINAL_TIMEOUT", 0)
             self.messages.put_nowait(
@@ -436,7 +435,7 @@ async def test_bounded_turn_resumes_same_session_with_native_budget_and_one_prom
                     num_turns=1,
                     session_id="prior-session",
                     stop_reason="end_turn",
-                    total_cost_usd=0.12,
+                    total_cost_usd=None,
                 )
             )
 
@@ -459,15 +458,16 @@ async def test_bounded_turn_resumes_same_session_with_native_budget_and_one_prom
     await session.start()
     session.sdk_session_id = "prior-session"
     try:
-        await session.submit_bounded_turn(
+        result = await session.submit_automated_turn(
             [{"type": "text", "text": "continue"}],
-            max_budget_usd=0.5,
-            reservation_id="root-1",
+            attempt_id="root-1",
             on_admitted=lambda: None,
         )
-        assert len(clients) == 3  # initial, budgeted resume, restored unbudgeted resume
+        assert result["attempt_id"] == "root-1" and result["actual_cost_usd"] is None
+        assert len(clients) == 3  # initial, context-bound resume, restored ordinary resume
         assert clients[1].options.resume == "prior-session"
-        assert clients[1].options.max_budget_usd == 0.5
+        assert clients[1].options.max_budget_usd is None
+        assert clients[1].options.max_turns is None
         assert clients[1].sent == [
             {
                 "type": "user",
@@ -476,7 +476,7 @@ async def test_bounded_turn_resumes_same_session_with_native_budget_and_one_prom
         ]
         assert clients[2].options.resume == "prior-session"
         assert clients[2].options.max_budget_usd is None
-        assert session.root_budget_metadata()["inflight"] is False
+        assert session.automation_metadata()["inflight"] is False
     finally:
         await session.close()
 
@@ -1979,7 +1979,7 @@ async def test_interrupt_during_image_expansion_is_not_sent_and_next_input_can_r
 
 
 @pytest.mark.asyncio
-async def test_interrupted_bounded_reconnect_never_sends_the_reserved_prompt(monkeypatch, tmp_path):
+async def test_interrupted_automated_reconnect_never_sends_the_prompt(monkeypatch, tmp_path):
     entered, release = asyncio.Event(), asyncio.Event()
     clients, events = [], []
 
@@ -1998,7 +1998,7 @@ async def test_interrupted_bounded_reconnect_never_sends_the_reserved_prompt(mon
             clients.append(self)
 
         async def connect(self):
-            if self.options.max_budget_usd is not None:
+            if self.options.resume == "held-native-cli" and not entered.is_set():
                 entered.set()
                 await release.wait()
 
@@ -2039,10 +2039,9 @@ async def test_interrupted_bounded_reconnect_never_sends_the_reserved_prompt(mon
     await session.start()
     session.sdk_session_id = "held-native-cli"
     sending = asyncio.create_task(
-        session.submit_bounded_turn(
+        session.submit_automated_turn(
             [{"type": "text", "text": "stopped before dispatch"}],
-            max_budget_usd=0.5,
-            reservation_id="interrupted-root",
+            attempt_id="interrupted-root",
             on_admitted=lambda: None,
         )
     )
