@@ -7,12 +7,11 @@ own rule matcher can take over for the rest of a running session; other
 backends have their own, different remembered-grant mechanisms and write
 their own adapter instead (see ``planning/roadmap.md``).
 
-A bug here means a tool ran that the human never approved, so every path
-through ``ask`` returns a ``Decision`` and nothing here ever raises out of
-``ask`` itself (fact 14 in ``docs/agent-chat-plan.md`` section 2a): a
-returned dict, or an uncaught exception, both surface to the model as an
-infrastructure error rather than a decision, which is worse than a denial
-with a clear reason.
+A bug here means a tool ran outside the selected execution policy, so every
+path through ``ask`` returns a ``Decision`` and nothing here raises out of
+``ask`` itself. Products may select automatic approval for their declared
+tools; by default writes still require human approval. A returned dict or
+uncaught exception surfaces as an infrastructure error rather than a decision.
 
 Calling contract, mirroring ``viewers.py``'s own documented pattern rather
 than inventing a second one:
@@ -187,6 +186,7 @@ class PermissionBroker:
         no_viewer_grace: float = DEFAULT_NO_VIEWER_GRACE,
         never_remembered=(),
         request_guard=None,
+        automatic_tools=None,
     ):
         # Beside the module-wide NEVER_REMEMBERED; see the comment there.
         self._never_remembered: FrozenSet[str] = frozenset(never_remembered)
@@ -201,6 +201,7 @@ class PermissionBroker:
         # has already elapsed.
         self._no_viewer_timer = None
         self._request_guard = request_guard
+        self._automatic_tools = automatic_tools
         self._shutdown = False
         self._next_id = 1
         # Every request id this broker gives out carries this, so a new
@@ -246,6 +247,14 @@ class PermissionBroker:
         backend with a per-tool timeout of its own (Codex) must outlast."""
         return self._timeout
 
+    def automatically_allows(self, tool_name: str) -> bool:
+        """Backend-selected included tools, never persisted as human grants.
+
+        The callable supplies the current declared tool names, not native shells.
+        No callback preserves the ordinary approval policy for other products.
+        """
+        return self._automatic_tools is not None and tool_name in self._automatic_tools()
+
     # -- can_use_tool itself ----------------------------------------------
 
     async def ask(
@@ -280,18 +289,22 @@ class PermissionBroker:
         ``action`` is set for a call the human started from the page rather
         than one the agent made (an upload action's label, ``uploads.py``),
         and ``by`` to the login of the human who started it. Such a call is
-        always asked: no standing grant for ``tool_name`` answers it, since
-        the grant was given to the agent and the card is how the human sees
-        what leaves the page, and no "always allow" is offered or kept for
-        it. Both reach the card on the ``PermissionRequest``.
+        normally always asked: a standing grant does not answer it, and no
+        "always allow" is offered or kept. Backend-selected automatic approval
+        also applies to these declared upload tools without a card.
 
-        Shutdown and no-viewer refusals happen before host authority is
-        captured. For a granted tool, its captured authority is revalidated
-        before the grant is returned; for a prompted tool, it is revalidated
-        immediately after the human decision and before the backend sees it.
+        A backend may automatically allow only its included tool names, including
+        upload actions, without a card or remembered grant. Shutdown still denies.
+        Otherwise host request guards and the ordinary viewer/card policy apply.
         """
         if self._shutdown:
             return Decision(allow=False, message=_deny_message(_DENY_SHUTDOWN_TEMPLATE))
+        try:
+            if self.automatically_allows(tool_name):
+                return Decision(allow=True)
+        except Exception as exc:
+            sys.stderr.write("warning: automatic tool policy failed for %r: %r\n" % (tool_name, exc))
+            return Decision(allow=False, message="the included tool policy could not be verified")
         if self._viewer_count == 0 and not (
             action is None
             and tool_name in self._granted_tools

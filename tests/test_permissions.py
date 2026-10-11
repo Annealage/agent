@@ -92,6 +92,52 @@ async def test_a_changed_authority_denies_a_delayed_allow():
     assert "authority changed" in decision.message
 
 
+async def test_automatic_included_tools_have_no_cards_or_persisted_human_grants(tmp_path):
+    path = tmp_path / "permissions.toml"
+    included = {"mcp__loom__export_pack", "ds-wiki__submit_datasheet",
+                "mcp__loom__resolve_comment"}
+    broker, events = _broker(
+        automatic_tools=lambda: included, permissions_path=path,
+        never_remembered=included,
+    )
+    for name in included:
+        result = await broker.ask(name, {}, None)
+        assert result.allow and result.remember_tool is None
+    result = await broker.ask(
+        "ds-wiki__submit_datasheet", {}, None, action="Submit to Datum", by="human"
+    )
+    assert result.allow and result.remember_tool is None
+    assert not path.exists()
+    assert events == []
+    assert broker.pending_requests() == []
+    assert not (await broker.ask("Bash", {}, None)).allow
+    assert not (await broker.ask("mcp__other-project__write_file", {}, None)).allow
+    included.add("mcp__datum__newly_reached_write")
+    assert (await broker.ask("mcp__datum__newly_reached_write", {}, None)).allow
+    broker.shutdown()
+    assert not (await broker.ask("mcp__loom__export_pack", {}, None)).allow
+    assert events == []
+
+
+async def test_default_policy_still_asks_for_included_write_tools():
+    broker, events = _broker()
+    assert not (await broker.ask("mcp__loom__export_pack", {}, None)).allow
+    broker.viewer_connected()
+    task, request = await _pending_request(broker, events, tool_name="mcp__loom__export_pack")
+    await broker.decide(request.request_id, "allow")
+    assert (await task).allow
+
+
+async def test_automatic_policy_failure_returns_a_denial_without_a_card():
+    def broken():
+        raise ValueError("policy unavailable")
+
+    broker, events = _broker(automatic_tools=broken)
+    result = await broker.ask("mcp__loom__export_pack", {}, None)
+    assert not result.allow and "could not be verified" in result.message
+    assert events == []
+
+
 def _assert_allow(result):
     assert isinstance(result, Decision)
     assert result.allow is True

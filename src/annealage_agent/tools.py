@@ -233,10 +233,11 @@ def asks_the_human(tool_def):
     with a request that says what it is about. So ``ToolServer`` treats it as
     read-grade whatever grade the product gave it: pre-allowed, never marked
     write in ``tool_table``, so no transport asks a second, less specific,
-    question first, and not pause-gated, since every call that changes
-    anything the human cares about asks them anyway. Its model-visible and
-    bare names are the server's ``never_remembered``: no "always allow" may
-    stand in for the question it asks.
+    question first. Under the default policy it is not pause-gated, since
+    every call that changes anything the human cares about asks them anyway;
+    automatic execution instead pause-gates it. Its model-visible and bare
+    names are the server's ``never_remembered``: no "always allow" may stand
+    in for the question it asks.
     """
     setattr(tool_def.handler, _ASKS_THE_HUMAN, True)
     return tool_def
@@ -277,7 +278,11 @@ def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None):
                 or operation not in bus.hosted_turn_ops
             ):
                 return fail("hosted operation is not granted for this tool call")
-        if gated and bus.paused:
+        automatically_gated = (
+            getattr(bus, "auto_approve_included_tools", False)
+            and getattr(tool_def.handler, _ASKS_THE_HUMAN, False)
+        )
+        if (gated or automatically_gated) and bus.paused:
             return fail(paused_message() if callable(paused_message) else paused_message)
         try:
             result = await tool_def.handler(args)
@@ -508,6 +513,25 @@ class ToolServer:
         and ``/mcp`` ask) and bare (as omp's host-tool gate does), for the
         session's ``PermissionBroker`` (``launch.py``)."""
         return tuple(namespaced(self.name, n) for n in self._never_remembered) + self._never_remembered
+
+    def included_permission_names(self):
+        """Declared tool and upload-target broker names; excludes native tools.
+
+        This is an execution policy input, not a change to read/write grading.
+        Keeping it live includes remotes reached after startup.
+        """
+        names = set(self.tool_table())
+        names.update(namespaced(self.name, name) for name in self.tool_table())
+        for server_name, table in self.remote_tables().items():
+            names.update(host_tool_name(server_name, name) for name in table)
+            names.update(namespaced(server_name, name) for name in table)
+        # Upload actions may deliberately target a declared remote operation
+        # that is not exposed to the model's tool table. They use this same
+        # broker, but their inputs still come only from the upload route.
+        for action in getattr(self._bus, "upload_actions", ()):
+            server_name, name = action.tool
+            names.add(namespaced(server_name, name))
+        return names
 
     @property
     def remote_instructions(self):

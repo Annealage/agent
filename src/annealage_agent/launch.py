@@ -99,6 +99,11 @@ def build_session(
         # server has none.
         never_remembered=getattr(bus.tools, "never_remembered", ()) if bus.tools is not None else (),
         request_guard=getattr(bus.tools, "request_guard", None) if bus.tools is not None else None,
+        automatic_tools=(
+            bus.tools.included_permission_names
+            if getattr(bus, "auto_approve_included_tools", False) and bus.tools is not None
+            else None
+        ),
     )
     # app.py reads this back once build_session returns, to gate a
     # write-class tool call arriving through /mcp with the exact same

@@ -252,6 +252,7 @@ def create_app(
     state_sink=None,
     usage_sink=None,
     builtin_tools=None,
+    auto_approve_included_tools=False,
 ):
     """Build a Microdot app serving ``serve_dir``, routes registered, not started.
 
@@ -337,6 +338,11 @@ def create_app(
     registered MCP tools. Callers use ``[]`` when the project must expose only
     its curated tool server, including after a session reopen.
 
+    ``auto_approve_included_tools`` is a backend-selected execution policy:
+    declared product/remote tools and upload actions run without approval cards.
+    It defaults off, preserves classification and authentication, never grants
+    native tools or persists human approval, and survives session reopen.
+
     ``url_prefix`` is the path this app is mounted under in a front door
     (``"/p/demo"``: no trailing slash; ``""``, the default, is an app served
     at the root). It goes into every address this app gives out itself:
@@ -396,8 +402,8 @@ def create_app(
 
     ``upload_actions`` are ``uploads.UploadAction``s: what the human can do
     with a document they upload from the chat pane (submit a datasheet to a
-    remote MCP server, say), each call put in front of them as a permission
-    card and its result queued for the agent (``uploads.py``). Each names a
+    remote MCP server, say), each call using the selected approval policy and
+    its result queued for the agent (``uploads.py``). Each names a
     remote the product's tool server declares, which is checked here. An app
     with no agent (viewer-only, and not ``external_agents``) offers none.
 
@@ -643,6 +649,8 @@ def create_app(
     bus.review_store = review_store
     bus.settings = settings
     bus.builtin_tools = builtin_tools
+    bus.auto_approve_included_tools = auto_approve_included_tools
+    bus.upload_actions = upload_actions
     bus.hosted_mode = hosted_mode
     bus.hosted_tool_ops = dict(hosted_tool_ops or {})
     bus.hosted_turn_ops = ()
@@ -752,6 +760,9 @@ def create_app(
                 timeout=float(settings["approval_timeout"]),
                 never_remembered=tools.never_remembered,
                 request_guard=tools.request_guard,
+                automatic_tools=(
+                    tools.included_permission_names if auto_approve_included_tools else None
+                ),
             )
             session = ExternalAgentSession(publish, bus.broker)
         return session
@@ -835,6 +846,8 @@ def create_app(
             broker = bus.broker
             if broker is None:
                 return "no agent session is running here to put this in front of you", 409
+            if auto_approve_included_tools and bus.paused:
+                return "the view is paused; resume it before sending a document", 409
             try:
                 args = uploads.call_args(action, upload, human, source_url=source_url)
             except ValueError as exc:
@@ -855,6 +868,7 @@ def create_app(
                     documents=documents,
                     remote_action_context=bus.remote_action_context,
                     action_store=bus.remote_action_store,
+                    dispatch_allowed=(lambda: not bus.paused) if auto_approve_included_tools else None,
                 )
             )
             running_actions.add(task)

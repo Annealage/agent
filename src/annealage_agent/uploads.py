@@ -342,8 +342,9 @@ def _current_context(callback):
 async def run(
     action, upload, human, args, *, broker, server, publish, queue_note, documents,
     action_store=None, remote_action_context=None,
+    dispatch_allowed=None,
 ):
-    """Ask the human, then make the call, recording upload writes durably."""
+    """Apply the broker policy, then call, recording upload writes durably."""
     # Imported here: the tool layer and the MCP client come with the SDK,
     # which only an app with an agent (the only kind with actions) loads.
     from . import remote
@@ -377,6 +378,9 @@ async def run(
     if not decision.allow:
         ended(ACTION_DENIED, decision.message or "not approved")
         return
+    if dispatch_allowed is not None and not dispatch_allowed():
+        ended(ACTION_DENIED, "the view is paused; nothing was sent")
+        return
     loop = asyncio.get_running_loop()
     try:
         data = await loop.run_in_executor(None, files.read_document, upload.path, upload.bytes)
@@ -397,9 +401,21 @@ async def run(
     }
     try:
         current_context = _current_context(remote_action_context)
+        if dispatch_allowed is not None and not dispatch_allowed():
+            ended(ACTION_DENIED, "the view is paused; nothing was sent")
+            return
+        if getattr(broker, "automatically_allows", lambda _tool: False)(tool):
+            decision = await broker.ask(tool, arguments, None, action=action.label, by=human.login)
+            if not decision.allow:
+                ended(ACTION_DENIED, decision.message or "not permitted")
+                return
         result = await remote.call(
             server, tool_name, arguments, action_store=action_store, source="upload:" + action.name,
-            approval=human.login, context=current_context, expected_context=approved_context,
+            approval=(
+                None if getattr(broker, "automatically_allows", lambda _tool: False)(tool)
+                else human.login
+            ),
+            context=current_context, expected_context=approved_context,
             context_callback=remote_action_context,
         )
     except Exception as exc:

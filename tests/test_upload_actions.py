@@ -344,3 +344,30 @@ async def test_authority_context_change_while_upload_card_is_open_prevents_dispa
     assert ended["outcome"] == "failed"
     assert "authority context changed" in ended["text"]
     assert "submit" not in remote.calls
+
+
+async def test_backend_selected_automatic_upload_has_no_card_or_viewer(served_dir, remote):
+    app = create_toy_app(
+        served_dir, token=TOKEN, agent_token=AGENT_TOKEN,
+        session_id=sessions.create_session(served_dir), external_agents=True,
+        auto_approve_included_tools=True, upload_actions=(DATUM,),
+    )
+    app.events = []
+    app.agent_event_log.observers.append(app.events.append)
+    assert app.agent_bus.broker.automatically_allows(TOOL)
+    assert "submit" not in app.agent_tools.remote_tables()["datum"]
+    assert not app.agent_bus.broker.automatically_allows("Bash")
+    try:
+        client = make_test_client(app)
+        response = await _upload(client)
+        assert response.status_code == 200
+        result = await _start(client, response.json["upload"])
+        assert result.status_code == 202
+        ended = await _next(app, "upload_action")
+        assert ended["outcome"] == "done"
+        assert "submit" in remote.calls
+        assert not any(event["kind"] == "permission_request" for event in app.events)
+        assert app.agent_bus.broker.pending_requests() == []
+    finally:
+        await app.agent_stop()
+        app.agent_event_log.close()
