@@ -612,7 +612,7 @@ export function initChat({
           const btn = document.createElement("button");
           btn.type = "button";
           btn.textContent = action.label;
-          btn.addEventListener("click", () => startUploadAction(doc.id, action.name));
+          btn.addEventListener("click", () => startUploadAction(doc.id, action.name, action.source_url_label));
           rec.actionsEl.appendChild(btn);
         });
       }

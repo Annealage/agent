@@ -494,15 +494,9 @@ def register_chat_routes(
 
 
 def register_upload_action_route(app, *, auth, actions, documents, begin):
-    """Register ``POST /upload/action``, body ``{"upload": <id>, "action":
-    <name>}``: the human starting one of ``actions`` (``uploads.UploadAction``)
-    on a document they uploaded to ``documents`` (the app's
-    ``uploads.Documents``); and ``DELETE /upload/<id>``, the human removing
-    one they will not use. Gated by ``auth`` like every browser request,
-    ``Origin`` included, so the agent token never opens either. ``begin(action,
-    upload, human)`` is the app's: it returns None once the action is under
-    way (its card raised, its end published as ``upload_action``), or
-    ``(message, status)`` refusing it. Answers 202 once begun."""
+    """Register the browser-only upload action route. Actions that declare
+    ``source_url_arg`` also require a caller-supplied ``source_url``; the
+    app validates it before raising the permission card."""
     by_name = {action.name: action for action in actions}
 
     @app.post("/upload/action")
@@ -513,11 +507,17 @@ def register_upload_action_route(app, *, auth, actions, documents, begin):
         data, error = await read_json_body(req)
         if error is not None:
             return error
-        if not isinstance(data, dict) or set(data) != {"upload", "action"}:
-            return {"ok": False, "error": 'body must be {"upload": ..., "action": ...}'}, 400
-        action = by_name.get(data["action"]) if isinstance(data["action"], str) else None
+        if not isinstance(data, dict):
+            return {"ok": False, "error": "request body must be an object"}, 400
+        action_name = data.get("action")
+        action = by_name.get(action_name) if isinstance(action_name, str) else None
         if action is None:
-            return {"ok": False, "error": "no upload action %r" % (data["action"],)}, 404
+            return {"ok": False, "error": "no upload action %r" % (action_name,)}, 404
+        expected = {"upload", "action"}
+        if action.source_url_arg is not None:
+            expected.add("source_url")
+        if set(data) != expected:
+            return {"ok": False, "error": "request body does not match this upload action"}, 400
         upload_id = data["upload"]
         loop = asyncio.get_running_loop()
         upload = await loop.run_in_executor(None, documents.find, upload_id)
@@ -528,7 +528,7 @@ def register_upload_action_route(app, *, auth, actions, documents, begin):
                 "ok": False,
                 "error": "%s takes %s, not %s" % (action.label, action.accepts, upload.media_type),
             }, 400
-        refused = await begin(action, upload, human)
+        refused = await begin(action, upload, human, data.get("source_url"))
         if refused is not None:
             message, status = refused
             return {"ok": False, "error": message}, status

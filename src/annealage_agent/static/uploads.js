@@ -138,17 +138,31 @@ export async function discardDocument(id) {
  * the call in front of the human as a permission card, and its end arrives as
  * an `upload_action` event.
  */
-export async function startUploadAction(id, action) {
+export async function startUploadAction(id, action, sourceUrlLabel) {
   const doc = store.getState().chat.documents.find((d) => d.id === id);
   if (!doc || !doc.upload) return;
   const label = (doc.actions.find((a) => a.name === action) || {}).label || action;
+  let source_url;
+  if (sourceUrlLabel) {
+    source_url = window.prompt(sourceUrlLabel);
+    if (source_url === null) return;
+    let parsed;
+    try { parsed = new URL(source_url); } catch (err) {}
+    if (source_url.length > 2048 || /\s/.test(source_url)
+        || !parsed || !["http:", "https:"].includes(parsed.protocol) || !parsed.hostname) {
+      toast("Enter the original absolute HTTP(S) source URL (max 2048 characters).", false);
+      return;
+    }
+  }
   let res;
   let data = null;
   try {
+    const body = { upload: doc.upload, action };
+    if (sourceUrlLabel) body.source_url = source_url;
     res = await fetch(withToken(appUrl("upload/action")), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ upload: doc.upload, action }),
+      body: JSON.stringify(body),
     });
     data = await res.json();
   } catch (err) {

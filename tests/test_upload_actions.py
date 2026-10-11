@@ -31,11 +31,14 @@ TOKEN = "upload-actions-browser-token"
 AGENT_TOKEN = "upload-actions-agent-token"
 PDF = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n%%EOF\n"
 TOOL = "mcp__datum__submit"
+SOURCE_URL = "https://manufacturer.example/LM2596.pdf"
 DATUM = UploadAction(
     name="datum",
     label="Submit to Datum",
     tool=("datum", "submit"),
     build_args=lambda upload, human: {"project_tag": "psu", "doc_type_hint": "datasheet"},
+    source_url_arg="original_url",
+    source_url_label="Original HTTP(S) source URL (max 2048 characters)",
 )
 
 
@@ -80,11 +83,14 @@ async def _upload(client, body=PDF, token=TOKEN, name="LM2596 datasheet.pdf"):
     )
 
 
-async def _start(client, upload, token=TOKEN, headers=None):
+async def _start(client, upload, token=TOKEN, headers=None, source_url=SOURCE_URL):
+    body = {"upload": upload, "action": "datum"}
+    if source_url is not None:
+        body["source_url"] = source_url
     return await client.post(
         "/upload/action?t=%s" % token,
         headers={"Content-Type": "application/json", **(headers or {})},
-        body=json.dumps({"upload": upload, "action": "datum"}).encode(),
+        body=json.dumps(body).encode(),
     )
 
 
@@ -110,12 +116,18 @@ async def test_an_approved_action_sends_the_bytes_from_the_server_and_tells_the_
         "application/pdf",
     )
     assert upload["actions"] == [
-        {"name": "datum", "label": "Submit to Datum", "accepts": "application/pdf"}
+        {"name": "datum", "label": "Submit to Datum", "accepts": "application/pdf",
+         "source_url_label": "Original HTTP(S) source URL (max 2048 characters)"}
     ]
     # Kept outside the served tree, and never served.
     kept = app.agent_documents.directory / upload["upload"]
     assert kept.read_bytes() == PDF
     assert (await client.get("/asset/%s" % upload["upload"])).status_code == 404
+
+    missing = await _start(client, upload["upload"], source_url=None)
+    invalid = await _start(client, upload["upload"], source_url="file:///tmp/part.pdf")
+    assert missing.status_code == invalid.status_code == 400
+    assert "submit" not in remote.calls
 
     started = await _start(client, upload["upload"])
     assert started.status_code == 202, started.json
@@ -127,6 +139,7 @@ async def test_an_approved_action_sends_the_bytes_from_the_server_and_tells_the_
     assert card["input"] == {
         "project_tag": "psu",
         "doc_type_hint": "datasheet",
+        "original_url": SOURCE_URL,
         "filename": "LM2596-datasheet.pdf",
         "content_base64": "(the file's %d bytes, read when you allow this)" % len(PDF),
     }
@@ -144,6 +157,7 @@ async def test_an_approved_action_sends_the_bytes_from_the_server_and_tells_the_
     assert called == {
         "project_tag": "psu",
         "doc_type_hint": "datasheet",
+        "original_url": SOURCE_URL,
         "filename": "LM2596-datasheet.pdf",
         "content_base64": base64.b64encode(PDF).decode(),
     }

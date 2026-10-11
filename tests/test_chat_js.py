@@ -174,6 +174,20 @@ chat.handleEvent({ kind: "upload_action", id: "ua_1", upload: "u-1", label: "Sub
   { replayed: false });
 const endedDoc = store.getState().chat.documents.find((d) => d.id === docId);
 out.documentAfterAction = { state: endedDoc.state, message: endedDoc.message };
+// A Datum upload asks for an explicit source URL and sends it with the action.
+const { startUploadAction } = await import(pathToFileURL(dir + "/uploads.js").href);
+const sourceUrl = "https://manufacturer.example/sheet.pdf";
+let actionRequest = null;
+globalThis.prompt = (label) => { out.sourceUrlPrompt = label; return sourceUrl; };
+globalThis.fetch = async (url, options) => {
+  actionRequest = { url, body: JSON.parse(options.body) };
+  return { ok: true, json: async () => ({ ok: true }) };
+};
+const sourceDocId = store.reserveChatDocument("sheet.pdf");
+store.updateChatDocument(sourceDocId, { state: "done", upload: "u-2", name: "sheet.pdf",
+  actions: [{ name: "datum", label: "Submit to Datum", source_url_label: "Original URL" }] });
+await startUploadAction(sourceDocId, "datum", "Original URL");
+out.uploadActionRequest = actionRequest;
 
 // Permission cards across connections.
 const pendingOf = () => store.getState().chat.pending.map((p) => [p.request_id, p.submitted || null]);
@@ -412,6 +426,18 @@ def test_a_document_s_chip_says_how_its_action_ended(observed):
         "message": "Submit to Datum: sent",
     }
 
+
+
+def test_a_datum_upload_prompts_for_and_sends_the_source_url(observed):
+    assert observed["sourceUrlPrompt"] == "Original URL"
+    assert observed["uploadActionRequest"] == {
+        "url": "/upload/action?t=tok",
+        "body": {
+            "upload": "u-2",
+            "action": "datum",
+            "source_url": "https://manufacturer.example/sheet.pdf",
+        },
+    }
 
 def test_a_card_whose_decision_could_not_be_sent_stays_answerable(observed):
     assert observed["cardWhileOffline"]["pending"] == [["pr_a_1", None]]

@@ -3,8 +3,7 @@
 Datum holds OCR'd component datasheets, application notes and eval-board
 manuals, and the imported boards that use them. A product that wants its
 agent to look parts up there declares it as a remote beside its own tools
-(``remote.py``) and, if the human may file a datasheet from the chat pane, as
-an upload action (``uploads.py``)::
+(``remote.py``), and may expose ``upload_action`` for a human-attached PDF::
 
     ToolServer(tools, ..., remote=(datum.remote(url),))
     create_app(..., upload_actions=(datum.upload_action("my-project"),))
@@ -34,9 +33,9 @@ A tool Datum adds that this grading does not name is left out with the
 remote's usual startup warning, until it is graded here.
 """
 
-from .remote import RemoteServer
-from .tools import Grading
 from .uploads import UploadAction
+from .tools import Grading
+from .remote import RemoteServer
 
 #: Datum's name as an MCP server: the key a repository's ``.mcp.json`` gives
 #: it, and so the namespace its tools have (``mcp__ds-wiki__search_parts``).
@@ -96,9 +95,7 @@ def remote(url):
 
 
 def upload_action(project_tag):
-    """The chat pane's "Submit to Datum" button for a PDF the human attaches:
-    ``submit_datasheet`` as a datasheet filed under ``project_tag``, the tag
-    Datum lists the product's documents by."""
+    """A PDF upload action that asks the human for its exact source URL."""
     return UploadAction(
         name="datum",
         label="Submit to Datum",
@@ -107,4 +104,6 @@ def upload_action(project_tag):
             "project_tag": project_tag,
             "doc_type_hint": "datasheet",
         },
+        source_url_arg="original_url",
+        source_url_label="Original HTTP(S) source URL (max 2048 characters)",
     )

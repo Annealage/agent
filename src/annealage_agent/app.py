@@ -829,14 +829,14 @@ def create_app(
         # Held until each ends, so a running action is not collected mid-way.
         running_actions = set()
 
-        async def _begin_upload_action(action, upload, human):
+        async def _begin_upload_action(action, upload, human, source_url):
             await holder.ensure()
             holder.note_activity()
             broker = bus.broker
             if broker is None:
                 return "no agent session is running here to put this in front of you", 409
             try:
-                args = uploads.call_args(action, upload, human)
+                args = uploads.call_args(action, upload, human, source_url=source_url)
             except ValueError as exc:
                 return str(exc), 400
             except Exception as exc:

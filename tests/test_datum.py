@@ -1,7 +1,5 @@
-"""Annealage Datum as a remote (``datum.py``): what each class of its tools is
-graded as, what is left out, the priming that reveals the rest, and the
-upload action's fields.
-
+"""Annealage Datum as a remote (``datum.py``): tool grading, priming,
+excluded tools and the human-supplied source URL for upload actions.
 The remote is a Datum-shaped fake: it lists a few tools until
 ``getting_started`` has been called on a connection and all of them after,
 including the three the agent must not get and one nobody has graded.
@@ -17,9 +15,8 @@ import pytest
 import uvicorn
 from mcp.server import Server
 from toy_product import build_toy_tools
-
-from annealage_agent import datum
-from annealage_agent.uploads import UploadAction, check_upload_actions
+from annealage_agent import datum, uploads
+from annealage_agent.uploads import check_upload_actions
 
 # The tools Datum lists, written out by hand rather than read from the module
 # under test (including the request tools discovered 2026-10-09).
@@ -204,27 +201,31 @@ async def test_request_and_polling_tools_are_discovered_graded_and_forwarded(
     assert fake.calls[-1] == (name, arguments)
 
 
-def test_the_upload_action_files_a_datasheet_under_the_products_tag():
+
+def test_datum_upload_action_requires_an_exact_source_url():
     action = datum.upload_action("some-tag")
-    assert isinstance(action, UploadAction)
-    assert action.name == "datum"
-    assert action.label == "Submit to Datum"
+    assert isinstance(action, uploads.UploadAction)
     assert action.tool == ("ds-wiki", "submit_datasheet")
-    assert action.accepts == "application/pdf"
     assert action.build_args(None, None) == {
         "project_tag": "some-tag",
         "doc_type_hint": "datasheet",
     }
-    assert action.to_wire() == {
-        "name": "datum",
-        "label": "Submit to Datum",
-        "accepts": "application/pdf",
-    }
-    assert datum.upload_action("other").build_args(None, None)["project_tag"] == "other"
+    assert action.to_wire()["source_url_label"]
+
+    source = "https://manufacturer.example/part.pdf?revision=2"
+    args = uploads.call_args(action, None, None, source_url=source)
+    assert args["original_url"] == source
+    assert args["project_tag"] == "some-tag"
+    prefix = "https://manufacturer.example/"
+    boundary = prefix + "x" * (2048 - len(prefix))
+    assert uploads.call_args(action, None, None, source_url=boundary)["original_url"] == boundary
+    for invalid in (None, "file:///tmp/part.pdf", "https://", "https://maker.example/" + "x" * 2040):
+        with pytest.raises(ValueError, match="original absolute HTTP"):
+            uploads.call_args(action, None, None, source_url=invalid)
 
 
-def test_the_upload_action_names_a_remote_the_datum_tool_server_declares(fake, tmp_path):
+def test_datum_upload_action_declares_its_remote(fake, tmp_path):
     tools = _tools(tmp_path, fake.url)
-    assert check_upload_actions((datum.upload_action("t"),), tools)
-    submit = tools.remote_tables()["ds-wiki"][datum.upload_action("t").tool[1]]
-    assert submit.write
+    action = datum.upload_action("t")
+    assert check_upload_actions((action,), tools)
+    assert tools.remote_tables()["ds-wiki"]["submit_datasheet"].write

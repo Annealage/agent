@@ -58,6 +58,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Tuple
+from urllib.parse import urlsplit
 
 from . import files, product, sessions
 from .session.base import ACTION_DENIED, ACTION_DONE, ACTION_FAILED, UploadActionEnded
@@ -89,15 +90,14 @@ class Upload:
 
 @dataclasses.dataclass(frozen=True)
 class UploadAction:
-    """One thing the human can do with an uploaded file; see the module
-    docstring.
+    """One thing the human can do with an uploaded file.
 
-    ``name`` is a short lowercase slug the page sends back, ``label`` its
-    button and card text. ``build_args(upload, human)`` returns the call's
-    arguments other than the file's: a JSON object, without
-    ``content_arg`` or ``filename_arg``, which the server fills in. It runs
-    when the human clicks, and a ``ValueError`` it raises refuses the click
-    with its message. ``human`` is the ``identity.Human`` who clicked.
+    ``name`` is a short slug sent by the page, ``label`` its button and card
+    text. ``build_args(upload, human)`` returns the call's non-file arguments,
+    and ``human`` is the ``identity.Human`` who clicked. An action may declare
+    ``source_url_arg`` and ``source_url_label`` to require a human-entered
+    absolute HTTP(S) provenance URL (max 2048 characters), passed unchanged
+    under that argument name.
     """
 
     name: str
@@ -107,11 +107,16 @@ class UploadAction:
     accepts: str = "application/pdf"
     content_arg: str = "content_base64"
     filename_arg: str = "filename"
+    source_url_arg: str | None = None
+    source_url_label: str | None = None
 
     def to_wire(self):
         """What the page is told of it (the hello's
         ``session.upload_actions``)."""
-        return {"name": self.name, "label": self.label, "accepts": self.accepts}
+        result = {"name": self.name, "label": self.label, "accepts": self.accepts}
+        if self.source_url_arg is not None:
+            result["source_url_label"] = self.source_url_label
+        return result
 
 
 def check_upload_actions(actions, tools=None):
@@ -155,6 +160,17 @@ def check_upload_actions(actions, tools=None):
                 "upload action %r: content_arg and filename_arg are two argument names"
                 % action.name
             )
+        if (action.source_url_arg is None) != (action.source_url_label is None):
+            raise ValueError("upload action %r: source_url_arg and source_url_label are both required"
+                             % action.name)
+        if action.source_url_arg is not None:
+            names = (action.source_url_arg, action.content_arg, action.filename_arg)
+            if (not all(isinstance(n, str) and n for n in names)
+                    or len(set(names)) != len(names)):
+                raise ValueError("upload action %r: source_url_arg, content_arg and filename_arg "
+                                 "must be different argument names" % action.name)
+            if not isinstance(action.source_url_label, str) or not action.source_url_label.strip():
+                raise ValueError("upload action %r: source_url_label is required" % action.name)
         if tools is not None and tool[0] not in tools.remote_servers:
             raise ValueError(
                 "upload action %r calls the %s MCP server, which the tool server does not "
@@ -256,22 +272,41 @@ class Documents:
                 pass
 
 
-def call_args(action, upload, human):
-    """``build_args``'s arguments for ``action`` on ``upload``, checked:
-    ``ValueError`` is the product refusing the click (its message is the
-    human's), ``RuntimeError`` a product whose ``build_args`` returned
-    something that is not a JSON object of other arguments."""
+def valid_source_url(value):
+    """An explicit absolute HTTP(S) source URL, at most 2048 characters."""
+    if (not isinstance(value, str) or not value or len(value) > 2048
+            or any(char.isspace() or ord(char) < 32 for char in value)):
+        return False
+    try:
+        parsed = urlsplit(value)
+        return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+    except ValueError:
+        return False
+
+
+def call_args(action, upload, human, source_url=None):
+    """Build checked tool arguments, including an explicitly provided URL
+    when the action declares one."""
     args = action.build_args(upload, human)
     if not isinstance(args, Mapping) or not all(isinstance(key, str) for key in args):
         raise RuntimeError(
             "upload action %r: build_args returned %r, not an object" % (action.name, args)
         )
-    clashing = sorted({action.content_arg, action.filename_arg} & set(args))
+    reserved = {action.content_arg, action.filename_arg}
+    if action.source_url_arg is not None:
+        reserved.add(action.source_url_arg)
+    clashing = sorted(reserved & set(args))
     if clashing:
         raise RuntimeError(
             "upload action %r: build_args set %s, which the server fills in"
             % (action.name, ", ".join(clashing))
         )
+    if action.source_url_arg is not None:
+        if not valid_source_url(source_url):
+            raise ValueError("enter the original absolute HTTP(S) source URL (max 2048 characters)")
+        args = {**args, action.source_url_arg: source_url}
+    elif source_url is not None:
+        raise ValueError("this upload action does not accept a source URL")
     return dict(args)
 
 
