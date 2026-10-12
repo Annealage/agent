@@ -501,6 +501,44 @@ async def test_omp_request_timeout_is_rejected_for_claude(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "options, message, backend",
+    [
+        ({"provider_session_id": "affinity"}, "provider_session_id is only supported", "claude"),
+        ({"cache_retention": "short"}, "cache_retention is only supported", "claude"),
+        (
+            {"provider_session_id": ""},
+            "provider_session_id must be None or a non-empty string",
+            "omp",
+        ),
+        (
+            {"provider_session_id": 42},
+            "provider_session_id must be None or a non-empty string",
+            "omp",
+        ),
+        ({"cache_retention": "invalid"}, "cache_retention must be None", "omp"),
+    ],
+)
+async def test_omp_affinity_options_are_validated(options, message, backend, tmp_path):
+    with pytest.raises(ValueError, match=message):
+        await run_prompt("go", **make_args(tmp_path, backend=backend, **options))
+
+
+@pytest.mark.parametrize("cache_retention", ["short", "long", "none"])
+async def test_cache_retention_accepts_documented_values(cache_retention, tmp_path):
+    headless._check_arguments(
+        "go",
+        make_toolset(),
+        "omp",
+        "prov/model",
+        tmp_path,
+        5,
+        None,
+        None,
+        cache_retention=cache_retention,
+    )
+
+
+@pytest.mark.parametrize(
     "overrides, message",
     [
         ({"backend": "gpt"}, "backend must be one of omp, claude"),

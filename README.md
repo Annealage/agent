@@ -462,6 +462,8 @@ result: RunResult = await run_prompt(
     cwd=scratch_dir,          # an empty directory you own; only the backend's working directory
     timeout=300,              # seconds for the whole run
     omp_request_timeout=180,   # optional OMP RPC wait, separate from the whole-run timeout
+    provider_session_id="request-affinity",  # optional opaque OMP affinity ID
+    cache_retention="long",   # optional OMP cache policy: short, long or none
     system="Be terse.",       # optional, appended to the backend's system prompt
 )
 ```
@@ -478,6 +480,12 @@ SDK backend rejects `xhigh` rather than silently translating it.
 `run_prompt(..., on_runtime=callback)` optionally calls `callback(event)` with each `AgentRuntimeResolved` event the backend reports, starting after actual OMP state/model observation or Claude SDK initialization. The event carries backend, nullable provider/model/effort and provenance; requested configuration is never used as a substitute. This callback observes runtime facts, it does not establish a pre-submit admission guarantee.
 
 When a run ends early (timeout or cancel), further tool calls are refused, handlers still running are cancelled and waited for (up to 5 seconds, so their cleanup is done before `run_prompt` returns), the backend process is killed and the close is bounded at 10 seconds. A handler blocked inside a synchronous call cannot be stopped and finishes on its own thread, so keep per-run handlers free of that. `omp_agent_dir`, `omp_binary` and `omp_config_dir` take the omp profile, executable and config root, as `launch.build_session` does.
+`provider_session_id` and `cache_retention` are OMP-only and refused with
+`ValueError` on Claude. The provider ID is an opaque affinity hint passed to
+OMP's `RpcClient`, separate from the fresh per-run telemetry `session_id` used
+by `usage_sink`, so callers must choose an ID within their own isolation scope.
+`cache_retention` sets `PI_CACHE_RETENTION` only in the child OMP process;
+`None` leaves OMP's default alone and never changes the host process environment.
 
 `builtin_tools` (omp only, default empty) leaves named omp built-in tools enabled for the run: `headless.BUILTIN_TOOLS` is the whole allowlist, `web_search` only, and any other name, or one on the Claude backend, is a `ValueError`. These run inside omp, so they bypass the permission broker, grading and `grant` (omp runs `--auto-approve`): the model can reach the network with any arguments it chooses, and what comes back is untrusted text. They show in `RunResult.calls` by omp's name. `create_app` and hosted mode never enable them.
 

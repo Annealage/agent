@@ -360,6 +360,8 @@ def _check_arguments(
     timeout,
     thinking,
     omp_request_timeout,
+    provider_session_id=None,
+    cache_retention=None,
     usage_sink=None,
     builtin_tools=(),
     on_runtime=None,
@@ -384,6 +386,18 @@ def _check_arguments(
                 "usage_sink is only supported with backend='omp': the Claude backend reports "
                 "usage per turn, not per provider request"
             )
+    for name, value in (
+        ("provider_session_id", provider_session_id),
+        ("cache_retention", cache_retention),
+    ):
+        if value is not None and backend != "omp":
+            raise ValueError("%s is only supported with backend='omp'" % name)
+    if provider_session_id is not None and (
+        not isinstance(provider_session_id, str) or not provider_session_id.strip()
+    ):
+        raise ValueError("provider_session_id must be None or a non-empty string")
+    if cache_retention not in (None, "short", "long", "none"):
+        raise ValueError("cache_retention must be None, 'short', 'long' or 'none'")
 
     if on_runtime is not None and not callable(on_runtime):
         raise ValueError("on_runtime must be a callable taking one AgentRuntimeResolved event")
@@ -471,6 +485,8 @@ def _build_session(
     native_max_turns,
     on_owner,
     owner_context,
+    provider_session_id=None,
+    cache_retention=None,
 ):
     """The session ``backend`` names, built and not started. ``launch.build_session``
     is the app's: it is made of the served directory (the working directory and
@@ -496,6 +512,8 @@ def _build_session(
             # The conversation file goes under the run's own state, and goes
             # with it.
             session_dir=os.path.join(state_dir, "omp"),
+            provider_session_id=provider_session_id,
+            cache_retention=cache_retention,
             on_request_usage=on_request_usage,
             builtin_tools=builtin_tools,
         )
@@ -577,6 +595,8 @@ async def run_prompt(
     omp_binary=None,
     omp_config_dir=None,
     omp_request_timeout=None,
+    provider_session_id=None,
+    cache_retention=None,
     usage_sink=None,
     builtin_tools=(),
     on_runtime=None,
@@ -603,6 +623,11 @@ async def run_prompt(
     across providers. ``omp_agent_dir``, ``omp_binary`` and ``omp_config_dir``
     are ``launch.build_session``'s omp profile, executable and config root,
     ``None`` for omp as installed.
+    ``provider_session_id`` is an optional opaque OMP provider-affinity ID; it
+    is passed to OMP's ``RpcClient`` and is not the run's telemetry
+    ``session_id``. ``cache_retention`` optionally sets the OMP child process's
+    ``PI_CACHE_RETENTION`` to ``short``, ``long`` or ``none``; ``None`` leaves
+    OMP's own default unchanged. Neither option is supported by Claude.
     ``max_budget_usd`` is optional and Claude-only. When provided it is passed
     unchanged to the SDK's native query budget option, which can stop a query
     at its reported USD budget; it is not an invoice or exact-billing guarantee.
@@ -668,6 +693,8 @@ async def run_prompt(
         timeout,
         thinking,
         omp_request_timeout,
+        provider_session_id,
+        cache_retention,
         usage_sink,
         builtin_tools,
         on_runtime,
@@ -714,6 +741,8 @@ async def run_prompt(
                     omp_binary=omp_binary,
                     omp_config_dir=omp_config_dir,
                     omp_request_timeout=omp_request_timeout,
+                    provider_session_id=provider_session_id,
+                    cache_retention=cache_retention,
                     session_id=session_id,
                     on_request_usage=bus.request_usage,
                     builtin_tools=tuple(builtin_tools),

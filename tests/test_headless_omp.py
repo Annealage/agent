@@ -11,6 +11,7 @@ The rest of ``run_prompt``'s tests, which need neither, are in
 """
 
 import asyncio
+import os
 import sys
 import threading
 import time
@@ -176,6 +177,47 @@ async def test_thinking_is_passed_to_omp(omp_client, tmp_path):
         "--thinking",
         "high",
     )
+
+
+async def test_provider_affinity_and_cache_retention_reach_omp(omp_client, tmp_path, monkeypatch):
+    monkeypatch.setenv("PI_CACHE_RETENTION", "short")
+    events = []
+
+    def script(client):
+        _request(
+            client,
+            {"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0},
+            response_id="response-1",
+        )
+        client.end()
+
+    omp_client.script = script
+    result = await run_prompt(
+        "do it",
+        **make_args(
+            tmp_path,
+            provider_session_id="opaque-affinity-id",
+            cache_retention="long",
+            usage_sink=events.append,
+        ),
+    )
+
+    assert result.error is None
+    (client,) = omp_client.instances
+    assert client.kwargs["provider_session_id"] == "opaque-affinity-id"
+    assert client.kwargs["env"]["PI_CACHE_RETENTION"] == "long"
+    assert events and events[0]["session_id"].startswith("headless-")
+    assert events[0]["session_id"] != "opaque-affinity-id"
+    assert os.environ["PI_CACHE_RETENTION"] == "short"
+
+
+async def test_default_cache_retention_leaves_child_override_unset(omp_client, tmp_path, monkeypatch):
+    monkeypatch.setenv("PI_CACHE_RETENTION", "short")
+    omp_client.script = lambda client: client.end()
+    await run_prompt("do it", **make_args(tmp_path))
+
+    (client,) = omp_client.instances
+    assert "PI_CACHE_RETENTION" not in client.kwargs["env"]
 
 
 async def test_a_granted_write_tool_runs_and_nothing_is_remembered(omp_client, tmp_path):

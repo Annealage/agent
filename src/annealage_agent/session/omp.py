@@ -340,6 +340,8 @@ class OmpSession:
         request_timeout: Optional[float] = None,
         on_request_usage: Optional[Callable[[dict], None]] = None,
         builtin_tools: Sequence[str] = (),
+        provider_session_id: Optional[str] = None,
+        cache_retention: Optional[str] = None,
     ):
         # omp's own tools to leave enabled (``--tools``); none by default, which
         # is ``--no-tools``. They run inside omp, outside the broker.
@@ -373,6 +375,8 @@ class OmpSession:
         self._resume = resume or None
         self._on_session_file = on_session_file
         self._thinking = thinking
+        self._provider_session_id = provider_session_id
+        self._cache_retention = cache_retention
         self._request_timeout = request_timeout
         self._login_command = login_command or None
         self.session_file: Optional[str] = None
@@ -809,6 +813,8 @@ class OmpSession:
                 model_arg = self._model
             if self._config_rel is not None:
                 env["PI_CONFIG_DIR"] = self._config_rel
+            if self._cache_retention is not None:
+                env["PI_CACHE_RETENTION"] = self._cache_retention
             # omp's logs directory is decided by what it is launched with.
             self._omp_logs_dir = logfiles.omp_logs_dir(
                 self._config_rel, env.get("PI_CODING_AGENT_DIR")
@@ -826,6 +832,8 @@ class OmpSession:
                 client_kwargs["no_session"] = True
             if self._request_timeout is not None:
                 client_kwargs["request_timeout"] = self._request_timeout
+            if self._provider_session_id is not None:
+                client_kwargs["provider_session_id"] = self._provider_session_id
             self._client = self._client_factory(
                 **client_kwargs,
                 executable=self._binary or "omp",
