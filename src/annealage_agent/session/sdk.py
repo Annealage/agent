@@ -730,14 +730,14 @@ class SdkSession:
                         viewer=viewer,
                     )
                 )
-            )
-            return
-        if self._active_turn is not None and not self._active_turn.done():
-            self._emit(
-                AgentError(
-                    stderr="a turn is already active; this turn was not sent",
-                    remediation="wait for the active turn to finish before submitting another",
-                    viewer=viewer,
+                return
+            if self._active_turn is not None and not self._active_turn.done():
+                self._emit(
+                    AgentError(
+                        stderr="a turn is already active; this turn was not sent",
+                        remediation="wait for the active turn to finish before submitting another",
+                        viewer=viewer,
+                    )
                 )
                 return
             completion = asyncio.get_running_loop().create_future()

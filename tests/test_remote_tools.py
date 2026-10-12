@@ -14,6 +14,7 @@ The toy product's tool server is built with the fake as its remote
 """
 
 import asyncio
+import contextlib
 import json
 import socket
 import threading
@@ -60,7 +61,7 @@ def _tool(name, description, schema=None):
     return types.Tool(
         name=name,
         description=description,
-        inputSchema=schema or {"type": "object", "properties": {}},
+        input_schema=schema or {"type": "object", "properties": {}},
     )
 
 
@@ -116,14 +117,15 @@ class FakeRemote:
                 ]
             elif name == "broken":
                 return types.CallToolResult(
-                    isError=True, content=[types.TextContent(type="text", text="no such part")]
+                    is_error=True, content=[types.TextContent(type="text", text="no such part")]
                 )
             if name == "slow":
                 await anyio.sleep(2)
+                content = [types.TextContent(type="text", text="done")]
             if name == "store":
                 if arguments["text"] == "error":
                     return types.CallToolResult(
-                        isError=True, content=[types.TextContent(type="text", text="remote error")]
+                        is_error=True, content=[types.TextContent(type="text", text="remote error")]
                     )
                 self.stored.append(arguments["text"])
                 if arguments["text"] == "uncertain":
@@ -131,9 +133,7 @@ class FakeRemote:
                 return types.CallToolResult(
                     content=[types.TextContent(type="text", text="stored")]
                 )
-            return types.CallToolResult(
-                content=[types.TextContent(type="text", text="done")]
-            )
+            return types.CallToolResult(content=content)
 
         server = Server(
             "fake", instructions=INSTRUCTIONS, on_list_tools=list_tools, on_call_tool=call_tool

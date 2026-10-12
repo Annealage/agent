@@ -347,7 +347,7 @@ def _proxied(server, tool, bus=None):
     than reading it as the ``{param: type}`` shorthand. omp refuses a tool
     with no description, so one without gets a plain one.
     """
-    schema = dict(tool.inputSchema or {})
+    schema = dict(tool.input_schema or {})
     schema.setdefault("type", "object")
     schema.setdefault("properties", {})
     description = (tool.description or "").strip() or "%s, on the %s MCP server" % (
@@ -431,7 +431,7 @@ async def call(
             raise
         if result is not None:
             if invocation:
-                action_store.outcome(invocation, "uncertain" if result.isError else "reported_result")
+                action_store.outcome(invocation, "uncertain" if result.is_error else "reported_result")
             return _result(server.name, name, result)
         leaf = _leaf(exc)
         if sent and isinstance(leaf, MCPError):
@@ -455,7 +455,7 @@ async def call(
         action_store.outcome(invocation, "not_sent")
         return fail("remote write refused because its approved authority context changed")
     if invocation:
-        action_store.outcome(invocation, "uncertain" if result.isError else "reported_result")
+        action_store.outcome(invocation, "uncertain" if result.is_error else "reported_result")
     return _result(server.name, name, result)
 
 
