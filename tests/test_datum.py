@@ -1,10 +1,8 @@
-"""Annealage Datum as a remote (``datum.py``): tool grading, priming,
-excluded tools and the human-supplied source URL for upload actions.
-The remote is a Datum-shaped fake: it lists a few tools until
-``getting_started`` has been called on a connection and all of them after,
-including the three the agent must not get and one nobody has graded.
+"""Datum proxy policy, annotation discovery, direct-call guard and uploads.
+The fake lists its expanded tool set only after ``getting_started`` runs.
 """
 
+import asyncio
 import json
 import threading
 import time
@@ -15,6 +13,7 @@ import pytest
 import uvicorn
 from mcp.server import Server
 from toy_product import build_toy_tools
+
 from annealage_agent import datum, uploads
 from annealage_agent.uploads import check_upload_actions
 
@@ -32,7 +31,7 @@ LOOKUPS = (
     "get_document_relations",
     "get_job_status",
     "get_request_status",
-    "get_evidence_job_status",
+    "get_evidence_usage",
     "get_evidence_result",
     "list_boards",
     "trace_board_rail_or_net",
@@ -59,14 +58,20 @@ ADVERTISED = ("getting_started", "search_parts", "semantic_search", "list_boards
 
 
 class FakeDatum:
-    def __init__(self, extra=()):
+    def __init__(self, extra=(), delay=0, new_tools=True):
+        self.delay = delay
         self.calls = []
         primed = set()
-        names = (*LOOKUPS, *WRITES, *VIEWS, *WITHHELD, *extra)
+        additions = ("new_read_tool", "new_write_tool") if new_tools else ()
+        names = (*LOOKUPS, *WRITES, *VIEWS, *WITHHELD, *additions, *extra)
 
         def listed(name):
+            read_only = name in LOOKUPS or name in ("new_read_tool", "cancel_evidence_job")
             return types.Tool(
-                name=name, description="Datum's %s." % name, inputSchema={"type": "object"}
+                name=name,
+                description="Datum's %s." % name,
+                inputSchema={"type": "object"},
+                annotations=types.ToolAnnotations(readOnlyHint=read_only),
             )
 
         async def list_tools(ctx, params):
@@ -75,6 +80,8 @@ class FakeDatum:
 
         async def call_tool(ctx, params):
             self.calls.append((params.name, params.arguments))
+            if self.delay:
+                await asyncio.sleep(self.delay)
             if params.name == "getting_started":
                 primed.add(ctx.request.headers["mcp-session-id"])
             return types.CallToolResult(
@@ -118,14 +125,14 @@ def fake():
     remote.stop()
 
 
-def _tools(tmp_path, url):
+def _tools(tmp_path, url, *, view=()):
     from annealage_agent.remote_actions import RemoteActionStore
 
     bus = SimpleNamespace(paused=False)
     bus.remote_action_store = RemoteActionStore(
         tmp_path / "remote-actions.json", project_id=str(tmp_path), session="sess-1"
     )
-    return build_toy_tools(bus, tmp_path, "sess-1", remote=(datum.remote(url),))
+    return build_toy_tools(bus, tmp_path, "sess-1", remote=(datum.remote(url, view=view),))
 
 
 def test_the_remote_is_datum_under_the_ds_wiki_key():
@@ -133,47 +140,53 @@ def test_the_remote_is_datum_under_the_ds_wiki_key():
     assert remote.name == "ds-wiki" == datum.SERVER
     assert remote.url == "https://example.invalid/mcp"
     assert remote.prime == ("getting_started", {})
-    assert remote.excluded == WITHHELD
+    assert remote.excluded == datum.DENY
+    assert remote.denied == datum.DENY
+    assert remote.annotation_grading
+    assert datum.EVIDENCE_SUBMIT_TOOL in remote.product_only
     assert remote.headers is None
 
 
-def test_every_lookup_is_read_grade_and_submitting_and_requesting_are_write():
+def test_annotation_grading_keeps_only_explicit_write_names():
     grading = datum.remote("http://x/mcp").grading
-    assert grading.read == LOOKUPS
-    assert grading.view == VIEWS
+    assert grading.read == ()
+    assert grading.view == ()
     assert grading.write == WRITES
-    # Nothing the agent must not have is graded, so nothing can be both.
-    assert not set(WITHHELD) & {*grading.read, *grading.view, *grading.write}
-    assert set(grading.pause_gated) == {*WRITES, *VIEWS}
-    assert set(grading.pre_allowed) == {*LOOKUPS, *VIEWS}
 
 
 def test_the_published_default_is_the_hosted_datum():
     assert datum.DEFAULT_URL == "https://ds.story-kettle.ts.net/mcp"
 
 
-def test_a_tool_server_proxies_the_graded_tools_and_drops_the_withheld_ones(fake, tmp_path, capsys):
+def test_a_tool_server_proxies_annotated_reads_and_explicit_writes(fake, tmp_path, capsys):
     tools = _tools(tmp_path, fake.url)
     proxied = tools.remote_tables()["ds-wiki"]
-    # Priming revealed the tools Datum only lists after getting_started.
-    assert set(proxied) == {*LOOKUPS, *WRITES, *VIEWS}
+    # Priming reveals the expanded tool listing.
+    assert set(proxied) == {*LOOKUPS, "new_read_tool", *WRITES}
     assert [name for name, spec in proxied.items() if spec.write] == list(WRITES)
     assert not set(WITHHELD) & set(proxied)
+    assert "submit_evidence_job" not in proxied
     pre = {
         name.removeprefix("mcp__ds-wiki__")
         for name in tools.pre_allowed
         if name.startswith("mcp__ds-wiki__")
     }
-    assert pre == {*LOOKUPS, *VIEWS}
-    # The withheld tools are left out silently; a tool nobody graded is warned about.
+    assert pre == {*LOOKUPS, "new_read_tool"}
     err = capsys.readouterr().err
-    assert "brand_new_tool" in err
+    assert "new_write_tool" in err and "brand_new_tool" in err
     for name in WITHHELD:
         assert name not in err
 
 
+def test_the_product_only_job_is_view_grade_only_when_opted_in(fake, tmp_path):
+    tools = _tools(tmp_path, fake.url, view=(datum.EVIDENCE_SUBMIT_TOOL,))
+    spec = tools.remote_tables()["ds-wiki"][datum.EVIDENCE_SUBMIT_TOOL]
+    assert not spec.write
+    assert "mcp__ds-wiki__submit_evidence_job" in tools.pre_allowed
+
+
 def test_the_withheld_tools_are_not_warned_about_when_datum_lists_nothing_new(tmp_path, capsys):
-    plain = FakeDatum()
+    plain = FakeDatum(new_tools=False)
     try:
         _tools(tmp_path, plain.url)
     finally:
@@ -187,6 +200,63 @@ async def test_a_lookup_reaches_datum_and_primes_it(fake, tmp_path):
     result = await proxied["search_parts"].handler({"query": "RP2040"})
     assert result["content"][0]["text"] == 'search_parts {"query": "RP2040"}'
     assert fake.calls[-1] == ("search_parts", {"query": "RP2040"})
+    new_read = await proxied["new_read_tool"].handler({})
+    assert new_read["content"][0]["text"] == "new_read_tool {}"
+    assert fake.calls[-1] == ("new_read_tool", {})
+
+
+@pytest.mark.asyncio
+async def test_direct_calls_are_read_guarded_and_named_writes_are_allowed(fake, tmp_path):
+    from annealage_agent import remote
+    from annealage_agent.remote_actions import RemoteActionStore
+
+    server = datum.remote(fake.url)
+    refused = await remote.call(server, "request_datasheet", {}, read_only=True)
+    assert refused["is_error"]
+    assert "not read-only" in refused["content"][0]["text"]
+    assert fake.calls == []
+
+    store = RemoteActionStore(
+        tmp_path / "actions.json", project_id=str(tmp_path), session="direct-call"
+    )
+    allowed = await remote.call(
+        server,
+        "request_datasheet",
+        {"mpn": "X"},
+        action_store=store,
+        allowed_writes=("request_datasheet",),
+    )
+    assert not allowed.get("is_error", False)
+    assert fake.calls[-1] == ("request_datasheet", {"mpn": "X"})
+
+    denied = await remote.call(
+        server,
+        "cancel_evidence_job",
+        {},
+        allowed_writes=("cancel_evidence_job",),
+    )
+    assert denied["is_error"]
+    assert "denied" in denied["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_remote_call_uses_its_timeout_override():
+    from annealage_agent import remote
+
+    slow = FakeDatum(delay=0.2)
+    try:
+        result = await remote.call(
+            datum.remote(slow.url),
+            "get_evidence_result",
+            {"job_id": "job"},
+            read_only=True,
+            timeout=0.05,
+        )
+        assert result["is_error"]
+        assert "no answer came back" in result["content"][0]["text"]
+        assert slow.calls == [("get_evidence_result", {"job_id": "job"})]
+    finally:
+        slow.stop()
 
 
 @pytest.mark.asyncio
@@ -195,8 +265,8 @@ async def test_a_lookup_reaches_datum_and_primes_it(fake, tmp_path):
     (
         ("request_datasheet", {"mpn": "TPS54302"}, True),
         ("get_request_status", {"request_id": 123}, False),
-        ("submit_evidence_job", {"page_path": "wiki/x", "mpn": "X"}, False),
         ("get_evidence_result", {"result_id": "r"}, False),
+        ("get_evidence_usage", {}, False),
     ),
 )
 async def test_request_and_polling_tools_are_discovered_graded_and_forwarded(

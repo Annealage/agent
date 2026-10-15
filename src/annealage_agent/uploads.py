@@ -411,6 +411,7 @@ async def run(
                 return
         result = await remote.call(
             server, tool_name, arguments, action_store=action_store, source="upload:" + action.name,
+            allowed_writes=(tool_name,),
             approval=(
                 None if getattr(broker, "automatically_allows", lambda _tool: False)(tool)
                 else human.login

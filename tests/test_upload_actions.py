@@ -46,7 +46,9 @@ DATUM = UploadAction(
 def remote(monkeypatch):
     fake = FakeRemote()
     monkeypatch.setattr(
-        toy_product, "REMOTE", (RemoteServer("datum", fake.url, FAKE_GRADING, prime=("begin", {})),)
+        toy_product,
+        "REMOTE",
+        (RemoteServer("datum", fake.url, FAKE_GRADING, prime=("begin", {}), read_tools=("read",)),),
     )
     yield fake
     fake.stop()

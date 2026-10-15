@@ -80,8 +80,7 @@ from claude_agent_sdk import SdkMcpTool, create_sdk_mcp_server
 from mcp import ClientSession, MCPError
 from mcp.client.streamable_http import streamable_http_client
 
-from . import product
-from . import remote_actions
+from . import product, remote_actions
 from .tools import Grading, _wrap, fail, namespaced
 
 #: How long connecting, ``initialize``, the ``prime`` call and ``list_tools``
@@ -102,7 +101,11 @@ _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
 class RemoteServer(
-    namedtuple("RemoteServer", "name url grading prime headers excluded", defaults=(None, None, ()))
+    namedtuple(
+        "RemoteServer",
+        "name url grading prime headers excluded annotation_grading product_only read_tools denied",
+        defaults=(None, None, (), False, (), (), ()),
+    )
 ):
     """A remote MCP server, reached over streamable HTTP at ``url``.
 
@@ -111,11 +114,11 @@ class RemoteServer(
     its tool names, which decides what is proxied at all and how, exactly as
     a product's grading does for its own tools. ``prime`` is ``(tool,
     arguments)``, called once before listing, for a server that advertises
-    more tools after a first call. ``headers`` are sent with every request
-    (an ``Authorization`` header, say). ``excluded`` names the tools the
-    product deliberately does not offer: they are not proxied, and a remote
-    listing them is not warned about, as it is for a tool the grading merely
-    does not name. A tool cannot be both graded and excluded.
+    more tools after a first call. ``headers`` are sent with every request.
+    ``excluded`` names are silently withheld. ``annotation_grading`` adds
+    read-annotated tools at read grade; ``product_only`` withholds named
+    tools unless explicitly graded. ``read_tools`` and ``denied`` govern
+    direct product ``call`` access.
     """
 
     __slots__ = ()
@@ -156,8 +159,26 @@ def connect(servers, *, product_server, bus, paused_message, retry=False):
             _warn("the %s MCP server, unreachable until now, has been reached" % server.name)
         instructions, listed = listing
         listed = {tool.name: tool for tool in listed}
-        graded = set(server.grading.read) | set(server.grading.view) | set(server.grading.write)
-        ungraded = sorted(set(listed) - graded - set(server.excluded))
+        explicit_read = set(server.grading.read)
+        explicit_view = set(server.grading.view)
+        explicit_write = set(server.grading.write)
+        product_only = set(server.product_only)
+        denied = set(server.denied)
+        if server.annotation_grading:
+            for name, tool in listed.items():
+                annotations = getattr(tool, "annotations", None)
+                if getattr(annotations, "read_only_hint", None) is True and (
+                    name not in product_only
+                    and name not in denied
+                    and name not in explicit_view
+                    and name not in explicit_write
+                ):
+                    explicit_read.add(name)
+        explicit_read.difference_update(denied | product_only)
+        explicit_view.difference_update(denied)
+        explicit_write.difference_update(denied)
+        graded = explicit_read | explicit_view | explicit_write
+        ungraded = sorted(set(listed) - graded - set(server.excluded) - product_only)
         if ungraded:
             _warn(
                 "the %s MCP server lists %s, which its grading does not name, so the "
@@ -169,7 +190,12 @@ def connect(servers, *, product_server, bus, paused_message, retry=False):
                 "the %s MCP server does not list %s, which its grading names, so the "
                 "agent does not get them" % (server.name, ", ".join(unlisted))
             )
-        grading = Grading(*(tuple(n for n in grade if n in listed) for grade in server.grading))
+        grading = Grading(
+            tuple(n for n in server.grading.read if n in listed and n not in denied)
+            + tuple(sorted(n for n in explicit_read if n in listed and n not in server.grading.read)),
+            tuple(n for n in server.grading.view if n in listed and n not in denied),
+            tuple(n for n in server.grading.write if n in listed and n not in denied),
+        )
         gated = set(grading.pause_gated)
         tools = tuple(
             _wrap(
@@ -372,6 +398,8 @@ def _proxied(server, tool, bus=None):
         return await call(
             server, name, args, action_store=getattr(bus, "remote_action_store", None),
             source="agent", read_only=name in server.grading.read,
+            allowed_reads=(name,) if name in server.grading.read else (),
+            allowed_writes=() if name in server.grading.read else (name,),
             context=context, expected_context=expected_context,
             context_callback=getattr(bus, "remote_action_context", None),
         )
@@ -382,8 +410,22 @@ def _proxied(server, tool, bus=None):
 async def call(
     server, name, arguments, *, action_store=None, source="agent", read_only=False,
     approval=None, context=None, expected_context=None, context_callback=None,
+    allowed_reads=(), allowed_writes=(), timeout=None,  # noqa: ASYNC109
 ):
-    """Call a remote tool, durably recording non-read-only intent before send."""
+    """Call a remote tool, enforcing its read policy and recording writes."""
+    timeout = CALL_TIMEOUT if timeout is None else timeout
+    if name in server.denied:
+        return fail("remote call refused: %s is denied" % name)
+    if (
+        server.read_tools
+        and name not in server.read_tools
+        and name not in allowed_reads
+        and name not in allowed_writes
+    ):
+        return fail(
+            "remote call refused: %s is not read-only; name it in allowed_reads "
+            "or allowed_writes to permit it" % name
+        )
     invocation = None
     if not read_only:
         if action_store is None:
@@ -411,7 +453,7 @@ async def call(
     stale_context = False
     result = None
     try:
-        with anyio.fail_after(CALL_TIMEOUT):
+        with anyio.fail_after(timeout):
             async with _session(server) as (session, _):
                 current_context = _read_context(context_callback) if callable(context_callback) else context
                 if invocation and expected_context is not None:
@@ -438,7 +480,7 @@ async def call(
             return fail(
                 "the %s MCP server refused %s: %s" % (server.name, name, leaf.error.message)
             )
-        reason = _reason(leaf, CALL_TIMEOUT)
+        reason = _reason(leaf, timeout)
         if reason is None:
             raise
         if sent:
