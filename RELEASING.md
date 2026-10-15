@@ -16,15 +16,12 @@ path source to a sibling checkout (`[tool.uv.sources]` in their
 product can publish a release until this package has one: Mesh's own publish
 workflow refuses to build while the path source is there. The order is:
 
-1. Create the `Annealage/agent` repository on GitHub and push `main` with its
-   tags (`git push origin main --tags`). This holds whether the repository
-   starts private or public. While it's private, anything that clones it
-   (a product's CI checking out a submodule or the sibling checkout, a uv git
-   source) needs a token with read access, the way Mesh's CI uses
-   `ANNEALAGE_EMBER_READ_TOKEN` today.
-2. Once the remote exists, Mesh and Loom can switch from the sibling path to a
-   git submodule of it (README, "As a git submodule"), so a checkout of either
-   brings the agent commit it was tested against.
+1. Push `main` and its tags to `Annealage/ember` (`git push origin main --tags`)
+   before publishing a release. The repository is public, so product CI can
+   fetch the pinned `lib/ember` submodule without a private read token.
+2. Consumers pin the Ember commit they tested in their `lib/ember` submodule.
+   A product's CI must fetch that submodule revision, including its tags where
+   the build uses `hatch-vcs` for the package version.
 3. Release this package (below).
 4. In each product, raise the `annealage-ember` floor to that release and
    delete the path source. A path source to a git submodule of this repository
