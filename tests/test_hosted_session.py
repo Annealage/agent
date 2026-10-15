@@ -17,9 +17,9 @@ from types import SimpleNamespace
 import pytest
 from conftest import create_toy_app, make_test_client
 
-from annealage_agent import sessions, settings
-from annealage_agent.session.base import AgentError, UserTurn
-from annealage_agent.session.fake import FakeSession
+from annealage_ember import sessions, settings
+from annealage_ember.session.base import AgentError, UserTurn
+from annealage_ember.session.fake import FakeSession
 
 pytestmark = pytest.mark.asyncio
 

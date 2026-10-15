@@ -23,7 +23,7 @@ import pytest
 from conftest import DEFAULT_PORT, TEST_HOST, create_toy_app, make_test_client
 from toy_product import TOY
 
-from annealage_agent import settings
+from annealage_ember import settings
 
 TOKEN = "the-real-settings-token-Value_123"
 

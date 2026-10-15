@@ -1,4 +1,4 @@
-# Contributing to Annealage Agent
+# Contributing to Annealage Ember
 
 Thanks for your interest. Read the licensing section before submitting a patch; it sets out the grant you make to the project by submitting.
 
@@ -42,7 +42,7 @@ The suite runs as a small made-up product (`tests/toy_product.py`) whose every n
 
 ## Contribution licensing
 
-Annealage Agent is offered under the PolyForm Noncommercial License 1.0.0. Andrew Leech also offers commercial licences to organisations whose use is not permitted under the PolyForm Noncommercial License. For that dual model to work, contributions need a clear licensing grant; otherwise contributed code could not be offered under a commercial licence without re-asking every contributor.
+Annealage Ember is offered under the PolyForm Noncommercial License 1.0.0. Andrew Leech also offers commercial licences to organisations whose use is not permitted under the PolyForm Noncommercial License. For that dual model to work, contributions need a clear licensing grant; otherwise contributed code could not be offered under a commercial licence without re-asking every contributor.
 
 By submitting a contribution (a pull request, patch, or any change) to this project, you agree to the following.
 

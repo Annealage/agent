@@ -31,8 +31,8 @@ import asyncio
 
 import pytest
 
-from annealage_agent.session.base import PermissionRequest, PermissionResolved
-from annealage_agent.session.permissions import (
+from annealage_ember.session.base import PermissionRequest, PermissionResolved
+from annealage_ember.session.permissions import (
     DEFAULT_DENY_MESSAGE,
     NEVER_REMEMBERED,
     Decision,

@@ -32,7 +32,7 @@ import sys
 import pytest
 from conftest import DEFAULT_PORT, TEST_HOST, create_toy_app, make_test_client
 
-from annealage_agent import diagnostics, lock, settings
+from annealage_ember import diagnostics, lock, settings
 
 
 class _Completed:
@@ -203,7 +203,7 @@ def test_collect_names_the_last_sessions_backend_files_for_a_doctor_run(monkeypa
     CLI's transcript, under the folder the CLI names after the project."""
     import re
 
-    from annealage_agent import sessions
+    from annealage_ember import sessions
 
     monkeypatch.setattr(diagnostics, "_bundled_claude_path", lambda: None)
     config = tmp_path / "claude-config"
@@ -720,7 +720,7 @@ def test_sandbox_info_reports_dependencies_and_missing_from_session_sdk(monkeypa
     """The dependency list and the missing subset both come from
     ``session.sdk``'s own view of the sandbox's requirements, not a second
     count kept here, so the two can never disagree with it."""
-    from annealage_agent.session import sdk
+    from annealage_ember.session import sdk
 
     monkeypatch.setattr(sdk, "missing_sandbox_dependencies", lambda: ("socat",))
 
@@ -741,13 +741,13 @@ def test_diagnostics_module_import_never_touches_claude_agent_sdk(monkeypatch):
 
     def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
         if name.split(".")[0] == "claude_agent_sdk":
-            raise AssertionError("importing annealage_agent.diagnostics pulled in claude_agent_sdk")
+            raise AssertionError("importing annealage_ember.diagnostics pulled in claude_agent_sdk")
         return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)
-    monkeypatch.delitem(sys.modules, "annealage_agent.diagnostics", raising=False)
+    monkeypatch.delitem(sys.modules, "annealage_ember.diagnostics", raising=False)
 
-    import annealage_agent.diagnostics as fresh
+    import annealage_ember.diagnostics as fresh
 
     assert hasattr(fresh, "collect")
 

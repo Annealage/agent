@@ -21,20 +21,20 @@ from conftest import make_test_client
 from microdot import Microdot
 from toy_product import TOY_PAUSED_MESSAGE, build_toy_tools, toy_review_store
 
-from annealage_agent import launch, sessions
-from annealage_agent import settings as settings_module
-from annealage_agent.http.routes_mcp import register_mcp_routes
-from annealage_agent.review import Capabilities
-from annealage_agent.review.tools import (
+from annealage_ember import launch, sessions
+from annealage_ember import settings as settings_module
+from annealage_ember.http.routes_mcp import register_mcp_routes
+from annealage_ember.review import Capabilities
+from annealage_ember.review.tools import (
     AddCallout,
     DeleteCallout,
     ListComments,
     ResolveComment,
     review_tools,
 )
-from annealage_agent.session.base import PermissionRequest
-from annealage_agent.session.permissions import Decision, PermissionBroker
-from annealage_agent.tools import Grading, ToolServer, namespaced
+from annealage_ember.session.base import PermissionRequest
+from annealage_ember.session.permissions import Decision, PermissionBroker
+from annealage_ember.tools import Grading, ToolServer, namespaced
 
 pytestmark = pytest.mark.asyncio
 

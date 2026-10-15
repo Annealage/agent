@@ -21,10 +21,10 @@ from microdot import Request
 from microdot.test_client import TestClient
 from toy_product import NOTES_FILE, TOY_PAGE, TOY_REVIEW_FILE, toy_review_store
 
-from annealage_agent import app as agent_app
-from annealage_agent import sessions
-from annealage_agent.frontdoor import FrontDoor, mount_prefix
-from annealage_agent.session.fake import FakeSession
+from annealage_ember import app as agent_app
+from annealage_ember import sessions
+from annealage_ember.frontdoor import FrontDoor, mount_prefix
+from annealage_ember.session.fake import FakeSession
 
 pytestmark = pytest.mark.asyncio
 

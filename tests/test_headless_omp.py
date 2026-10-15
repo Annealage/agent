@@ -22,10 +22,10 @@ import pytest
 from claude_agent_sdk import tool
 from test_headless import make_args, make_toolset
 
-from annealage_agent import headless
-from annealage_agent.headless import ToolSet, run_prompt
-from annealage_agent.session import omp as omp_module
-from annealage_agent.tools import Grading, ok
+from annealage_ember import headless
+from annealage_ember.headless import ToolSet, run_prompt
+from annealage_ember.session import omp as omp_module
+from annealage_ember.tools import Grading, ok
 
 pytestmark = pytest.mark.asyncio
 

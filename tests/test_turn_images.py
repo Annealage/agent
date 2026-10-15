@@ -20,10 +20,10 @@ import json
 import pytest
 from claude_agent_sdk import Transport
 
-from annealage_agent import files
-from annealage_agent.session import turn_images
-from annealage_agent.session.base import AGENT_READY, AgentError
-from annealage_agent.session.sdk import SdkSession
+from annealage_ember import files
+from annealage_ember.session import turn_images
+from annealage_ember.session.base import AGENT_READY, AgentError
+from annealage_ember.session.sdk import SdkSession
 
 pytestmark = pytest.mark.asyncio
 

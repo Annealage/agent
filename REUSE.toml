@@ -1,6 +1,6 @@
 version = 1
 
-# Per-file licensing map for Annealage Agent (REUSE 3.0).
+# Per-file licensing map for Annealage Ember (REUSE 3.0).
 # Authoritative, machine-readable companion to the LICENSE file. Resolves
 # the licence of any path, including files that cannot carry an inline SPDX
 # header (images, JSON, lockfiles, LICENSE itself).

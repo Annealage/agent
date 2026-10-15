@@ -22,10 +22,10 @@ from types import SimpleNamespace
 import pytest
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny, ResultMessage, tool
 
-import annealage_agent
-from annealage_agent import headless
-from annealage_agent.headless import RunResult, ToolSet, run_prompt
-from annealage_agent.session.base import (
+import annealage_ember
+from annealage_ember import headless
+from annealage_ember.headless import RunResult, ToolSet, run_prompt
+from annealage_ember.session.base import (
     AGENT_READY,
     AGENT_UNAVAILABLE,
     AgentError,
@@ -36,9 +36,9 @@ from annealage_agent.session.base import (
     ToolUse,
     TurnEnd,
 )
-from annealage_agent.session.fake import FakeSession
-from annealage_agent.session.permissions import HeadlessBroker
-from annealage_agent.tools import Grading, asks_the_human, ok
+from annealage_ember.session.fake import FakeSession
+from annealage_ember.session.permissions import HeadlessBroker
+from annealage_ember.tools import Grading, asks_the_human, ok
 
 pytestmark = pytest.mark.asyncio
 
@@ -603,15 +603,15 @@ async def test_a_tool_set_is_checked_as_the_tool_server_checks_it():
 
 
 async def test_the_public_names_import_from_the_package():
-    assert annealage_agent.run_prompt is run_prompt
-    assert annealage_agent.RunResult is RunResult
-    assert annealage_agent.ToolSet is ToolSet
-    assert not hasattr(annealage_agent, "not_a_thing")
+    assert annealage_ember.run_prompt is run_prompt
+    assert annealage_ember.RunResult is RunResult
+    assert annealage_ember.ToolSet is ToolSet
+    assert not hasattr(annealage_ember, "not_a_thing")
 
 
 async def test_importing_the_package_does_not_import_the_backends():
     code = (
-        "import sys, annealage_agent;"
+        "import sys, annealage_ember;"
         "assert 'omp_rpc' not in sys.modules and 'claude_agent_sdk' not in sys.modules"
     )
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
@@ -642,7 +642,7 @@ async def test_text_is_what_the_model_said_after_its_last_tool_result(monkeypatc
 
 async def test_a_backend_that_cannot_be_built_is_an_error_result(monkeypatch, tmp_path):
     # omp_rpc is installed apart from this package: its absence is an import error.
-    monkeypatch.setitem(sys.modules, "annealage_agent.session.omp", None)
+    monkeypatch.setitem(sys.modules, "annealage_ember.session.omp", None)
     result = await run_prompt("go", **make_args(tmp_path))
 
     assert result.stop_reason == "error"

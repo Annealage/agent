@@ -1,4 +1,4 @@
-"""The agent layer's boundary: nothing under ``src/annealage_agent/`` depends
+"""The agent layer's boundary: nothing under ``src/annealage_ember/`` depends
 on a product.
 
 This package is shared by the products built on it (Annealage Mesh was the
@@ -13,8 +13,8 @@ would not see it until that function ran.
 Two things are refused:
 
 - an import of a product's module, which is any ``annealage_*`` package other
-  than ``annealage_agent`` itself, or ``loom``; a relative import that climbs
-  above ``annealage_agent`` (``from ... import paths`` in ``session/sdk.py``),
+  than ``annealage_ember`` itself, or ``loom``; a relative import that climbs
+  above ``annealage_ember`` (``from ... import paths`` in ``session/sdk.py``),
   which can only be reaching for some other distribution's modules; and a
   string naming a product's module, which is how a module path handed to a
   subprocess would re-couple the two: any string that starts with such a
@@ -56,8 +56,8 @@ import pytest
 from conftest import DEFAULT_PORT
 from toy_product import TOY_PAGE
 
-AGENT_DIR = Path(__file__).resolve().parents[1] / "src" / "annealage_agent"
-AGENT_PACKAGE = "annealage_agent"
+AGENT_DIR = Path(__file__).resolve().parents[1] / "src" / "annealage_ember"
+AGENT_PACKAGE = "annealage_ember"
 # Top-level packages that are a product's own without the ``annealage_``
 # prefix every other product's module carries.
 UNPREFIXED_PRODUCT_PACKAGES = frozenset({"loom"})
@@ -68,7 +68,7 @@ _MODULE_TEXT_RE = re.compile(r"^(annealage_[A-Za-z0-9_]+|loom)(\.[A-Za-z_][A-Za-
 
 def _agent_modules():
     """``(path, dotted module name, is_package)`` for every module under
-    ``src/annealage_agent/``."""
+    ``src/annealage_ember/``."""
     for path in sorted(AGENT_DIR.rglob("*.py")):
         parts = path.relative_to(AGENT_DIR).with_suffix("").parts
         is_package = parts[-1] == "__init__"
@@ -79,7 +79,7 @@ def _agent_modules():
 
 def _relative_base(node, module_name, is_package):
     """The absolute package the relative ``from`` import ``node`` resolves
-    against, or None when it climbs above ``annealage_agent`` itself."""
+    against, or None when it climbs above ``annealage_ember`` itself."""
     package = module_name if is_package else module_name.rpartition(".")[0]
     for _ in range(node.level - 1):
         package = package.rpartition(".")[0]
@@ -186,9 +186,9 @@ def test_the_agent_package_is_where_the_checker_looks():
     """Guards the check itself: a moved directory would otherwise make every
     test below pass over zero files."""
     modules = [name for _path, name, _pkg in _agent_modules()]
-    assert "annealage_agent.product" in modules
-    assert "annealage_agent.session.sdk" in modules
-    assert "annealage_agent.http.routes_mcp" in modules
+    assert "annealage_ember.product" in modules
+    assert "annealage_ember.session.sdk" in modules
+    assert "annealage_ember.http.routes_mcp" in modules
 
 
 @pytest.mark.parametrize(
@@ -228,7 +228,7 @@ def test_agent_module_depends_on_no_product(path, module_name, is_package):
     ],
 )
 def test_the_checker_catches_a_regression(source):
-    assert violations(source, "annealage_agent.session.sdk")
+    assert violations(source, "annealage_ember.session.sdk")
 
 
 @pytest.mark.parametrize(
@@ -236,15 +236,15 @@ def test_the_checker_catches_a_regression(source):
     [
         "from .. import product\n",
         "from ..tools import ToolServer\n",
-        "from annealage_agent import files\n",
+        "from annealage_ember import files\n",
         "import asyncio\n",
         '"""A docstring may say STL, where the idea came from."""\n',
         "BRIDGE = __package__ + '.session.codex_mcp_stdio_bridge'\n",
-        'BRIDGE = "annealage_agent.session.codex_mcp_stdio_bridge"\n',
+        'BRIDGE = "annealage_ember.session.codex_mcp_stdio_bridge"\n',
     ],
 )
 def test_the_checker_allows_the_agent_layer_itself(source):
-    assert violations(source, "annealage_agent.session.sdk") == []
+    assert violations(source, "annealage_ember.session.sdk") == []
 
 
 # --- the front end under static/ ------------------------------------------
@@ -442,7 +442,7 @@ def agent_route_prefixes():
     agent layer adds or renames moves this list with it. (``/mcp`` is
     registered only in agent mode and is the agent's, not the page's, so a
     page naming it would rightly be refused.)"""
-    from annealage_agent import app as agent_app
+    from annealage_ember import app as agent_app
 
     with tempfile.TemporaryDirectory() as d:
         app = agent_app.create_app(d, page_html=TOY_PAGE, port=DEFAULT_PORT, register_routes=None)

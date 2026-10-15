@@ -39,8 +39,8 @@ from claude_agent_sdk.types import PermissionRuleValue
 from conftest import create_toy_app
 from toy_product import build_toy_tools
 
-from annealage_agent.session import sdk as sdk_module
-from annealage_agent.session.base import (
+from annealage_ember.session import sdk as sdk_module
+from annealage_ember.session.base import (
     AGENT_READY,
     AGENT_UNAVAILABLE,
     AgentError,
@@ -55,8 +55,8 @@ from annealage_agent.session.base import (
     TurnEnd,
     Usage,
 )
-from annealage_agent.session.permissions import Decision
-from annealage_agent.session.sdk import SandboxStatus, SdkSession
+from annealage_ember.session.permissions import Decision
+from annealage_ember.session.sdk import SandboxStatus, SdkSession
 
 # The toy tools that never prompt, in the namespaced form fact 1 requires
 # (``mcp__<server>__<tool>``). Hardcoded here rather than read off the tool
@@ -557,7 +557,7 @@ async def test_the_tripwire_is_installed_as_a_pre_tool_use_hook_matching_every_t
 async def test_the_tripwire_says_nothing_while_the_config_is_unchanged(tmp_path):
     """Returning ``{}`` leaves the permission flow exactly as it would be with
     no hook at all, which is what keeps contained bash running unprompted."""
-    from annealage_agent.session import workspace_trust as wt
+    from annealage_ember.session import workspace_trust as wt
 
     recorder = EventRecorder()
     session = SdkSession(
@@ -570,7 +570,7 @@ async def test_the_tripwire_says_nothing_while_the_config_is_unchanged(tmp_path)
 
 @pytest.mark.asyncio
 async def test_the_tripwire_denies_every_tool_once_the_config_changes(tmp_path):
-    from annealage_agent.session import workspace_trust as wt
+    from annealage_ember.session import workspace_trust as wt
 
     recorder = EventRecorder()
     session = SdkSession(
@@ -596,7 +596,7 @@ async def test_the_tripwire_denies_every_tool_once_the_config_changes(tmp_path):
 async def test_the_change_is_reported_to_the_human_only_once(tmp_path):
     """The model retries a denied call, so a report per attempt would bury the
     pane in copies of one fact."""
-    from annealage_agent.session import workspace_trust as wt
+    from annealage_ember.session import workspace_trust as wt
 
     recorder = EventRecorder()
     session = SdkSession(
@@ -613,7 +613,7 @@ async def test_the_change_is_reported_to_the_human_only_once(tmp_path):
 async def test_a_digest_that_cannot_be_computed_denies(tmp_path, monkeypatch):
     """A control that cannot tell whether the configuration changed has to
     assume it did."""
-    from annealage_agent.session import workspace_trust as wt
+    from annealage_ember.session import workspace_trust as wt
 
     recorder = EventRecorder()
     session = SdkSession(
@@ -725,9 +725,9 @@ async def test_submit_turn_sends_the_turn_to_the_real_client():
 
 @pytest.mark.asyncio
 async def test_an_active_sdk_turn_refuses_browser_input_without_consuming_notes_or_number():
-    from annealage_agent.http import ws as ws_module
-    from annealage_agent.session.events import EventLog
-    from annealage_agent.viewers import ViewerBus
+    from annealage_ember.http import ws as ws_module
+    from annealage_ember.session.events import EventLog
+    from annealage_ember.viewers import ViewerBus
 
     session, transport, recorder = await _started_session()
     bus, log = ViewerBus(None, url="http://127.0.0.1/"), EventLog()
@@ -1346,8 +1346,8 @@ async def test_each_app_s_write_protected_patterns_reach_its_claude_session(tmp_
     """``create_app(write_protected=...)`` is the app's own set, relative to
     the directory it serves, in place of the product's (the toy protects
     nothing): what ``launch.build_session`` gives the session's hook."""
-    from annealage_agent import launch, sessions
-    from annealage_agent import settings as settings_module
+    from annealage_ember import launch, sessions
+    from annealage_ember import settings as settings_module
 
     sid = sessions.create_session(tmp_path)
     built = []
@@ -1580,7 +1580,7 @@ async def test_the_secret_path_hook_expresses_no_opinion_on_ordinary_work(tmp_pa
 async def test_the_secret_path_hook_denies_when_it_cannot_decide(monkeypatch):
     """A control that cannot tell whether a call is safe has to assume it is
     not, the same way the digest check does."""
-    from annealage_agent.session import secret_paths
+    from annealage_ember.session import secret_paths
 
     def explode(*args, **kwargs):
         raise RuntimeError("no home directory")
@@ -1706,8 +1706,8 @@ def test_launch_builds_the_claude_session_with_the_tool_servers_pre_allowed_list
     what makes each of them reach the human as a card."""
     from types import SimpleNamespace
 
-    from annealage_agent import launch, sessions
-    from annealage_agent import settings as settings_module
+    from annealage_ember import launch, sessions
+    from annealage_ember import settings as settings_module
 
     class _StubBus:
         paused = False
@@ -1743,8 +1743,8 @@ def _session_with_context(backend, tmp_path, session_id):
     for the two session-context tests below."""
     from types import SimpleNamespace
 
-    from annealage_agent import launch
-    from annealage_agent import settings as settings_module
+    from annealage_ember import launch
+    from annealage_ember import settings as settings_module
 
     bus = SimpleNamespace(
         tools=build_toy_tools(SimpleNamespace(paused=False), tmp_path, session_id),
@@ -1775,7 +1775,7 @@ def test_the_product_s_session_context_reaches_each_backend(tmp_path, swap_produ
 
     from toy_product import TOY
 
-    from annealage_agent import sessions
+    from annealage_ember import sessions
 
     seen = []
 
@@ -1803,7 +1803,7 @@ def test_the_product_s_session_context_reaches_omp(tmp_path, swap_product):
 
     from toy_product import TOY
 
-    from annealage_agent import sessions
+    from annealage_ember import sessions
 
     seen = []
 

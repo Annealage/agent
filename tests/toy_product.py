@@ -1,7 +1,7 @@
 """The product this package's own suite runs as.
 
 The agent layer knows nothing about what a product shows or does
-(``annealage_agent/product.py``), so its tests need some product installed,
+(``annealage_ember/product.py``), so its tests need some product installed,
 and using a real one (Mesh) would both drag a 3D package into this suite and
 make "read from the product" indistinguishable from "hard-coded to that
 product's values". This one is small and deliberately unlike any real product:
@@ -40,13 +40,13 @@ import json
 from pathlib import Path
 from typing import ClassVar, Optional
 
-from annealage_agent import product, protocol, settings
-from annealage_agent.review import AnchorSpace, JsonReviewStore, ReviewError
-from annealage_agent.session.base import AgentEvent
+from annealage_ember import product, protocol, settings
+from annealage_ember.review import AnchorSpace, JsonReviewStore, ReviewError
+from annealage_ember.session.base import AgentEvent
 
 TOY_PAGE = Path(__file__).resolve().parent / "toy_page.html"
 
-#: The toy's tools, by grade (``annealage_agent.tools.Grading``'s fields).
+#: The toy's tools, by grade (``annealage_ember.tools.Grading``'s fields).
 TOY_READ = ("list_notes", "get_view")
 TOY_VIEW = ("set_view",)
 TOY_WRITE = ("add_note", "clear_notes")
@@ -169,9 +169,9 @@ def build_toy_tools(bus, serve_dir, session_id=None, *, remote=None):
     (``tests/test_remote_tools.py``), ``REMOTE`` when not given."""
     from claude_agent_sdk import tool
 
-    from annealage_agent import files
-    from annealage_agent.review.tools import review_tools
-    from annealage_agent.tools import Grading, ToolServer, ok
+    from annealage_ember import files
+    from annealage_ember.review.tools import review_tools
+    from annealage_ember.tools import Grading, ToolServer, ok
 
     @tool("list_notes", "Read the notes saved in the served directory.", {})
     async def list_notes(args):
@@ -220,7 +220,7 @@ def build_toy_tools(bus, serve_dir, session_id=None, *, remote=None):
 
 def register_toy_routes(app, allowed_origins):
     """The toy's ``register_routes``: its page at ``/``."""
-    from annealage_agent.http import Response
+    from annealage_ember.http import Response
 
     @app.get("/")
     async def _page(req):

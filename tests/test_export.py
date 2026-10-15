@@ -16,9 +16,9 @@ import time
 
 import pytest
 
-from annealage_agent import files, sessions
-from annealage_agent.session import events
-from annealage_agent.session.base import (
+from annealage_ember import files, sessions
+from annealage_ember.session import events
+from annealage_ember.session.base import (
     AgentStatus,
     PermissionRequest,
     PermissionResolved,

@@ -6,8 +6,8 @@ asked, and nobody at the terminal means an error rather than a guess.
 
 import pytest
 
-from annealage_agent import backends, settings
-from annealage_agent.backends import detect as real_detect
+from annealage_ember import backends, settings
+from annealage_ember.backends import detect as real_detect
 
 
 def _answers(*replies):

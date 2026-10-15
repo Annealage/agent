@@ -1,4 +1,4 @@
-"""Annealage Agent: the embedded coding agent the Annealage products share.
+"""Annealage Ember: the embedded coding agent the Annealage products share.
 
 A product (Annealage Mesh for 3D parts, for example) serves its own view in a
 browser page; this package puts a chat pane beside it, runs the agent behind

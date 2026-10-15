@@ -54,7 +54,7 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.fixture
 def net():
-    import annealage_agent.net as net_module
+    import annealage_ember.net as net_module
 
     return net_module
 

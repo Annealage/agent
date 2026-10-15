@@ -19,8 +19,8 @@ import pytest
 from conftest import DEFAULT_PORT, TEST_AUTHORITY, TEST_HOST, create_toy_app, make_test_client
 from microdot import Request
 
-from annealage_agent import files
-from annealage_agent.http import routes_chat
+from annealage_ember import files
+from annealage_ember.http import routes_chat
 
 pytestmark = pytest.mark.asyncio
 

@@ -1,6 +1,6 @@
-# Releasing Annealage Agent to PyPI
+# Releasing Annealage Ember to PyPI
 
-Annealage Agent publishes to PyPI via GitHub Actions trusted publishing
+Annealage Ember publishes to PyPI via GitHub Actions trusted publishing
 (OIDC), so there's no API token to store. First-time setup, then it's one
 release per version.
 
@@ -21,12 +21,12 @@ workflow refuses to build while the path source is there. The order is:
    starts private or public. While it's private, anything that clones it
    (a product's CI checking out a submodule or the sibling checkout, a uv git
    source) needs a token with read access, the way Mesh's CI uses
-   `ANNEALAGE_AGENT_READ_TOKEN` today.
+   `ANNEALAGE_EMBER_READ_TOKEN` today.
 2. Once the remote exists, Mesh and Loom can switch from the sibling path to a
    git submodule of it (README, "As a git submodule"), so a checkout of either
    brings the agent commit it was tested against.
 3. Release this package (below).
-4. In each product, raise the `annealage-agent` floor to that release and
+4. In each product, raise the `annealage-ember` floor to that release and
    delete the path source. A path source to a git submodule of this repository
    is fine for development, but it is still a path source, so a product that
    publishes has to depend on the release.
@@ -38,13 +38,13 @@ workflow refuses to build while the path source is there. The order is:
 The repository has to exist first (step 1 above).
 
 1. On PyPI, add a "pending publisher" for a new project (Account → Publishing):
-   - PyPI project name: `annealage-agent`
+   - PyPI project name: `annealage-ember`
    - Owner: `Annealage`
    - Repository: `agent`
    - Workflow: `publish.yml`
    - Environment: leave blank (the workflow doesn't use one)
 
-That's it: PyPI now trusts this repo's `publish.yml` to upload `annealage-agent`.
+That's it: PyPI now trusts this repo's `publish.yml` to upload `annealage-ember`.
 
 ## Cutting a release
 

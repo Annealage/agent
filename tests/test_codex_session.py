@@ -53,7 +53,7 @@ from openai_codex.generated.v2_all import (
 from openai_codex.models import Notification
 from toy_product import TOY
 
-from annealage_agent.session.base import (
+from annealage_ember.session.base import (
     AGENT_READY,
     AGENT_UNAVAILABLE,
     AgentError,
@@ -66,8 +66,8 @@ from annealage_agent.session.base import (
     TurnEnd,
     Usage,
 )
-from annealage_agent.session.codex import CodexSession
-from annealage_agent.session.permissions import PermissionBroker
+from annealage_ember.session.codex import CodexSession
+from annealage_ember.session.permissions import PermissionBroker
 
 
 class FakeCodexClient:
@@ -524,15 +524,15 @@ async def test_allow_always_on_bash_is_downgraded_to_a_one_time_accept():
 
 
 def test_to_codex_decision_allow_with_no_remembered_tool_is_accept():
-    from annealage_agent.session.codex import _to_codex_decision
-    from annealage_agent.session.permissions import Decision
+    from annealage_ember.session.codex import _to_codex_decision
+    from annealage_ember.session.permissions import Decision
 
     assert _to_codex_decision(Decision(allow=True)) == {"decision": "accept"}
 
 
 def test_to_codex_decision_allow_with_a_remembered_tool_is_accept_for_session():
-    from annealage_agent.session.codex import _to_codex_decision
-    from annealage_agent.session.permissions import Decision
+    from annealage_ember.session.codex import _to_codex_decision
+    from annealage_ember.session.permissions import Decision
 
     assert _to_codex_decision(Decision(allow=True, remember_tool="FileChange")) == {
         "decision": "acceptForSession"
@@ -540,8 +540,8 @@ def test_to_codex_decision_allow_with_a_remembered_tool_is_accept_for_session():
 
 
 def test_to_codex_decision_deny_is_decline():
-    from annealage_agent.session.codex import _to_codex_decision
-    from annealage_agent.session.permissions import Decision
+    from annealage_ember.session.codex import _to_codex_decision
+    from annealage_ember.session.permissions import Decision
 
     assert _to_codex_decision(Decision(allow=False, message="no")) == {"decision": "decline"}
 
@@ -727,7 +727,7 @@ async def test_interrupt_leaves_a_card_the_human_raised_from_the_page_open():
 
 @pytest.mark.asyncio
 async def test_text_delta_becomes_one_text_delta_event():
-    from annealage_agent.session.base import TextDelta
+    from annealage_ember.session.base import TextDelta
 
     session, fake, recorder, broker = await _started_session()
     try:
@@ -904,7 +904,7 @@ def test_mcp_config_overrides_is_valid_toml_registering_the_stdio_proxy(tmp_path
     assert toy["command"] == sys.executable
     assert toy["args"] == [
         "-m",
-        "annealage_agent.session.codex_mcp_stdio_bridge",
+        "annealage_ember.session.codex_mcp_stdio_bridge",
         "--host",
         "127.0.0.1",
         "--port",
@@ -914,14 +914,14 @@ def test_mcp_config_overrides_is_valid_toml_registering_the_stdio_proxy(tmp_path
         "--server-version",
         TOY.version,
     ]
-    assert toy["env_vars"] == ["ANNEALAGE_AGENT_TOKEN"]
+    assert toy["env_vars"] == ["ANNEALAGE_EMBER_TOKEN"]
     # Codex's own per-tool timeout (60 s by default) must outlast the
     # approval card, or Codex fails a call the host still holds open.
     assert toy["tool_timeout_sec"] > 3600
     # Forwarded to the bridge, and kept out of the shells Codex runs for the
     # model, which Codex does not do on its own for a *TOKEN* name.
-    assert parsed["shell_environment_policy"]["exclude"] == ["ANNEALAGE_AGENT_TOKEN"]
-    assert session._mcp_env() == {"ANNEALAGE_AGENT_TOKEN": 'tok "en\\x'}
+    assert parsed["shell_environment_policy"]["exclude"] == ["ANNEALAGE_EMBER_TOKEN"]
+    assert session._mcp_env() == {"ANNEALAGE_EMBER_TOKEN": 'tok "en\\x'}
 
 
 def test_the_shell_exclude_keeps_the_users_own_list(tmp_path, monkeypatch):
@@ -934,7 +934,7 @@ def test_the_shell_exclude_keeps_the_users_own_list(tmp_path, monkeypatch):
         import tomli as tomllib
 
     (tmp_path / "config.toml").write_text(
-        '[shell_environment_policy]\nexclude = ["AWS_*", "ANNEALAGE_AGENT_TOKEN"]\n',
+        '[shell_environment_policy]\nexclude = ["AWS_*", "ANNEALAGE_EMBER_TOKEN"]\n',
         encoding="utf-8",
     )
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
@@ -942,7 +942,7 @@ def test_the_shell_exclude_keeps_the_users_own_list(tmp_path, monkeypatch):
         lambda e: None, cwd="/proj", session_id="s", mcp_host="h", mcp_port=1, mcp_token="t"
     )
     parsed = tomllib.loads("\n".join(session._mcp_config_overrides()))
-    assert parsed["shell_environment_policy"]["exclude"] == ["AWS_*", "ANNEALAGE_AGENT_TOKEN"]
+    assert parsed["shell_environment_policy"]["exclude"] == ["AWS_*", "ANNEALAGE_EMBER_TOKEN"]
 
 
 def test_no_bridge_means_no_token_in_the_app_server_environment():
@@ -985,7 +985,7 @@ async def test_start_threads_config_overrides_through_to_codex_config():
         assert captured["config"].config_overrides != ()
         # The token reaches the app-server through its environment, the one
         # channel env_vars forwards to the bridge, and never its argv.
-        assert captured["config"].env == {"ANNEALAGE_AGENT_TOKEN": "ttt"}
+        assert captured["config"].env == {"ANNEALAGE_EMBER_TOKEN": "ttt"}
         assert not any("ttt" in entry for entry in captured["config"].config_overrides)
     finally:
         await session.close()

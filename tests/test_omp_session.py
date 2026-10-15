@@ -36,9 +36,9 @@ import pytest
 from claude_agent_sdk import SdkMcpTool
 from omp_rpc import RpcClient
 
-from annealage_agent import launch, sessions
-from annealage_agent.session import omp as omp_module
-from annealage_agent.session.base import (
+from annealage_ember import launch, sessions
+from annealage_ember.session import omp as omp_module
+from annealage_ember.session.base import (
     AGENT_CONNECTING,
     AGENT_READY,
     AGENT_UNAVAILABLE,
@@ -58,16 +58,16 @@ from annealage_agent.session.base import (
     TurnEnd,
     Usage,
 )
-from annealage_agent.session.omp import (
+from annealage_ember.session.omp import (
     OmpSession,
     _api_key_env_name,
     _build_custom_provider,
     _provider_id,
     _write_agent_dir,
 )
-from annealage_agent.session.permissions import PermissionBroker
-from annealage_agent.tools import ToolSpec, _wrap, ok
-from annealage_agent.viewers import ViewerBus
+from annealage_ember.session.permissions import PermissionBroker
+from annealage_ember.tools import ToolSpec, _wrap, ok
+from annealage_ember.viewers import ViewerBus
 
 
 class FakeRpcClient:
@@ -1000,8 +1000,8 @@ async def test_resolving_a_human_comment_asks_once_per_call_and_is_never_remembe
 ):
     from toy_product import TOY_PAUSED_MESSAGE, toy_review_store
 
-    from annealage_agent.review.tools import review_tools
-    from annealage_agent.tools import Grading, ToolServer
+    from annealage_ember.review.tools import review_tools
+    from annealage_ember.tools import Grading, ToolServer
 
     store = toy_review_store(tmp_path)
     for text in ("one", "two"):
@@ -1383,8 +1383,8 @@ async def test_a_turn_sent_while_omp_is_still_connecting_is_neither_prompted_nor
     connecting (switch_session, get_state). A turn sent then is refused
     before omp or either counter sees it, so the next accepted turn's
     ``user_turn`` and its reply carry the same number."""
-    from annealage_agent.http import ws as ws_module
-    from annealage_agent.session.events import EventLog
+    from annealage_ember.http import ws as ws_module
+    from annealage_ember.session.events import EventLog
 
     session, fake, recorder, broker = await _started_session()
     log = EventLog()
@@ -2046,7 +2046,7 @@ async def test_set_tool_table_registers_the_new_tools_with_the_running_omp():
 
 def _history(tmp_path, events):
     """A session whose events.jsonl already holds ``events``."""
-    from annealage_agent.session.events import EventLog
+    from annealage_ember.session.events import EventLog
 
     sid = sessions.create_session(tmp_path)
     log = EventLog(str(sessions.events_path(tmp_path, sid)))
@@ -2071,7 +2071,7 @@ class _Unregistered:
 def _resumed_omp_app(tmp_path, sid, monkeypatch):
     from conftest import create_toy_app
 
-    from annealage_agent import settings as settings_module
+    from annealage_ember import settings as settings_module
 
     clients = []
 
@@ -2112,8 +2112,8 @@ async def test_a_resumed_session_s_next_turn_follows_the_last_one_in_its_history
     """Five turns already in the log: the next human turn is 6 on the bus, on
     the wire and in the log, the human's message included, never a second
     turn 1 the page would merge into the replayed one."""
-    from annealage_agent.http import ws as ws_module
-    from annealage_agent.session.events import read_records
+    from annealage_ember.http import ws as ws_module
+    from annealage_ember.session.events import read_records
 
     sid = _history(
         tmp_path,
@@ -2166,8 +2166,8 @@ async def test_a_resumed_session_s_next_turn_follows_the_last_one_in_its_history
 @pytest.mark.asyncio
 async def test_a_queued_turn_is_logged_under_the_turn_its_reply_arrives_under(tmp_path, monkeypatch):
     """A queued input keeps its own turn identity after the previous run ends."""
-    from annealage_agent.http import ws as ws_module
-    from annealage_agent.session.events import read_records
+    from annealage_ember.http import ws as ws_module
+    from annealage_ember.session.events import read_records
 
     sid = _history(tmp_path, [TurnEnd(turn=1, stop_reason="end", cost_usd=0.0)])
     app, clients = _resumed_omp_app(tmp_path, sid, monkeypatch)
@@ -2241,7 +2241,7 @@ def test_a_turn_the_previous_process_never_finished_is_closed_on_resume(tmp_path
     """Killed mid-turn: the history ends with turn 3 unfinished, which the page
     would show as still running (and label Send as Steer). The resumed app
     closes it, and the next turn is 4."""
-    from annealage_agent.session.events import read_records
+    from annealage_ember.session.events import read_records
 
     sid = _history(
         tmp_path,
@@ -2265,7 +2265,7 @@ def test_a_turn_the_previous_process_never_finished_is_closed_on_resume(tmp_path
 def test_a_resumed_history_that_ended_cleanly_gets_no_new_event(tmp_path, monkeypatch):
     """Every turn in the history ended: nothing is appended on resume, and the
     bus says where this process's turns start."""
-    from annealage_agent.session.events import read_records
+    from annealage_ember.session.events import read_records
 
     events = [TextDelta(turn=t, text="old") for t in (1, 2)]
     events += [TurnEnd(turn=t, stop_reason="end", cost_usd=0.0) for t in (1, 2)]
@@ -2283,7 +2283,7 @@ def test_every_unfinished_turn_in_the_history_is_closed_on_resume(tmp_path, monk
     number reused before the numbering was continued across resumes): each
     is closed, once, and only the turn kinds count (a product event carrying
     a ``turn`` of its own neither moves the numbering nor gets closed)."""
-    from annealage_agent.session.events import read_records
+    from annealage_ember.session.events import read_records
 
     sid = _history(
         tmp_path,

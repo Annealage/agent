@@ -12,7 +12,7 @@ import subprocess
 
 import pytest
 
-from annealage_agent import product
+from annealage_ember import product
 
 PAUSE_JS = __import__("pathlib").Path(product.__file__).resolve().parent / "static" / "pause.js"
 

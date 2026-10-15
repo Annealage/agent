@@ -18,7 +18,7 @@ import threading
 
 import pytest
 
-from annealage_agent import lock
+from annealage_ember import lock
 
 
 def test_exclusive_creation_writes_pid_and_port_and_no_token(tmp_path):

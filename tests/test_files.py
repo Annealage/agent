@@ -11,7 +11,7 @@ import os
 
 import pytest
 
-from annealage_agent import files
+from annealage_ember import files
 
 # --- scan_static: extension allowlist, symlinks, the vendor/LICENSE carve-out --
 

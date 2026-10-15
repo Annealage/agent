@@ -168,7 +168,7 @@ from typing import Any, Callable, Mapping, Optional, Tuple
 
 #: The agent layer's own stdio MCP bridge, the module Codex launches with
 #: ``python -m``.
-CODEX_BRIDGE_MODULE = "annealage_agent.session.codex_mcp_stdio_bridge"
+CODEX_BRIDGE_MODULE = "annealage_ember.session.codex_mcp_stdio_bridge"
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -285,7 +285,7 @@ def current():
     if _installed is None:
         raise RuntimeError(
             "no product is installed in this process; the product's own package "
-            "installs one with annealage_agent.product.install before the agent "
+            "installs one with annealage_ember.product.install before the agent "
             "layer is used"
         )
     return _installed

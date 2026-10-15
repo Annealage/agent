@@ -16,10 +16,10 @@ import pytest
 from conftest import DEFAULT_PORT, TEST_HOST, create_toy_app, make_test_client
 from toy_product import TOY_REVIEW_FILE, toy_review_store
 
-from annealage_agent import app as agent_app
-from annealage_agent import sessions
-from annealage_agent.review import Capabilities
-from annealage_agent.session.fake import FakeSession
+from annealage_ember import app as agent_app
+from annealage_ember import sessions
+from annealage_ember.review import Capabilities
+from annealage_ember.session.fake import FakeSession
 
 pytestmark = pytest.mark.asyncio
 

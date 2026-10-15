@@ -18,7 +18,7 @@ import pytest
 from conftest import DEFAULT_PORT, TEST_HOST, create_toy_app, make_test_client
 from toy_product import TOY_PAGE
 
-from annealage_agent import app as agent_app
+from annealage_ember import app as agent_app
 
 pytestmark = pytest.mark.asyncio
 
@@ -159,9 +159,9 @@ async def test_agent_mode_writes_the_conversation_to_the_sessions_event_log(tmp_
     so a log with nowhere to go leaves both reading an empty history and
     reporting every session as 0 turns and $0.00.
     """
-    from annealage_agent import sessions
-    from annealage_agent.session.base import TurnEnd
-    from annealage_agent.session.fake import FakeSession
+    from annealage_ember import sessions
+    from annealage_ember.session.base import TurnEnd
+    from annealage_ember.session.fake import FakeSession
 
     sid = sessions.create_session(tmp_path)
     built = []
@@ -244,7 +244,7 @@ async def _hello_of(app):
     from microdot.microdot import Request
     from microdot.websocket import WebSocket
 
-    from annealage_agent import protocol
+    from annealage_ember import protocol
 
     client = make_test_client(app)
     headers = {
@@ -274,8 +274,8 @@ async def _hello_of(app):
 
 
 def _app_with_fake_session(served_dir, session_cls=None, **kwargs):
-    from annealage_agent import sessions
-    from annealage_agent.session.fake import FakeSession
+    from annealage_ember import sessions
+    from annealage_ember.session.fake import FakeSession
 
     built = []
     sid = sessions.create_session(served_dir)
@@ -298,7 +298,7 @@ async def test_a_fresh_connection_after_a_live_model_switch_sees_the_new_model(s
     announcing it is still inside the replay ring buffer -- once evicted, a
     fresh ``hello`` would permanently show the CLI-configured starting model
     instead of what the session is actually running."""
-    from annealage_agent.session.base import AgentModelChanged
+    from annealage_ember.session.base import AgentModelChanged
 
     app, session = _app_with_fake_session(served_dir, settings={"model": "claude-opus-4"})
     # The live switch this fix keeps session_info current for -- a real
@@ -320,7 +320,7 @@ async def test_a_fresh_connection_after_a_live_model_switch_sees_the_new_model(s
 
 
 async def test_a_fresh_connection_gets_backend_reported_runtime_metadata(served_dir):
-    from annealage_agent.session.base import AgentRuntimeResolved
+    from annealage_ember.session.base import AgentRuntimeResolved
 
     app, session = _app_with_fake_session(served_dir, settings={"model": "requested-model"})
     session.emit(
@@ -346,7 +346,7 @@ async def test_a_fresh_connection_gets_backend_reported_runtime_metadata(served_
 async def test_a_fresh_connection_gets_the_models_the_backend_listed(served_dir):
     """The list is published once, at session start, usually before any tab
     is open, so a later tab takes it from the hello, not from the replay."""
-    from annealage_agent.session.base import AgentModelsAvailable
+    from annealage_ember.session.base import AgentModelsAvailable
 
     app, session = _app_with_fake_session(served_dir)
     session.emit(AgentModelsAvailable(models=["titan/qwen3.9-70b", "anthropic/claude-opus-4"]))
@@ -360,7 +360,7 @@ async def test_a_reload_replacing_a_session_that_went_down_offers_none_of_its_mo
     went down is greeted before the new one has listed anything, so its hello
     offers no models rather than the old session's, and the new session's
     own list reaches the next one."""
-    from annealage_agent.session.base import AgentModelsAvailable, AgentStatus
+    from annealage_ember.session.base import AgentModelsAvailable, AgentStatus
 
     app, session = _app_with_fake_session(served_dir)
     session.emit(AgentModelsAvailable(models=["titan/qwen3.9-70b"]))
@@ -381,8 +381,8 @@ async def test_a_page_opened_while_the_agent_is_down_is_told_why(served_dir):
     unavailable pane with no reason. Opening it starts the agent again, and
     the hello carries the latest error while that one is not ready, and
     nothing once it is."""
-    from annealage_agent.session.base import AGENT_CONNECTING, AgentError, AgentStatus
-    from annealage_agent.session.fake import FakeSession
+    from annealage_ember.session.base import AGENT_CONNECTING, AgentError, AgentStatus
+    from annealage_ember.session.fake import FakeSession
 
     class Starting(FakeSession):
         """Connecting until told otherwise, as a real backend's is."""
@@ -415,10 +415,10 @@ async def test_the_hello_carries_the_conversation_s_usage_across_a_restart(serve
     the last ``usage`` event's figures, whatever else followed; and after a
     restart, the last one the log holds, never a sum of the log's turn ends,
     until the resumed backend reports afresh."""
-    from annealage_agent import sessions
-    from annealage_agent.session.base import SessionReset, TurnEnd, Usage
-    from annealage_agent.session.events import EventLog
-    from annealage_agent.session.fake import FakeSession
+    from annealage_ember import sessions
+    from annealage_ember.session.base import SessionReset, TurnEnd, Usage
+    from annealage_ember.session.events import EventLog
+    from annealage_ember.session.fake import FakeSession
 
     app, session = _app_with_fake_session(served_dir)
     try:
@@ -487,10 +487,10 @@ async def test_a_human_turn_the_last_process_never_answered_is_closed_on_resume(
     """The process died after logging the human's message and before the
     agent said anything. The resumed app closes that turn, so the page does
     not show it as running, and continues the numbering after it."""
-    from annealage_agent import sessions
-    from annealage_agent.session.base import TextDelta, TurnEnd, UserTurn
-    from annealage_agent.session.events import EventLog, read_records
-    from annealage_agent.session.fake import FakeSession
+    from annealage_ember import sessions
+    from annealage_ember.session.base import TextDelta, TurnEnd, UserTurn
+    from annealage_ember.session.events import EventLog, read_records
+    from annealage_ember.session.fake import FakeSession
 
     sid = sessions.create_session(served_dir)
     log = EventLog(str(sessions.events_path(served_dir, sid)))
@@ -524,10 +524,10 @@ async def test_a_permission_request_the_last_process_never_resolved_is_closed_on
     """Killed while a card waited: nobody can answer it now, so the resumed
     app resolves it, and the page replaying the history shows no live card.
     An answered request is left alone."""
-    from annealage_agent import sessions
-    from annealage_agent.session.base import PermissionRequest, PermissionResolved
-    from annealage_agent.session.events import EventLog
-    from annealage_agent.session.fake import FakeSession
+    from annealage_ember import sessions
+    from annealage_ember.session.base import PermissionRequest, PermissionResolved
+    from annealage_ember.session.events import EventLog
+    from annealage_ember.session.fake import FakeSession
 
     sid = sessions.create_session(served_dir)
     log = EventLog(str(sessions.events_path(served_dir, sid)))
@@ -563,7 +563,7 @@ async def test_a_permission_request_the_last_process_never_resolved_is_closed_on
 async def test_viewer_only_mode_writes_no_event_log(tmp_path):
     """There is no session and no conversation, so there is nothing to persist
     and nothing to create a session directory for."""
-    from annealage_agent import sessions
+    from annealage_ember import sessions
 
     create_toy_app(tmp_path, token="tok")
 
@@ -601,8 +601,8 @@ async def test_a_session_factory_that_returns_none_builds_a_working_app(tmp_path
 
 
 async def test_attention_is_published_to_the_page_and_recorded_in_the_event_log(tmp_path):
-    from annealage_agent import sessions
-    from annealage_agent.session.fake import FakeSession
+    from annealage_ember import sessions
+    from annealage_ember.session.fake import FakeSession
 
     sid = sessions.create_session(tmp_path)
     app = create_toy_app(
@@ -620,8 +620,8 @@ async def test_attention_is_published_to_the_page_and_recorded_in_the_event_log(
 
 
 async def test_a_tool_s_end_turn_reaches_the_session_that_can_stop_its_turn(tmp_path):
-    from annealage_agent import sessions
-    from annealage_agent.session.fake import FakeSession
+    from annealage_ember import sessions
+    from annealage_ember.session.fake import FakeSession
 
     class _Stoppable(FakeSession):
         ended = 0
@@ -744,7 +744,7 @@ async def test_responses_carry_nosniff_header(client):
 
 
 def _body_routes(app, _allowed_origins):
-    from annealage_agent.http import read_json_body
+    from annealage_ember.http import read_json_body
 
     @app.post("/buffered")
     async def buffered(req):

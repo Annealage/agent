@@ -149,7 +149,7 @@ def configure_request_limits():
 _UNBUFFERED = (
     "this request's body is not buffered (the agent layer sets "
     "Request.max_body_length to 0), so req.%s would be empty: read it off "
-    "req.stream with annealage_agent.http.read_json_body"
+    "req.stream with annealage_ember.http.read_json_body"
 )
 
 

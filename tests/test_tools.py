@@ -33,8 +33,8 @@ import json
 import pytest
 from toy_product import NOTES_FILE, TOY_PAUSED_MESSAGE, build_toy_tools
 
-from annealage_agent.tools import Grading, ToolServer, namespaced
-from annealage_agent.viewers import CallError, NoViewerConnected, ViewerGone
+from annealage_ember.tools import Grading, ToolServer, namespaced
+from annealage_ember.viewers import CallError, NoViewerConnected, ViewerGone
 
 pytestmark = pytest.mark.asyncio
 
@@ -153,8 +153,8 @@ async def test_no_write_class_tool_is_pre_allowed(project):
 async def test_nonrememberable_write_keeps_its_gate_and_gets_fresh_cards(
     project, tmp_path, broker_name
 ):
-    from annealage_agent.session.base import PermissionRequest
-    from annealage_agent.session.permissions import PermissionBroker
+    from annealage_ember.session.base import PermissionRequest
+    from annealage_ember.session.permissions import PermissionBroker
 
     bus = FakeBus()
     real = build_toy_tools(bus, project)

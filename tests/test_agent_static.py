@@ -31,9 +31,9 @@ import pytest
 from conftest import DEFAULT_PORT, TEST_HOST, create_toy_app, make_test_client
 from toy_product import TOY_PAGE, register_toy_routes
 
-from annealage_agent import app as agent_app
-from annealage_agent import files
-from annealage_agent.http import static as agent_static
+from annealage_ember import app as agent_app
+from annealage_ember import files
+from annealage_ember.http import static as agent_static
 
 pytestmark = pytest.mark.asyncio
 

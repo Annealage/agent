@@ -1,8 +1,8 @@
 # Commercial Licensing
 
-Annealage Agent is published under the **PolyForm Noncommercial License 1.0.0** (see [LICENSE](LICENSE)) for noncommercial use only. This document explains when a commercial licence is required and how to obtain one.
+Annealage Ember is published under the **PolyForm Noncommercial License 1.0.0** (see [LICENSE](LICENSE)) for noncommercial use only. This document explains when a commercial licence is required and how to obtain one.
 
-Annealage Agent is the embedded-agent layer the Annealage products (Annealage Mesh and Annealage Loom) are built on. A commercial licence for an Annealage product that depends on this package includes it for use with that product. Annealage Agent can also be licensed commercially on its own, to use it by itself or in a product of your own; say so when you enquire.
+Annealage Ember is the embedded-agent layer the Annealage products (Annealage Mesh and Annealage Loom) are built on. A commercial licence for an Annealage product that depends on this package includes it for use with that product. Annealage Ember can also be licensed commercially on its own, to use it by itself or in a product of your own; say so when you enquire.
 
 A commercial licence covers the Licensor's own code only. Third-party dependencies are licensed by their owners, under their own licences and terms. In particular, the Claude Agent SDK (MIT, with its use governed by Anthropic's [Commercial Terms of Service](https://www.anthropic.com/legal/commercial-terms)) and the Claude Code CLI it bundles (© Anthropic PBC, all rights reserved) are subject to Anthropic's terms, including when you use them to power products and services you make available to your own customers, and the Codex and omp backends to their own terms.
 
@@ -10,12 +10,12 @@ A commercial licence covers the Licensor's own code only. Third-party dependenci
 
 The boundary is the **purpose of your use**, not whether you are a company. The PolyForm Noncommercial License permits any noncommercial purpose; a commercial licence is required when your use is for a commercial purpose, that is, use directed toward commercial advantage or monetary compensation.
 
-In practice you need a commercial licence if you use Annealage Agent for purposes such as:
+In practice you need a commercial licence if you use Annealage Ember for purposes such as:
 
 - Embedding it in, or running it beside, a tool used to design, review, or iterate on work intended to ship in a commercial product.
-- Providing paid services that involve using Annealage Agent on behalf of clients (design, engineering, contracting, consulting, review services).
-- Distributing Annealage Agent, or a modified version, as part of a commercial product or paid service.
-- Hosting Annealage Agent, or a modified version, as a service offered to third parties for a commercial purpose.
+- Providing paid services that involve using Annealage Ember on behalf of clients (design, engineering, contracting, consulting, review services).
+- Distributing Annealage Ember, or a modified version, as part of a commercial product or paid service.
+- Hosting Annealage Ember, or a modified version, as a service offered to third parties for a commercial purpose.
 
 These are illustrations of commercial-purpose use, not an exhaustive list. If your use is for a commercial purpose by any other route, a commercial licence is required. If any of these may describe your use, contact **andrew@alelec.net** before deploying or distributing.
 
@@ -29,14 +29,14 @@ Any noncommercial purpose is permitted free of charge under the PolyForm Noncomm
 - Use by charitable organisations, government agencies, public research institutions, public safety and health organisations, and environmental protection organisations, regardless of funding source.
 - Evaluation and testing with no anticipated commercial application, including evaluation by individuals at a for-profit company, on their own time or otherwise, where there is no commercial purpose to the use.
 
-You may study, modify, contribute to, and run Annealage Agent freely for any noncommercial purpose. Being a for-profit company does not by itself require a licence; using the software for a commercial purpose does.
+You may study, modify, contribute to, and run Annealage Ember freely for any noncommercial purpose. Being a for-profit company does not by itself require a licence; using the software for a commercial purpose does.
 
 ## How to obtain a commercial licence
 
 Email **andrew@alelec.net** with:
 
 1. Your company name, country, and approximate size.
-2. A short description of how you intend to use Annealage Agent, and which Annealage products you use with it.
+2. A short description of how you intend to use Annealage Ember, and which Annealage products you use with it.
 3. The approximate number of engineers who will use it.
 4. Whether you intend to redistribute, embed, or host the software.
 
@@ -55,13 +55,13 @@ Unauthorised commercial use is copyright infringement. The Licensor reserves all
 
 Under the PolyForm Noncommercial License, the first time you are notified in writing of a violation, your licenses can continue if you come into full compliance and take practical steps to correct past violations within **32 days** of the notice; otherwise all your licenses to the software terminate.
 
-Forking, rebranding, hosting, or otherwise redistributing the PolyForm-licensed Annealage Agent as a commercial offering, in whole or in part, with or without modification, is not permitted under the PolyForm Noncommercial License, and the Licensor will pursue such uses. (This concerns code obtained under the PolyForm Noncommercial License. It does not affect any rights you separately hold under a commercial licence.)
+Forking, rebranding, hosting, or otherwise redistributing the PolyForm-licensed Annealage Ember as a commercial offering, in whole or in part, with or without modification, is not permitted under the PolyForm Noncommercial License, and the Licensor will pursue such uses. (This concerns code obtained under the PolyForm Noncommercial License. It does not affect any rights you separately hold under a commercial licence.)
 
 ## Patent and trademark
 
 The Licensor reserves all patent rights not expressly granted by the PolyForm Noncommercial License or by any commercial licence.
 
-"Annealage" and "Annealage Agent" are trademarks of Andrew Leech. The PolyForm Noncommercial License grants no trademark rights. The PolyForm Noncommercial License does permit you to make and distribute modified versions for a noncommercial purpose, but that copyright permission does not extend to the trademarks. If you distribute a modified version, you must rename it so the name is clearly distinct from "Annealage" and "Annealage Agent" and does not suggest endorsement by or affiliation with the Licensor. The renaming requirement is a trademark matter; it does not restrict the copyright permission PolyForm grants.
+"Annealage" and "Annealage Ember" are trademarks of Andrew Leech. The PolyForm Noncommercial License grants no trademark rights. The PolyForm Noncommercial License does permit you to make and distribute modified versions for a noncommercial purpose, but that copyright permission does not extend to the trademarks. If you distribute a modified version, you must rename it so the name is clearly distinct from "Annealage" and "Annealage Ember" and does not suggest endorsement by or affiliation with the Licensor. The renaming requirement is a trademark matter; it does not restrict the copyright permission PolyForm grants.
 
 ## Contributions
 

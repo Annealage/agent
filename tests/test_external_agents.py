@@ -16,10 +16,10 @@ import pytest
 from conftest import create_toy_app, make_test_client
 from toy_product import NOTES_FILE, toy_review_store
 
-from annealage_agent import settings as settings_module
-from annealage_agent.http import ws as ws_module
-from annealage_agent.session.base import AGENT_UNAVAILABLE
-from annealage_agent.session.external import ExternalAgentSession, NoEmbeddedAgent
+from annealage_ember import settings as settings_module
+from annealage_ember.http import ws as ws_module
+from annealage_ember.session.base import AGENT_UNAVAILABLE
+from annealage_ember.session.external import ExternalAgentSession, NoEmbeddedAgent
 
 pytestmark = pytest.mark.asyncio
 

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from annealage_agent.remote_actions import RemoteActionStore
+from annealage_ember.remote_actions import RemoteActionStore
 
 
 CONTEXT = {
@@ -108,7 +108,7 @@ def test_preparing_reservation_blocks_concurrent_writer(tmp_path):
 
 
 def test_real_context_keeps_opaque_project_hash_and_integer_epoch():
-    from annealage_agent.remote_actions import safe_context
+    from annealage_ember.remote_actions import safe_context
 
     context = {
         "project_id": "a" * 64,

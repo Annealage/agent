@@ -21,9 +21,9 @@ from mcp.shared.memory import create_client_server_memory_streams
 from microdot.test_client import TestClient
 from toy_product import TOY, TOY_PAGE, register_toy_routes
 
-from annealage_agent import app as agent_app
-from annealage_agent import net
-from annealage_agent import product as agent_product
+from annealage_ember import app as agent_app
+from annealage_ember import net
+from annealage_ember import product as agent_product
 
 agent_product.install(TOY)
 
@@ -152,7 +152,7 @@ def one_backend_installed(monkeypatch):
     decide would pass on a machine with one CLI and fail on a CI runner with
     none; ``tests/test_backends.py`` covers the choosing itself.
     """
-    from annealage_agent import backends
+    from annealage_ember import backends
 
     monkeypatch.setattr(backends, "detect", lambda **_kw: ("claude",))
 

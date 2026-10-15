@@ -19,9 +19,9 @@ import pytest
 from conftest import TEST_HOST, create_toy_app, make_test_client
 from toy_product import NOTES_FILE
 
-from annealage_agent import app as agent_app
-from annealage_agent import sessions
-from annealage_agent.session.base import (
+from annealage_ember import app as agent_app
+from annealage_ember import sessions
+from annealage_ember.session.base import (
     AGENT_READY,
     AGENT_UNAVAILABLE,
     AgentModelChanged,
@@ -29,8 +29,8 @@ from annealage_agent.session.base import (
     TurnEnd,
     UserTurn,
 )
-from annealage_agent.session.external import ExternalAgentSession
-from annealage_agent.session.permissions import PermissionBroker
+from annealage_ember.session.external import ExternalAgentSession
+from annealage_ember.session.permissions import PermissionBroker
 
 pytestmark = pytest.mark.asyncio
 

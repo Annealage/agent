@@ -23,13 +23,13 @@ from microdot.microdot import Request
 from microdot.websocket import WebSocket
 from toy_product import NOTES_FILE, TOY_PAGE, toy_review_store
 
-from annealage_agent import app as agent_app
-from annealage_agent import protocol, sessions
-from annealage_agent.frontdoor import FrontDoor, mount_prefix
-from annealage_agent.identity import Human, TailscaleIdentity, load_users
-from annealage_agent.session.base import UserTurn
-from annealage_agent.session.events import EventLog
-from annealage_agent.session.fake import FakeSession
+from annealage_ember import app as agent_app
+from annealage_ember import protocol, sessions
+from annealage_ember.frontdoor import FrontDoor, mount_prefix
+from annealage_ember.identity import Human, TailscaleIdentity, load_users
+from annealage_ember.session.base import UserTurn
+from annealage_ember.session.events import EventLog
+from annealage_ember.session.fake import FakeSession
 
 pytestmark = pytest.mark.asyncio
 
@@ -574,7 +574,7 @@ class _HostedVerifier:
 async def test_hosted_auth_requires_operation_scoped_verified_bearer():
     from types import SimpleNamespace
 
-    from annealage_agent.identity import BrowserAuth
+    from annealage_ember.identity import BrowserAuth
 
     verifier = _HostedVerifier()
     auth = BrowserAuth(None, hosted_mode=True, hosted_verifier=verifier)
@@ -597,7 +597,7 @@ async def test_hosted_auth_requires_operation_scoped_verified_bearer():
 async def test_hosted_display_is_attribution_only_and_rejects_control_text():
     from types import SimpleNamespace
 
-    from annealage_agent.identity import BrowserAuth
+    from annealage_ember.identity import BrowserAuth
 
     auth = BrowserAuth(None, hosted_mode=True, hosted_verifier=_HostedVerifier())
     request = SimpleNamespace(
@@ -616,7 +616,7 @@ async def test_hosted_display_is_attribution_only_and_rejects_control_text():
 async def test_hosted_auth_refuses_invalid_verifier_result_and_does_not_fallback():
     from types import SimpleNamespace
 
-    from annealage_agent.identity import BrowserAuth
+    from annealage_ember.identity import BrowserAuth
 
     request = SimpleNamespace(
         headers={
@@ -635,7 +635,7 @@ async def test_hosted_auth_refuses_invalid_verifier_result_and_does_not_fallback
 
 
 async def test_hosted_mode_requires_a_verifier():
-    from annealage_agent.identity import BrowserAuth
+    from annealage_ember.identity import BrowserAuth
 
     with pytest.raises(ValueError, match="requires a delegation-token verifier"):
         BrowserAuth(None, hosted_mode=True)
@@ -644,7 +644,7 @@ async def test_hosted_mode_requires_a_verifier():
 async def test_hosted_connection_rechecks_scope_and_expiry():
     from types import SimpleNamespace
 
-    from annealage_agent.identity import BrowserAuth
+    from annealage_ember.identity import BrowserAuth
 
     claims = _HostedClaims()
     auth = BrowserAuth(None, hosted_mode=True, hosted_verifier=_HostedVerifier(claims))

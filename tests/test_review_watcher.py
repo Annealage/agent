@@ -20,7 +20,7 @@ import json
 import pytest
 from toy_product import TOY_REVIEW_FILE, toy_review_store
 
-from annealage_agent.review import ReviewWatcher
+from annealage_ember.review import ReviewWatcher
 
 pytestmark = pytest.mark.asyncio
 

@@ -28,15 +28,15 @@ import shutil
 
 import pytest
 
-from annealage_agent.session.base import AGENT_READY, AgentError, TextDelta, TurnEnd
-from annealage_agent.session.omp import OmpSession
-from annealage_agent.session.permissions import PermissionBroker
+from annealage_ember.session.base import AGENT_READY, AgentError, TextDelta, TurnEnd
+from annealage_ember.session.omp import OmpSession
+from annealage_ember.session.permissions import PermissionBroker
 
 LIVE_PROMPT = "Reply with exactly the single word PONG and nothing else, no punctuation."
 
 # The "provider/model" reference this host's omp is already configured
 # with, exactly as typed at the CLI (`omp --model titan/qwen3.8-27b`).
-# Override with ANNEALAGE_AGENT_LIVE_OMP_MODEL for a different
+# Override with ANNEALAGE_EMBER_LIVE_OMP_MODEL for a different
 # account/config, never required -- same convention as the Claude/Codex live
 # tests.
 DEFAULT_MODEL = "titan/qwen3.8-27b"
@@ -84,7 +84,7 @@ async def _wait_for_turn_end(events, *, timeout):
 )
 @pytest.mark.asyncio
 async def test_real_omp_backend_completes_a_turn(tmp_path):
-    model = os.environ.get("ANNEALAGE_AGENT_LIVE_OMP_MODEL") or DEFAULT_MODEL
+    model = os.environ.get("ANNEALAGE_EMBER_LIVE_OMP_MODEL") or DEFAULT_MODEL
     events = []
     session = OmpSession(
         events.append,

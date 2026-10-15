@@ -19,10 +19,10 @@ adding anything to the question of what this layer does with the frame.
 import json
 
 import pytest
-from annealage_agent import protocol
+from annealage_ember import protocol
 
-from annealage_agent.http import ws as ws_module
-from annealage_agent.session.fake import FakeSession
+from annealage_ember.http import ws as ws_module
+from annealage_ember.session.fake import FakeSession
 
 pytestmark = pytest.mark.asyncio
 

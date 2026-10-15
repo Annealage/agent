@@ -172,7 +172,7 @@ async function tokenFromFragment() {
 
 // This tab's copy of the token. One key for the origin: one server is one
 // origin with one browser token, the front door's apps included.
-const TOKEN_KEY = "annealage-agent-token";
+const TOKEN_KEY = "annealage-ember-token";
 
 // Storage can refuse (a sandboxed frame, a browser set to block it), which
 // costs only the reload: the page still has its token until then.

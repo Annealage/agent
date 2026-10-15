@@ -15,8 +15,8 @@ import threading
 import pytest
 from toy_product import TOY_REVIEW_FILE, ToyAnchorSpace, toy_review_store
 
-from annealage_agent.review import JsonReviewStore, ReviewError
-from annealage_agent.review.native import FORMAT_VERSION
+from annealage_ember.review import JsonReviewStore, ReviewError
+from annealage_ember.review.native import FORMAT_VERSION
 
 FRONT_A = {"card": "front", "x": 10, "y": 10}
 BACK = {"card": "back", "x": 20, "y": 30}

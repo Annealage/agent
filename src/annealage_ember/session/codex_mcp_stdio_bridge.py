@@ -14,7 +14,7 @@ only forwards ``tools/list``/``tools/call`` to the host process's own
 **How it authenticates, and why not on the command line.** ``/mcp`` accepts
 only the per-run *agent* token, never the browser token that authorises
 ``/ws`` (see ``http/routes_mcp.py``). That token reaches this process through
-its environment, as ``ANNEALAGE_AGENT_TOKEN``: ``CodexSession`` puts it in the
+its environment, as ``ANNEALAGE_EMBER_TOKEN``: ``CodexSession`` puts it in the
 app-server's environment (``CodexConfig.env``) and names it in the server's
 ``env_vars``, which is Codex's own allowlist of variables it copies into an
 MCP child's otherwise scrubbed environment. A command line is readable by
@@ -69,7 +69,7 @@ from mcp.server import InitializationOptions, NotificationOptions, Server
 #: so ``CodexSession`` also excludes this name through
 #: ``shell_environment_policy.exclude``; that policy governs shells only, and
 #: the ``env_vars`` forwarding to this bridge is unaffected by it.
-AGENT_TOKEN_ENV = "ANNEALAGE_AGENT_TOKEN"
+AGENT_TOKEN_ENV = "ANNEALAGE_EMBER_TOKEN"
 
 #: How long reaching the host process may take. Only the connection is
 #: bounded: once a call is in, the host bounds it itself (a viewer-facing

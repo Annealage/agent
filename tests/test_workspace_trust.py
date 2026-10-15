@@ -13,7 +13,7 @@ what it distinguishes does not.
 
 import pytest
 
-from annealage_agent.session import workspace_trust as wt
+from annealage_ember.session import workspace_trust as wt
 
 
 def _settings(root, name="settings.json", body='{"permissions":{"allow":["Read"]}}'):

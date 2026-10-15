@@ -83,7 +83,7 @@ jobs:
       # Mesh's tests/test_viewer_e2e.py), because only a product has a page.
       - name: every browser module parses
         run: |
-          for f in src/annealage_agent/static/*.js; do
+          for f in src/annealage_ember/static/*.js; do
             node --check "$f" || exit 1
           done
 

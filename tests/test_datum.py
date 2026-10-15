@@ -14,8 +14,8 @@ import uvicorn
 from mcp.server import Server
 from toy_product import build_toy_tools
 
-from annealage_agent import datum, uploads
-from annealage_agent.uploads import check_upload_actions
+from annealage_ember import datum, uploads
+from annealage_ember.uploads import check_upload_actions
 
 # The tools Datum lists, written out by hand rather than read from the module
 # under test (including the request tools discovered 2026-10-09).
@@ -126,7 +126,7 @@ def fake():
 
 
 def _tools(tmp_path, url, *, view=()):
-    from annealage_agent.remote_actions import RemoteActionStore
+    from annealage_ember.remote_actions import RemoteActionStore
 
     bus = SimpleNamespace(paused=False)
     bus.remote_action_store = RemoteActionStore(
@@ -207,8 +207,8 @@ async def test_a_lookup_reaches_datum_and_primes_it(fake, tmp_path):
 
 @pytest.mark.asyncio
 async def test_direct_calls_are_read_guarded_and_named_writes_are_allowed(fake, tmp_path):
-    from annealage_agent import remote
-    from annealage_agent.remote_actions import RemoteActionStore
+    from annealage_ember import remote
+    from annealage_ember.remote_actions import RemoteActionStore
 
     server = datum.remote(fake.url)
     refused = await remote.call(server, "request_datasheet", {}, read_only=True)
@@ -241,7 +241,7 @@ async def test_direct_calls_are_read_guarded_and_named_writes_are_allowed(fake, 
 
 @pytest.mark.asyncio
 async def test_remote_call_uses_its_timeout_override():
-    from annealage_agent import remote
+    from annealage_ember import remote
 
     slow = FakeDatum(delay=0.2)
     try:

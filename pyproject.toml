@@ -3,7 +3,7 @@ requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
-name = "annealage-agent"
+name = "annealage-ember"
 dynamic = ["version"]
 description = "An embedded coding agent for browser-based tools: a chat pane beside the product's own view, Claude, Codex and omp backends, permission cards, workspace trust and a WebSocket event channel with replay"
 readme = "README.md"
@@ -117,9 +117,9 @@ codex = ["openai-codex>=0.154,<1"]
 # full reasoning). CI installs it from a pinned commit instead.
 
 [project.urls]
-Homepage = "https://github.com/Annealage/agent"
-Repository = "https://github.com/Annealage/agent"
-Issues = "https://github.com/Annealage/agent/issues"
+Homepage = "https://github.com/Annealage/ember"
+Repository = "https://github.com/Annealage/ember"
+Issues = "https://github.com/Annealage/ember/issues"
 
 # The version is the git tag, resolved at build time, so there is no literal to
 # keep in step with anything. Three consequences worth knowing. A build needs
@@ -144,11 +144,11 @@ fallback-version = "0.0.0"
 local_scheme = "no-local-version"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/annealage_agent"]
+packages = ["src/annealage_ember"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "src/annealage_agent",
+    "src/annealage_ember",
     "tests",
     "README.md",
     "LICENSE",
@@ -170,7 +170,7 @@ include = [
 # sdist missing them would silently drop them again.
 [tool.hatch.build]
 artifacts = [
-    "src/annealage_agent/static/**",
+    "src/annealage_ember/static/**",
 ]
 
 # Ruff is the linter and the formatter for this project. Its F rules are

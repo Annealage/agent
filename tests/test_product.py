@@ -15,9 +15,9 @@ import pytest
 from conftest import DEFAULT_PORT, TEST_AUTHORITY, product_swapper
 from toy_product import TOY
 
-from annealage_agent import lock, net, product, protocol, sessions, settings
-from annealage_agent.session import events
-from annealage_agent.session.base import AgentEvent, TurnEnd
+from annealage_ember import lock, net, product, protocol, sessions, settings
+from annealage_ember.session import events
+from annealage_ember.session.base import AgentEvent, TurnEnd
 
 
 @dataclasses.dataclass(frozen=True)
@@ -31,7 +31,7 @@ def _other_tools(bus, serve_dir, session_id):
     product builds its tool server."""
     from claude_agent_sdk import tool
 
-    from annealage_agent.tools import Grading, ToolServer, ok
+    from annealage_ember.tools import Grading, ToolServer, ok
 
     @tool("peek_sheet", "Read the sheet the human is looking at.", {})
     async def peek_sheet(args):
@@ -152,8 +152,8 @@ def test_a_registration_that_collides_with_the_agent_layer_installs_nothing(
 
 
 def _agent_mode_app(tmp_path):
-    from annealage_agent import app as agent_app
-    from annealage_agent.session.fake import FakeSession
+    from annealage_ember import app as agent_app
+    from annealage_ember.session.fake import FakeSession
 
     page = tmp_path / "page.html"
     page.write_text("<html></html>", encoding="utf-8")
@@ -267,7 +267,7 @@ def test_command_hints_default_to_the_distribution_and_follow_the_product(swap_p
     """Refusals name commands that exist: by default the distribution's (so
     an existing product's text is unchanged), else the product's own, and a
     product with no doctor command is not told to run one."""
-    from annealage_agent.session import codex, sdk, workspace_trust
+    from annealage_ember.session import codex, sdk, workspace_trust
 
     class CLIConnectionError(Exception):
         pass

@@ -14,7 +14,7 @@ import subprocess
 
 import pytest
 
-from annealage_agent import product
+from annealage_ember import product
 
 STORE_JS = __import__("pathlib").Path(product.__file__).resolve().parent / "static" / "store.js"
 

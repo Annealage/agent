@@ -15,19 +15,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from annealage_agent.http import ws as ws_module
-from annealage_agent.protocol import PROTOCOL_VERSION
-from annealage_agent.session.base import (
+from annealage_ember.http import ws as ws_module
+from annealage_ember.protocol import PROTOCOL_VERSION
+from annealage_ember.session.base import (
     AGENT_CONNECTING,
     AGENT_READY,
     AGENT_UNAVAILABLE,
     TextDelta,
     TurnEnd,
 )
-from annealage_agent.session.events import EventLog
-from annealage_agent.session.fake import FakeSession
-from annealage_agent.tools import instructions_of
-from annealage_agent.viewers import ViewerBus
+from annealage_ember.session.events import EventLog
+from annealage_ember.session.fake import FakeSession
+from annealage_ember.tools import instructions_of
+from annealage_ember.viewers import ViewerBus
 
 pytestmark = pytest.mark.asyncio
 

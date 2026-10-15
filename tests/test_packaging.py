@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-STATIC_DIR = REPO_ROOT / "src" / "annealage_agent" / "static"
+STATIC_DIR = REPO_ROOT / "src" / "annealage_ember" / "static"
 
 pytestmark = pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not on PATH")
 
@@ -62,8 +62,8 @@ def _static_files():
     )
     # Guards the check itself: a moved tree would otherwise make the tests
     # below pass over zero files.
-    assert "annealage_agent/static/chat.js" in files
-    assert "annealage_agent/static/agent.css" in files
+    assert "annealage_ember/static/chat.js" in files
+    assert "annealage_ember/static/agent.css" in files
     return files
 
 
@@ -101,5 +101,5 @@ def test_sdist_and_wheel_ship_a_static_file_under_a_gitignored_directory_name(tm
     finally:
         probe_file.unlink()
         probe_dir.rmdir()
-    assert "src/annealage_agent/static/lib/probe.js" in sdist_names
-    assert "annealage_agent/static/lib/probe.js" in wheel_names
+    assert "src/annealage_ember/static/lib/probe.js" in sdist_names
+    assert "annealage_ember/static/lib/probe.js" in wheel_names

@@ -19,11 +19,11 @@ import toy_product
 from conftest import create_toy_app, make_test_client
 from test_remote_tools import FAKE_GRADING, FakeRemote
 
-from annealage_agent import sessions, uploads
-from annealage_agent.remote import RemoteServer
-from annealage_agent.session.fake import FakeSession
-from annealage_agent.session.permissions import PermissionBroker
-from annealage_agent.uploads import UploadAction
+from annealage_ember import sessions, uploads
+from annealage_ember.remote import RemoteServer
+from annealage_ember.session.fake import FakeSession
+from annealage_ember.session.permissions import PermissionBroker
+from annealage_ember.uploads import UploadAction
 
 pytestmark = pytest.mark.asyncio
 

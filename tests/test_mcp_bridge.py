@@ -36,11 +36,11 @@ from conftest import create_toy_app, make_test_client, mcp_client
 from microdot import Microdot
 from toy_product import NOTES_FILE, build_toy_tools
 
-from annealage_agent import app as agent_app
-from annealage_agent.http.routes_mcp import register_mcp_routes
-from annealage_agent.session.codex_mcp_stdio_bridge import authority_url, build_server
-from annealage_agent.session.fake import FakeSession
-from annealage_agent.session.permissions import Decision, PermissionBroker
+from annealage_ember import app as agent_app
+from annealage_ember.http.routes_mcp import register_mcp_routes
+from annealage_ember.session.codex_mcp_stdio_bridge import authority_url, build_server
+from annealage_ember.session.fake import FakeSession
+from annealage_ember.session.permissions import Decision, PermissionBroker
 
 pytestmark = pytest.mark.asyncio
 
@@ -302,7 +302,7 @@ async def test_authority_http_failure_raises_authority_error():
     docstring), so this only needs to pin that the exception really is
     raised here.
     """
-    from annealage_agent.session.codex_mcp_stdio_bridge import AuthorityError, _call_authority
+    from annealage_ember.session.codex_mcp_stdio_bridge import AuthorityError, _call_authority
 
     transport = httpx.MockTransport(lambda request: httpx.Response(500))
     async with httpx.AsyncClient(transport=transport) as client:
@@ -342,7 +342,7 @@ async def _run_real_server(project, *, agent_token, broker):
     unconditionally (``session/events.py``'s ``EventLog``), which does not
     create its own parent directory.
     """
-    from annealage_agent import sessions as sessions_module
+    from annealage_ember import sessions as sessions_module
 
     session_id = sessions_module.create_session(project)
     port = _free_port()
@@ -373,7 +373,7 @@ def _bridge_argv(port):
     return [
         sys.executable,
         "-m",
-        "annealage_agent.session.codex_mcp_stdio_bridge",
+        "annealage_ember.session.codex_mcp_stdio_bridge",
         "--host",
         "127.0.0.1",
         "--port",
@@ -417,7 +417,7 @@ async def test_fake_app_server_write_call_reaches_the_broker_exactly_once_end_to
     the fake app-server's call_tool for a write-class tool blocks on a real
     PermissionBroker.ask, which this test answers exactly once
     (broker.decide), and the tool only takes effect after that answer."""
-    from annealage_agent.session.base import PermissionRequest
+    from annealage_ember.session.base import PermissionRequest
 
     token = "e2e-write-token"
     events = []
@@ -478,7 +478,7 @@ async def test_proxy_subprocess_exits_cleanly_when_its_stdin_closes(project):
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=dict(os.environ, ANNEALAGE_AGENT_TOKEN=token),
+            env=dict(os.environ, ANNEALAGE_EMBER_TOKEN=token),
         )
         # A short wait so this does not race the subprocess's own startup
         # (stdio_server's async context manager spawning its reader/writer
@@ -519,7 +519,7 @@ async def test_proxy_subprocess_authenticates_from_its_environment_not_its_argv(
         params = StdioServerParameters(
             command=argv[0],
             args=argv[1:],
-            env=dict(os.environ, ANNEALAGE_AGENT_TOKEN=token),
+            env=dict(os.environ, ANNEALAGE_EMBER_TOKEN=token),
         )
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
@@ -535,12 +535,12 @@ async def test_proxy_subprocess_refuses_to_start_without_a_token_in_its_environm
     """No token, no MCP: the bridge exits before speaking the protocol, so
     Codex reports the server as failed to start rather than as a server with
     no tools. Its argv has nowhere to take a token from any more."""
-    env = {key: value for key, value in os.environ.items() if key != "ANNEALAGE_AGENT_TOKEN"}
+    env = {key: value for key, value in os.environ.items() if key != "ANNEALAGE_EMBER_TOKEN"}
     proc = await asyncio.to_thread(
         subprocess.run, _bridge_argv(9), input=b"", capture_output=True, env=env, timeout=30
     )
     assert proc.returncode == 2
-    assert b"ANNEALAGE_AGENT_TOKEN" in proc.stderr
+    assert b"ANNEALAGE_EMBER_TOKEN" in proc.stderr
     assert proc.stdout == b""
 
 
@@ -553,7 +553,7 @@ def _agent_app(project, *, token=BROWSER_TOKEN, agent_token=TOKEN):
     """An agent-mode app with both tokens set, the toy product's real tool
     server and a ``FakeSession``, so ``/mcp`` is mounted exactly as a real run
     mounts it."""
-    from annealage_agent import sessions as sessions_module
+    from annealage_ember import sessions as sessions_module
 
     return create_toy_app(
         project,
@@ -622,8 +622,8 @@ async def test_what_the_model_reads_with_no_viewer_attached_never_carries_the_br
     agent could approve its own permission cards. The session is built by
     ``launch.py``, as a real run builds it, so the broker's address is the one
     a real run gives it."""
-    from annealage_agent import launch, sessions
-    from annealage_agent import settings as settings_module
+    from annealage_ember import launch, sessions
+    from annealage_ember import settings as settings_module
 
     session_id = sessions.create_session(project)
 

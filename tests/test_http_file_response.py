@@ -8,7 +8,7 @@ serves file bytes.
 
 import pytest
 
-from annealage_agent.http import file_response
+from annealage_ember.http import file_response
 
 pytestmark = pytest.mark.asyncio
 

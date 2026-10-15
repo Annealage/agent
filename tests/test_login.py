@@ -12,9 +12,9 @@ import json
 import pytest
 from conftest import create_toy_app, make_test_client
 
-from annealage_agent import sessions
-from annealage_agent.http.routes_login import LoginNonces
-from annealage_agent.session.fake import FakeSession
+from annealage_ember import sessions
+from annealage_ember.http.routes_login import LoginNonces
+from annealage_ember.session.fake import FakeSession
 
 pytestmark = pytest.mark.asyncio
 

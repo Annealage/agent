@@ -31,14 +31,14 @@ import shutil
 
 import pytest
 
-from annealage_agent.session.base import AGENT_READY, AgentError, TextDelta, TurnEnd
-from annealage_agent.session.permissions import PermissionBroker
-from annealage_agent.session.sdk import SdkSession
+from annealage_ember.session.base import AGENT_READY, AgentError, TextDelta, TurnEnd
+from annealage_ember.session.permissions import PermissionBroker
+from annealage_ember.session.sdk import SdkSession
 
 LIVE_PROMPT = "Reply with exactly the single word PONG and nothing else, no punctuation."
 
 # The model this test exercises. Override with
-# ANNEALAGE_AGENT_LIVE_CLAUDE_MODEL for a different account/config, never
+# ANNEALAGE_EMBER_LIVE_CLAUDE_MODEL for a different account/config, never
 # required.
 DEFAULT_MODEL = "haiku"
 
@@ -76,7 +76,7 @@ def _diagnose(events: list) -> str:
 )
 @pytest.mark.asyncio
 async def test_real_claude_backend_completes_a_turn(tmp_path):
-    model = os.environ.get("ANNEALAGE_AGENT_LIVE_CLAUDE_MODEL") or DEFAULT_MODEL
+    model = os.environ.get("ANNEALAGE_EMBER_LIVE_CLAUDE_MODEL") or DEFAULT_MODEL
     events: list = []
     session = SdkSession(
         events.append,

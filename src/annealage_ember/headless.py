@@ -67,7 +67,7 @@ Tools that ask the human themselves (``tools.asks_the_human``) are refused by
 ``ToolSet``: with no human they could never be answered, and the tool server
 would otherwise file them under read.
 
-Imported on demand (``annealage_agent.run_prompt`` and the other two names
+Imported on demand (``annealage_ember.run_prompt`` and the other two names
 resolve lazily), because it imports the Claude SDK through ``tools``.
 """
 

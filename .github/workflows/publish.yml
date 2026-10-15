@@ -1,7 +1,7 @@
 name: publish
 
 # Publishes to PyPI on a GitHub Release, using trusted publishing (OIDC) - no
-# API token stored. To enable: create the "annealage-agent" project on PyPI
+# API token stored. To enable: create the "annealage-ember" project on PyPI
 # with a trusted publisher pointing at this repo + workflow (owner Annealage,
 # repo agent, workflow publish.yml), then cut a GitHub release. See
 # RELEASING.md.
@@ -38,9 +38,9 @@ jobs:
         # would otherwise be discovered only by looking at PyPI afterwards.
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          test -f "dist/annealage_agent-${tag}.tar.gz" || {
+          test -f "dist/annealage_ember-${tag}.tar.gz" || {
             echo "no sdist for tag ${tag}; built:"; ls dist; exit 1; }
-          test -f "dist/annealage_agent-${tag}-py3-none-any.whl" || {
+          test -f "dist/annealage_ember-${tag}-py3-none-any.whl" || {
             echo "no wheel for tag ${tag}; built:"; ls dist; exit 1; }
       - name: publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

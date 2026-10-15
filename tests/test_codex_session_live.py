@@ -34,9 +34,9 @@ import shutil
 
 import pytest
 
-from annealage_agent.session.base import AGENT_READY, AgentError, TextDelta, TurnEnd
-from annealage_agent.session.codex import CodexSession
-from annealage_agent.session.permissions import PermissionBroker
+from annealage_ember.session.base import AGENT_READY, AgentError, TextDelta, TurnEnd
+from annealage_ember.session.codex import CodexSession
+from annealage_ember.session.permissions import PermissionBroker
 
 LIVE_PROMPT = "Reply with exactly the single word PONG and nothing else, no punctuation."
 
@@ -44,7 +44,7 @@ LIVE_PROMPT = "Reply with exactly the single word PONG and nothing else, no punc
 # (~/.codex/config.toml's `model = "gpt-5.6-luna"`); passed explicitly so
 # this test pins what it actually exercises rather than depending silently
 # on whatever a config file elsewhere happens to say. Override with
-# ANNEALAGE_AGENT_LIVE_CODEX_MODEL for a different account/config, never
+# ANNEALAGE_EMBER_LIVE_CODEX_MODEL for a different account/config, never
 # required.
 DEFAULT_MODEL = "gpt-5.6-luna"
 
@@ -93,7 +93,7 @@ def _reply_text(events: list) -> str:
 )
 @pytest.mark.asyncio
 async def test_real_codex_backend_completes_a_turn(tmp_path):
-    model = os.environ.get("ANNEALAGE_AGENT_LIVE_CODEX_MODEL") or DEFAULT_MODEL
+    model = os.environ.get("ANNEALAGE_EMBER_LIVE_CODEX_MODEL") or DEFAULT_MODEL
 
     events = []
     session = CodexSession(

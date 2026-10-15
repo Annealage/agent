@@ -12,7 +12,7 @@ fast real wall-clock timestamps happen to separate back-to-back calls.
 
 import json
 
-from annealage_agent import sessions
+from annealage_ember import sessions
 
 
 def _write_session(serve_dir, sid, started_at, first_user_text=None, turn_events=()):

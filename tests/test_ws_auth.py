@@ -88,8 +88,8 @@ from microdot.microdot import Request
 from microdot.test_client import TestClient
 from microdot.websocket import WebSocket
 
-from annealage_agent import protocol
-from annealage_agent.http import ws as ws_module
+from annealage_ember import protocol
+from annealage_ember.http import ws as ws_module
 
 pytestmark = pytest.mark.asyncio
 

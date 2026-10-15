@@ -22,10 +22,10 @@ import json
 import pytest
 from toy_product import TOY_PAUSED_MESSAGE, build_toy_tools
 
-from annealage_agent import protocol
-from annealage_agent.http import ws as ws_module
-from annealage_agent.session.base import PauseChanged
-from annealage_agent.viewers import ViewerBus, ViewerRegistry
+from annealage_ember import protocol
+from annealage_ember.http import ws as ws_module
+from annealage_ember.session.base import PauseChanged
+from annealage_ember.viewers import ViewerBus, ViewerRegistry
 
 pytestmark = pytest.mark.asyncio
 

@@ -12,10 +12,10 @@ opens it, only the session's own entries are reachable, and only their end.
 import pytest
 from conftest import DEFAULT_PORT, TEST_HOST, create_toy_app, make_test_client
 
-from annealage_agent import sessions
-from annealage_agent.session import logfiles
-from annealage_agent.session.base import AgentError, BackendLog
-from annealage_agent.session.fake import FakeSession
+from annealage_ember import sessions
+from annealage_ember.session import logfiles
+from annealage_ember.session.base import AgentError, BackendLog
+from annealage_ember.session.fake import FakeSession
 
 pytestmark = pytest.mark.asyncio
 

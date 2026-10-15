@@ -30,14 +30,14 @@ from mcp.server.lowlevel import Server
 from microdot import Microdot
 from toy_product import TOY, TOY_PAUSED_MESSAGE, build_toy_tools
 
-from annealage_agent import launch, sessions
-from annealage_agent import remote as remote_module
-from annealage_agent import settings as settings_module
-from annealage_agent import tools as tools_module
-from annealage_agent.http.routes_mcp import register_mcp_routes
-from annealage_agent.remote import RemoteServer
-from annealage_agent.session.permissions import Decision
-from annealage_agent.tools import Grading
+from annealage_ember import launch, sessions
+from annealage_ember import remote as remote_module
+from annealage_ember import settings as settings_module
+from annealage_ember import tools as tools_module
+from annealage_ember.http.routes_mcp import register_mcp_routes
+from annealage_ember.remote import RemoteServer
+from annealage_ember.session.permissions import Decision
+from annealage_ember.tools import Grading
 
 TOKEN = "remote-test-agent-token"
 INSTRUCTIONS = "Call begin first. Lookups are cheap."
@@ -179,7 +179,7 @@ def bus():
 
 def _tools(bus, tmp_path, *remote):
     if not hasattr(bus, "remote_action_store"):
-        from annealage_agent.remote_actions import RemoteActionStore
+        from annealage_ember.remote_actions import RemoteActionStore
 
         bus.remote_action_store = RemoteActionStore(
             tmp_path / "remote-actions.json", project_id=str(tmp_path), session="sess-1"
@@ -407,7 +407,7 @@ async def test_codex_reaches_the_remote_through_a_bridge_of_its_own(
     args = servers["fake"]["args"]
     assert args[args.index("--server-name") + 1] == "fake"
     assert args[args.index("--path") + 1] == "/mcp/fake"
-    assert servers["fake"]["env_vars"] == ["ANNEALAGE_AGENT_TOKEN"]
+    assert servers["fake"]["env_vars"] == ["ANNEALAGE_EMBER_TOKEN"]
 
     broker = CountingBroker(Decision(allow=True))
 
@@ -557,7 +557,7 @@ def test_a_remote_s_instructions_are_cut_to_the_cap(fake, bus, tmp_path, monkeyp
 def _unreachable_at_first(monkeypatch, fake, tmp_path):
     """A ViewerBus and a tool server whose one remote, ``fake``, could not be
     reached when it was built; the remote answers from now on."""
-    from annealage_agent.viewers import ViewerBus
+    from annealage_ember.viewers import ViewerBus
 
     real_discover = remote_module._discover
     monkeypatch.setattr(
@@ -587,7 +587,7 @@ async def test_a_remote_unreachable_at_startup_is_reached_by_reconnect(
 async def test_serve_s_retry_gives_an_omp_session_the_remote_on_the_first_turn(
     fake, tmp_path, monkeypatch
 ):
-    from annealage_agent import app as app_module
+    from annealage_ember import app as app_module
 
     class _OmpLike:
         def __init__(self):
@@ -620,7 +620,7 @@ async def test_a_session_that_cannot_take_new_tools_is_told_nothing_it_cannot_us
     """Claude's SDK servers and Codex's bridges are fixed when the session
     starts: the remote's tools wait for the next start, and the model is not
     told of tools it does not have."""
-    from annealage_agent import app as app_module
+    from annealage_ember import app as app_module
 
     bus, tools = _unreachable_at_first(monkeypatch, fake, tmp_path)
     bus.first_turn.set()
@@ -633,7 +633,7 @@ async def test_a_session_that_cannot_take_new_tools_is_told_nothing_it_cannot_us
 async def test_a_failed_hand_off_to_the_session_is_tried_again_rather_than_lost(
     fake, tmp_path, monkeypatch
 ):
-    from annealage_agent import app as app_module
+    from annealage_ember import app as app_module
 
     class _Flaky:
         def __init__(self):
@@ -693,7 +693,7 @@ async def test_hosted_remote_calls_use_declared_operation_not_tool_grade(fake, b
 async def test_written_remote_action_times_out_and_is_not_replayed_after_restart(
     fake, tmp_path, monkeypatch
 ):
-    from annealage_agent.remote_actions import RemoteActionStore
+    from annealage_ember.remote_actions import RemoteActionStore
 
     path = tmp_path / "actions.jsonl"
     store = RemoteActionStore(path, project_id=str(tmp_path), session="sess")
@@ -723,7 +723,7 @@ async def test_written_remote_action_times_out_and_is_not_replayed_after_restart
 
 @pytest.mark.asyncio
 async def test_connection_failure_leaves_write_retryable(fake, tmp_path, monkeypatch):
-    from annealage_agent.remote_actions import RemoteActionStore
+    from annealage_ember.remote_actions import RemoteActionStore
 
     monkeypatch.setattr(remote_module, "CALL_TIMEOUT", 0.2)
     server = RemoteServer("fake", "http://127.0.0.1:1/mcp", FAKE_GRADING)
@@ -743,7 +743,7 @@ async def test_connection_failure_leaves_write_retryable(fake, tmp_path, monkeyp
 
 @pytest.mark.asyncio
 async def test_changed_approved_authority_context_refuses_remote_dispatch(fake, tmp_path):
-    from annealage_agent.remote_actions import RemoteActionStore
+    from annealage_ember.remote_actions import RemoteActionStore
 
     store = RemoteActionStore(
         tmp_path / "context.json", project_id=str(tmp_path), session="sess"
@@ -766,7 +766,7 @@ async def test_changed_approved_authority_context_refuses_remote_dispatch(fake, 
 
 @pytest.mark.asyncio
 async def test_remote_error_is_not_proof_that_write_had_no_effect(fake, tmp_path):
-    from annealage_agent.remote_actions import RemoteActionStore
+    from annealage_ember.remote_actions import RemoteActionStore
 
     store = RemoteActionStore(
         tmp_path / "error.json", project_id=str(tmp_path), session="sess"
@@ -786,7 +786,7 @@ async def test_remote_error_is_not_proof_that_write_had_no_effect(fake, tmp_path
 async def test_concurrent_intent_reserves_before_connection_and_sends_once(
     fake, tmp_path, monkeypatch
 ):
-    from annealage_agent.remote_actions import RemoteActionStore
+    from annealage_ember.remote_actions import RemoteActionStore
 
     store = RemoteActionStore(
         tmp_path / "concurrent.json", project_id=str(tmp_path), session="sess"
@@ -819,7 +819,7 @@ async def test_concurrent_intent_reserves_before_connection_and_sends_once(
 async def test_client_cancellation_after_remote_write_records_unknown_and_blocks_replay(
     fake, tmp_path
 ):
-    from annealage_agent.remote_actions import RemoteActionStore
+    from annealage_ember.remote_actions import RemoteActionStore
 
     store = RemoteActionStore(
         tmp_path / "cancel.json", project_id=str(tmp_path), session="sess"

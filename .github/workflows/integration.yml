@@ -31,9 +31,9 @@ name: integration
 # Optional, non-sensitive overrides (repo variables) if a configured
 # runner's accounts should use different models than each test's own
 # default (Claude: "haiku", Codex: "gpt-5.6-luna", omp: "titan/qwen3.8-27b"):
-#   ANNEALAGE_AGENT_LIVE_CLAUDE_MODEL
-#   ANNEALAGE_AGENT_LIVE_CODEX_MODEL
-#   ANNEALAGE_AGENT_LIVE_OMP_MODEL
+#   ANNEALAGE_EMBER_LIVE_CLAUDE_MODEL
+#   ANNEALAGE_EMBER_LIVE_CODEX_MODEL
+#   ANNEALAGE_EMBER_LIVE_OMP_MODEL
 
 on:
   workflow_dispatch:
@@ -64,7 +64,7 @@ jobs:
 
       - name: run the live integration tier
         env:
-          ANNEALAGE_AGENT_LIVE_CLAUDE_MODEL: ${{ vars.ANNEALAGE_AGENT_LIVE_CLAUDE_MODEL }}
-          ANNEALAGE_AGENT_LIVE_CODEX_MODEL: ${{ vars.ANNEALAGE_AGENT_LIVE_CODEX_MODEL }}
-          ANNEALAGE_AGENT_LIVE_OMP_MODEL: ${{ vars.ANNEALAGE_AGENT_LIVE_OMP_MODEL }}
+          ANNEALAGE_EMBER_LIVE_CLAUDE_MODEL: ${{ vars.ANNEALAGE_EMBER_LIVE_CLAUDE_MODEL }}
+          ANNEALAGE_EMBER_LIVE_CODEX_MODEL: ${{ vars.ANNEALAGE_EMBER_LIVE_CODEX_MODEL }}
+          ANNEALAGE_EMBER_LIVE_OMP_MODEL: ${{ vars.ANNEALAGE_EMBER_LIVE_OMP_MODEL }}
         run: uv run --extra dev --extra codex pytest -m integration -q -rs

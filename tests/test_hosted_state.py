@@ -16,12 +16,12 @@ import pytest
 from conftest import create_toy_app, make_test_client
 from toy_product import toy_review_store
 
-from annealage_agent import hosted_state, settings
-from annealage_agent.http import ws as ws_module
-from annealage_agent.identity import Human
-from annealage_agent.session.events import EventLog
-from annealage_agent.session.fake import FakeSession
-from annealage_agent.viewers import ViewerBus
+from annealage_ember import hosted_state, settings
+from annealage_ember.http import ws as ws_module
+from annealage_ember.identity import Human
+from annealage_ember.session.events import EventLog
+from annealage_ember.session.fake import FakeSession
+from annealage_ember.viewers import ViewerBus
 
 pytestmark = pytest.mark.asyncio
 

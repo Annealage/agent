@@ -8,9 +8,9 @@ written out beside the text they are read from.
 
 import pytest
 
-from annealage_agent import guides
-from annealage_agent.guides import GuideSet, read_guide_tool
-from annealage_agent.tools import Grading, ToolServer
+from annealage_ember import guides
+from annealage_ember.guides import GuideSet, read_guide_tool
+from annealage_ember.tools import Grading, ToolServer
 
 WORKFLOW = """---
 name: workflow

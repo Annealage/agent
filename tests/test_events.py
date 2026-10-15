@@ -12,9 +12,9 @@ import json
 
 import pytest
 
-from annealage_agent.session import events as events_module
-from annealage_agent.session.base import RequestUsage, TextDelta, ToolUse, TurnEnd, UserTurn
-from annealage_agent.session.events import RING_SIZE, EventLog
+from annealage_ember.session import events as events_module
+from annealage_ember.session.base import RequestUsage, TextDelta, ToolUse, TurnEnd, UserTurn
+from annealage_ember.session.events import RING_SIZE, EventLog
 
 
 def _evt(text="x", turn=1):

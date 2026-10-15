@@ -37,10 +37,10 @@ import struct
 import pytest
 from microdot.websocket import WebSocket
 
-from annealage_agent.identity import Human
-from annealage_agent.protocol import CLOSE_OVERFLOW, build_call, build_event, build_ping
-from annealage_agent.session.base import PermissionRequest, TextDelta, ToolUse, TurnEnd
-from annealage_agent.viewers import (
+from annealage_ember.identity import Human
+from annealage_ember.protocol import CLOSE_OVERFLOW, build_call, build_event, build_ping
+from annealage_ember.session.base import PermissionRequest, TextDelta, ToolUse, TurnEnd
+from annealage_ember.viewers import (
     NO_VIEWER_MESSAGE,
     CallError,
     NoViewerConnected,
@@ -741,7 +741,7 @@ async def test_a_primary_change_reaches_every_viewer_behind_events_already_publi
     ``viewer_primary`` announced before that broadcast has run must still
     reach each page after it, since the page drops an event at or below the
     last seq it has."""
-    from annealage_agent.session.events import EventLog
+    from annealage_ember.session.events import EventLog
 
     log = EventLog()
     registry = ViewerRegistry(event_log=log)
@@ -773,7 +773,7 @@ async def test_a_turn_s_sender_given_by_login_is_the_human_with_that_login():
 
 
 async def test_automatic_turn_origin_is_visible_before_sweep_and_abort_restores_turn():
-    from annealage_agent.session.base import UserTurn
+    from annealage_ember.session.base import UserTurn
 
     bus = ViewerBus(ViewerRegistry(), url="http://127.0.0.1:1/")
     observed = []
