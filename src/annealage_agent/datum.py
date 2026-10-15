@@ -17,6 +17,15 @@ about Datum's tools and not about any product:
 * ``request_datasheet`` asks Datum to find and ingest a part's datasheet by
   MPN (it queues work and can fetch from outside), so it is write grade too,
   and ``get_request_status`` reads a request's progress and is read grade;
+* ``submit_evidence_job`` hands one already-ingested datasheet to Datum's
+  evidence agent for candidate facts (it never acquires a document, and an
+  identical job is answered from cache). It queues Datum-side compute but
+  changes nothing the agent's project holds, so it is view grade: no card,
+  refused while paused. ``get_evidence_job_status`` and ``get_evidence_result``
+  read a job and its immutable candidate packet and are read grade. A result is
+  a candidate, never verified: ``validated`` means structure and provenance
+  only. ``cancel_evidence_job`` is excluded with the shared-state writes below,
+  because Datum has one submit token and any caller can cancel any job;
 * ``publish_reference``, ``relate_documents`` and ``unrelate_documents``
   change what Datum holds for everyone, so they are excluded: the agent never
   gets them, and a Datum that lists them is not warned about;
@@ -50,6 +59,9 @@ SUBMIT_TOOL = "submit_datasheet"
 #: The tool that asks Datum to find and ingest a datasheet by MPN.
 REQUEST_TOOL = "request_datasheet"
 
+#: The tool that queues a document-bound evidence job.
+EVIDENCE_SUBMIT_TOOL = "submit_evidence_job"
+
 GRADING = Grading(
     read=(
         "getting_started",
@@ -63,6 +75,8 @@ GRADING = Grading(
         "get_document_relations",
         "get_job_status",
         "get_request_status",
+        "get_evidence_job_status",
+        "get_evidence_result",
         "list_boards",
         "trace_board_rail_or_net",
         "get_board_bom",
@@ -76,13 +90,14 @@ GRADING = Grading(
         "semantic_search_vault_components",
         "check_board_bom_against_vault",
     ),
-    view=(),
+    view=(EVIDENCE_SUBMIT_TOOL,),
     write=(SUBMIT_TOOL, REQUEST_TOOL),
 )
 
 #: Datum's tools the agent does not get: they change what Datum holds for
 #: everyone.
-EXCLUDED = ("publish_reference", "relate_documents", "unrelate_documents")
+EXCLUDED = ("publish_reference", "relate_documents", "unrelate_documents",
+            "cancel_evidence_job")
 
 #: Datum lists most of its tools only once ``getting_started`` has been called.
 PRIME = ("getting_started", {})

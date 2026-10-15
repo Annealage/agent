@@ -32,6 +32,8 @@ LOOKUPS = (
     "get_document_relations",
     "get_job_status",
     "get_request_status",
+    "get_evidence_job_status",
+    "get_evidence_result",
     "list_boards",
     "trace_board_rail_or_net",
     "get_board_bom",
@@ -46,7 +48,13 @@ LOOKUPS = (
     "check_board_bom_against_vault",
 )
 WRITES = ("submit_datasheet", "request_datasheet")
-WITHHELD = ("publish_reference", "relate_documents", "unrelate_documents")
+VIEWS = ("submit_evidence_job",)
+WITHHELD = (
+    "publish_reference",
+    "relate_documents",
+    "unrelate_documents",
+    "cancel_evidence_job",
+)
 ADVERTISED = ("getting_started", "search_parts", "semantic_search", "list_boards")
 
 
@@ -54,7 +62,7 @@ class FakeDatum:
     def __init__(self, extra=()):
         self.calls = []
         primed = set()
-        names = (*LOOKUPS, *WRITES, *WITHHELD, *extra)
+        names = (*LOOKUPS, *WRITES, *VIEWS, *WITHHELD, *extra)
 
         def listed(name):
             return types.Tool(
@@ -132,12 +140,12 @@ def test_the_remote_is_datum_under_the_ds_wiki_key():
 def test_every_lookup_is_read_grade_and_submitting_and_requesting_are_write():
     grading = datum.remote("http://x/mcp").grading
     assert grading.read == LOOKUPS
-    assert grading.view == ()
+    assert grading.view == VIEWS
     assert grading.write == WRITES
     # Nothing the agent must not have is graded, so nothing can be both.
     assert not set(WITHHELD) & {*grading.read, *grading.view, *grading.write}
-    assert set(grading.pause_gated) == set(WRITES)
-    assert set(grading.pre_allowed) == set(LOOKUPS)
+    assert set(grading.pause_gated) == {*WRITES, *VIEWS}
+    assert set(grading.pre_allowed) == {*LOOKUPS, *VIEWS}
 
 
 def test_the_published_default_is_the_hosted_datum():
@@ -148,7 +156,7 @@ def test_a_tool_server_proxies_the_graded_tools_and_drops_the_withheld_ones(fake
     tools = _tools(tmp_path, fake.url)
     proxied = tools.remote_tables()["ds-wiki"]
     # Priming revealed the tools Datum only lists after getting_started.
-    assert set(proxied) == {*LOOKUPS, *WRITES}
+    assert set(proxied) == {*LOOKUPS, *WRITES, *VIEWS}
     assert [name for name, spec in proxied.items() if spec.write] == list(WRITES)
     assert not set(WITHHELD) & set(proxied)
     pre = {
@@ -156,7 +164,7 @@ def test_a_tool_server_proxies_the_graded_tools_and_drops_the_withheld_ones(fake
         for name in tools.pre_allowed
         if name.startswith("mcp__ds-wiki__")
     }
-    assert pre == set(LOOKUPS)
+    assert pre == {*LOOKUPS, *VIEWS}
     # The withheld tools are left out silently; a tool nobody graded is warned about.
     err = capsys.readouterr().err
     assert "brand_new_tool" in err
@@ -187,6 +195,8 @@ async def test_a_lookup_reaches_datum_and_primes_it(fake, tmp_path):
     (
         ("request_datasheet", {"mpn": "TPS54302"}, True),
         ("get_request_status", {"request_id": 123}, False),
+        ("submit_evidence_job", {"page_path": "wiki/x", "mpn": "X"}, False),
+        ("get_evidence_result", {"result_id": "r"}, False),
     ),
 )
 async def test_request_and_polling_tools_are_discovered_graded_and_forwarded(
