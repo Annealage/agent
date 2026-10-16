@@ -1108,13 +1108,18 @@ def _event_publisher(registry, event_log, session_info=None, bus=None):
         if session_info is not None and isinstance(event, AgentModelsAvailable):
             session_info["models"] = list(event.models)
         if session_info is not None and isinstance(event, AgentRuntimeResolved):
-            session_info["resolved_runtime"] = {
+            runtime = {
                 "backend": event.backend,
                 "provider": event.provider,
                 "model": event.model,
                 "effort": event.effort,
                 "provenance": event.provenance,
             }
+            for field in ("requested_role", "resolved_role", "role_provenance"):
+                value = getattr(event, field, None)
+                if value is not None:
+                    runtime[field] = value
+            session_info["resolved_runtime"] = runtime
         if session_info is not None and isinstance(event, AgentError):
             session_info["agent_error"] = {
                 "remediation": event.remediation,

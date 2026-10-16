@@ -38,11 +38,15 @@ class FakeRpcClient:
 
     instances = []
     script = None
+    model_info = None
+    start_error = None
+    stderr_output = None
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.custom_tools = kwargs.get("custom_tools") or ()
         self.stopped = False
+        self.stderr = type(self).stderr_output
         self.cost = 0.0
         self.tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
         self._listeners = {}
@@ -50,13 +54,18 @@ class FakeRpcClient:
         FakeRpcClient.instances.append(self)
 
     def start(self):
+        if type(self).start_error is not None:
+            raise type(self).start_error
         return self
 
     def stop(self):
         self.stopped = True
 
     def get_state(self):
-        return SimpleNamespace(session_id="s", session_file=None, context_usage=None)
+        state = SimpleNamespace(session_id="s", session_file=None, context_usage=None)
+        if type(self).model_info is not None:
+            state.model = type(self).model_info
+        return state
 
     def get_session_stats(self):
         return SimpleNamespace(cost=self.cost, tokens=SimpleNamespace(**self.tokens))
@@ -120,6 +129,9 @@ class FakeRpcClient:
 @pytest.fixture
 def omp_client(monkeypatch):
     FakeRpcClient.instances = []
+    FakeRpcClient.model_info = None
+    FakeRpcClient.start_error = None
+    FakeRpcClient.stderr_output = None
     monkeypatch.setattr(omp_module, "RpcClient", FakeRpcClient)
     return FakeRpcClient
 
@@ -177,6 +189,53 @@ async def test_thinking_is_passed_to_omp(omp_client, tmp_path):
         "--thinking",
         "high",
     )
+
+@pytest.mark.parametrize("model_role", ("smol", "default", "slow"))
+async def test_model_role_uses_omp_alias_and_reports_backend_model(
+    omp_client, tmp_path, model_role
+):
+    omp_client.model_info = SimpleNamespace(provider="configured", id="actual-model")
+    omp_client.script = lambda client: client.end()
+    runtime = []
+
+    result = await run_prompt(
+        "do it",
+        **make_args(
+            tmp_path, model=None, model_role=model_role, on_runtime=runtime.append
+        ),
+    )
+
+    assert result.error is None
+    (client,) = omp_client.instances
+    assert client.kwargs["model"] == "@%s" % model_role
+    event, = runtime
+    assert (event.provider, event.model) == ("configured", "actual-model")
+    assert (event.requested_role, event.resolved_role) == (model_role, model_role)
+    assert event.provenance == "get_state"
+    assert event.role_provenance == "omp_cli_model_role_alias"
+
+
+@pytest.mark.parametrize(
+    ("start_error", "stderr", "expected"),
+    [
+        (RuntimeError('Model "@smol" not found'), None, True),
+        (RuntimeError("No models available"), "No models available", False),
+        (RuntimeError('Model "@slow" not found'), None, False),
+    ],
+)
+async def test_only_preflight_failure_for_the_requested_role_is_fallback_safe(
+    omp_client, tmp_path, start_error, stderr, expected
+):
+    omp_client.start_error = start_error
+    omp_client.stderr_output = stderr
+
+    result = await run_prompt(
+        "do it", **make_args(tmp_path, model=None, model_role="smol")
+    )
+
+    assert result.role_resolution_error is expected
+    assert result.calls == ()
+    assert result.error
 
 
 async def test_provider_affinity_and_cache_retention_reach_omp(omp_client, tmp_path, monkeypatch):

@@ -109,6 +109,9 @@ BACKENDS = ("omp", "claude")
 #: drives a browser is on this list, and it is not widened by configuration.
 BUILTIN_TOOLS = ("web_search",)
 
+#: OMP's configured model roles available to a headless child.
+MODEL_ROLES = ("smol", "default", "slow")
+
 #: The common thinking levels supported by both backends.
 THINKING_LEVELS = ("low", "medium", "high")
 BACKEND_THINKING_LEVELS = {
@@ -196,6 +199,9 @@ class RunResult:
     remain ``None``, never a fabricated zero. ``error`` is ``None`` for a
     clean run, else why not (``"timeout"`` for a timeout).
 
+    ``role_resolution_error`` is true only when OMP rejected the requested
+    role before any provider request.
+
     ``calls`` is every tool the model called, in order, as ``(name, ok)``:
     the ``ToolSet``'s own name on both backends, and ``ok`` false for a call
     that failed, was refused, or never returned. Neither arguments nor results
@@ -211,6 +217,7 @@ class RunResult:
     native_num_turns: Optional[int] = None
     native_turns_supported: Optional[bool] = None
     error: Optional[str] = None
+    role_resolution_error: bool = False
 
 class _Run:
     """The events of one turn, collected. ``on_event`` is the session's sink and
@@ -232,6 +239,7 @@ class _Run:
         # after that refuses (``guard``), and ``end`` cancels those running.
         self.over = False
         self._inflight: set = set()
+        self.role_resolution_error = False
         # The session, for what only it knows about how its turn ended.
         self.session: Any = None
 
@@ -305,6 +313,8 @@ class _Run:
             if index is not None:
                 self._calls[index][1] = not event.is_error
         elif isinstance(event, AgentError):
+            if event.role_resolution_error is True:
+                self.role_resolution_error = True
             message = (event.stderr or event.remediation or "").strip()
             if message and message not in self.errors:
                 self.errors.append(message)
@@ -350,6 +360,7 @@ class _Run:
             native_num_turns=getattr(self.session, "last_result_num_turns", None),
             native_turns_supported=getattr(self.session, "_native_turns_supported", None),
             error=error if error is not None else self.error(),
+            role_resolution_error=self.role_resolution_error,
         )
 def _check_arguments(
     prompt,
@@ -367,6 +378,7 @@ def _check_arguments(
     on_runtime=None,
     max_budget_usd=None,
     native_max_turns=None,
+    model_role=None,
 ):
     if backend == "codex":
         raise ValueError(
@@ -407,6 +419,16 @@ def _check_arguments(
         raise ValueError("prompt must be a non-empty string")
     if model is not None and (not isinstance(model, str) or not model.strip()):
         raise ValueError("model must be None or a non-empty string")
+    if model_role is not None:
+        if model_role not in MODEL_ROLES:
+            raise ValueError(
+                "model_role must be one of %s or None, not %r"
+                % (", ".join(MODEL_ROLES), model_role)
+            )
+        if model is not None:
+            raise ValueError("model and model_role are mutually exclusive")
+        if backend != "omp":
+            raise ValueError("model_role is currently supported only with backend='omp'")
     if max_budget_usd is not None:
         if (backend != "claude" or isinstance(max_budget_usd, bool)
                 or not isinstance(max_budget_usd, (int, float))
@@ -470,6 +492,7 @@ def _build_session(
     server,
     allowed_tools,
     model,
+    model_role,
     thinking,
     cwd,
     state_dir,
@@ -502,6 +525,7 @@ def _build_session(
             session_id=session_id,
             broker=broker,
             model=model,
+            model_role=model_role,
             tool_table=server.host_tool_table(),
             thinking=thinking,
             instructions=instructions,
@@ -591,6 +615,7 @@ async def run_prompt(
     timeout,
     system=None,
     thinking=None,
+    model_role=None,
     omp_agent_dir=None,
     omp_binary=None,
     omp_config_dir=None,
@@ -609,10 +634,17 @@ async def run_prompt(
     return its ``RunResult``. See the module docstring.
 
     ``backend`` is ``"omp"`` or ``"claude"``; ``model`` optionally names omp's
-    ``provider/model`` or a Claude model; ``None`` uses the backend default. ``cwd`` is an existing
-    directory, the caller's scratch space, used only as the backend's working
-    directory. ``timeout`` is seconds for the whole run, start included: when it
-    passes the session is closed and the result is ``error="timeout"``.
+    ``provider/model`` or a Claude model; ``None`` uses the backend default.
+    Alternatively, ``model_role`` selects OMP's configured ``smol``, ``default``
+    or ``slow`` role and cannot be combined with ``model``. OMP resolves the
+    role from its configured model settings; the runtime observer reports the
+    model OMP actually selected. Unsupported role resolution is exposed as
+    ``RunResult.role_resolution_error`` only for OMP's exact preflight rejection.
+    ``model_role`` is not currently supported by Claude because this package has
+    no Claude role mapping. ``cwd`` is an existing directory, the caller's
+    scratch space, used only as the backend's working directory. ``timeout`` is
+    seconds for the whole run, start included: when it passes the session is
+    closed and the result is ``error="timeout"``.
     ``omp_request_timeout`` is an optional per-request wait for OMP RPC calls,
     including the prompt acknowledgement. ``None`` leaves ``omp_rpc``'s 30-second
     default unchanged; it is separate from the whole-run ``timeout``.
@@ -670,9 +702,11 @@ async def run_prompt(
     identity the backend actually reports, never the requested model. Startup
     events follow successful OMP state/model observation or SDK initialization;
     later reported changes may produce another event. Unknown fields remain
-    null and ``provenance`` identifies the report source. Observer failures are
-    logged and do not change the run.
-
+    null and ``provenance`` identifies the report source. For OMP role selection,
+    ``requested_role``, ``resolved_role`` and ``role_provenance`` identify the
+    alias requested, the alias OMP resolved to the reported model, and the
+    verified OMP role-resolution path. Observer failures are logged and do not
+    change the run.
     ``on_owner(event)`` optionally receives native-process ownership and
     termination records for a Claude SDK run when ``owner_context`` supplies
     ``run_id``, ``project_id``, ``source`` and integer ``epoch``. The SDK
@@ -700,6 +734,7 @@ async def run_prompt(
         on_runtime,
         max_budget_usd,
         native_max_turns,
+        model_role,
     )
 
     with tempfile.TemporaryDirectory(prefix="annealage-headless-") as state_dir:
@@ -733,6 +768,7 @@ async def run_prompt(
                     server=server,
                     allowed_tools=server.pre_allowed + claude_grants,
                     model=model,
+                    model_role=model_role,
                     thinking=thinking,
                     cwd=cwd,
                     state_dir=state_dir,

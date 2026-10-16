@@ -789,3 +789,21 @@ async def test_a_str_cwd_is_accepted(monkeypatch, tmp_path):
     script_session(monkeypatch, script)
     result = await run_prompt("go", **make_args(tmp_path, cwd=str(tmp_path)))
     assert result.error is None
+
+
+@pytest.mark.parametrize(
+    ("backend", "model", "model_role", "message"),
+    [
+        ("omp", None, "fast", "model_role must be one of"),
+        ("omp", "prov/model", "smol", "model and model_role are mutually exclusive"),
+        ("claude", None, "smol", "supported only with backend='omp'"),
+    ],
+)
+async def test_model_role_rejects_unsupported_requests(
+    tmp_path, backend, model, model_role, message
+):
+    with pytest.raises(ValueError, match=message):
+        await run_prompt(
+            "go",
+            **make_args(tmp_path, backend=backend, model=model, model_role=model_role),
+        )

@@ -458,8 +458,9 @@ result: RunResult = await run_prompt(
     tools=ToolSet(tools=[...], grading=Grading(read=(...), view=(), write=("submit_result",)),
                   grant=("submit_result",)),
     backend="omp",            # "omp" or "claude"; "codex" is refused
-    model="provider/model",   # optional: None uses the backend's default role
-    cwd=scratch_dir,          # an empty directory you own; only the backend's working directory
+    model=None,                # use the backend's default model unless model_role is set
+    model_role="smol",         # optional OMP role: smol, default or slow; cannot combine with model
+    cwd=scratch_dir,           # an empty directory you own; only the backend's working directory
     timeout=300,              # seconds for the whole run
     omp_request_timeout=180,   # optional OMP RPC wait, separate from the whole-run timeout
     provider_session_id="request-affinity",  # optional opaque OMP affinity ID
@@ -477,7 +478,10 @@ SDK backend rejects `xhigh` rather than silently translating it.
 
 `RunResult` has `text` (what the model said after its last tool result, so the narration before and between tool calls is dropped), `stop_reason`, `cost_usd`, `tokens`, `error` and `calls`, the `(tool name, ok)` pairs of the tools it called, with no arguments or results. A model or backend failure (a Claude result that reports an API error included), a timeout included (`error="timeout"`), or a backend that cannot be built (omp_rpc not installed), comes back as `error`; `run_prompt` raises only `ValueError` for a bad argument, and `CancelledError` if you cancel it, after closing the session. Session state lives in a temporary directory that is removed afterwards.
 
-`run_prompt(..., on_runtime=callback)` optionally calls `callback(event)` with each `AgentRuntimeResolved` event the backend reports, starting after actual OMP state/model observation or Claude SDK initialization. The event carries backend, nullable provider/model/effort and provenance; requested configuration is never used as a substitute. This callback observes runtime facts, it does not establish a pre-submit admission guarantee.
+`run_prompt(..., model_role="smol")`, or `"default"` / `"slow"`, asks OMP to resolve that role using its configured role settings, including profile and environment overrides. The alias is passed to OMP's own model resolver; Ember doesn't map role names to model IDs. Missing or unusable role configuration returns as a backend error, not the ordinary model default. Use a separate `model_role="default"` call if that's the fallback you want. `model_role` can't be combined with `model` and isn't supported with Claude because Ember has no Claude role mapping.
+`RunResult.role_resolution_error` is true only for OMP's explicit `Model "@<role>" not found` startup failure, before a provider request; auth, network, provider and tool failures leave it false. A caller can use that typed flag for a deliberate fallback call without retrying ordinary failed work.
+
+`run_prompt(..., on_runtime=callback)` calls `callback(event)` with each `AgentRuntimeResolved` event the backend reports. Events carry backend, nullable provider/model/effort and `provenance`; role-selected OMP runs also include the requested and resolved role plus role-resolution provenance. The model always comes from backend runtime observation, never from requested configuration. This callback observes runtime facts, it doesn't establish a pre-submit admission guarantee.
 
 When a run ends early (timeout or cancel), further tool calls are refused, handlers still running are cancelled and waited for (up to 5 seconds, so their cleanup is done before `run_prompt` returns), the backend process is killed and the close is bounded at 10 seconds. A handler blocked inside a synchronous call cannot be stopped and finishes on its own thread, so keep per-run handlers free of that. `omp_agent_dir`, `omp_binary` and `omp_config_dir` take the omp profile, executable and config root, as `launch.build_session` does.
 `provider_session_id` and `cache_retention` are OMP-only and refused with

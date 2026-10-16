@@ -492,7 +492,7 @@ class AgentModelsAvailable(AgentEvent):
 
 @dataclasses.dataclass(frozen=True)
 class AgentRuntimeResolved(AgentEvent):
-    """Runtime identity reported by the backend itself, never a requested value."""
+    """Runtime identity reported by the backend, plus any resolved role request."""
 
     kind: ClassVar[str] = "agent_runtime_resolved"
     backend: str
@@ -500,7 +500,9 @@ class AgentRuntimeResolved(AgentEvent):
     model: Optional[str]
     effort: Optional[str]
     provenance: str
-
+    requested_role: Optional[str] = None
+    resolved_role: Optional[str] = None
+    role_provenance: Optional[str] = None
 
 @dataclasses.dataclass(frozen=True)
 class SessionReset(AgentEvent):
@@ -514,15 +516,13 @@ class SessionReset(AgentEvent):
 
 @dataclasses.dataclass(frozen=True)
 class AgentError(AgentEvent):
-    """Emitted when the CLI is missing, unauthenticated, or its child dies
-    (plan section 3.4): the product's page and its own routes keep working,
-    and this is how the chat pane learns to show a Retry affordance
-    instead of hanging."""
+    """A backend failure, with optional typed evidence for safe role fallback."""
 
     kind: ClassVar[str] = "agent_error"
     stderr: str
     remediation: str
     viewer: Optional[str] = None
+    role_resolution_error: Optional[bool] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -717,8 +717,9 @@ class AgentSession(Protocol):
       a new manual input. The browser dispatcher checks this before counting,
       logging, or consuming notes (SDK active turn, OMP full queue).
     - ``resolved_runtime``: actual backend-reported provider/model/effort
-      metadata, or None until the backend reports it. Requested settings are
-      never used as actual runtime identity.
+      metadata, or None until the backend reports it. A backend that supports
+      role aliases may also report the requested/resolved role and provenance.
+      Requested settings are never used as actual runtime identity.
     - ``end_turn_after_tool()``: a tool result asked to end the turn
       (``tools.ok(..., end_turn=True)``, via ``ViewerBus.request_end_turn``).
       Called from inside the tool's handler, before its result reaches the

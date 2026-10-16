@@ -322,6 +322,7 @@ class OmpSession:
         session_id,
         broker=None,
         model: Optional[str] = None,
+        model_role: Optional[str] = None,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         tool_table: Optional[dict] = None,
@@ -354,9 +355,12 @@ class OmpSession:
         self.session_id = session_id
         self.sdk_session_id = None
         self._broker = broker
+        if model_role not in (None, "smol", "default", "slow"):
+            raise ValueError("model_role must be one of smol, default or slow")
+        if model_role is not None and (model is not None or base_url is not None):
+            raise ValueError("model_role cannot be combined with model or base_url")
         self._model = model
-        # The product's session context (Product.session_context), passed as
-        # --append-system-prompt; only when set, so the client is built with
+        self._model_role = model_role
         # exactly today's keywords otherwise.
         self._instructions = instructions or None
         self._base_url = base_url
@@ -801,16 +805,15 @@ class OmpSession:
                 # No omp_base_url: `omp`'s own provider registry and
                 # credentials, from the profile ``agent_dir`` names or, with
                 # none, the human's own (no PI_CODING_AGENT_DIR override).
-                # `self._model` (e.g. "titan/qwen3.8-27b", or None to take
-                # omp's own default) is passed straight through to
-                # ``--model``, the same fuzzy provider/model reference a
-                # human would type at the CLI. `RpcClient.start()` merges
-                # `env` onto `os.environ` rather than replacing it
-                # (confirmed by reading ``omp_rpc/client.py``).
+                # A model-role alias is resolved by OMP's own CLI against
+                # that profile's model-role settings, not by this client.
                 env = {}
                 if self._profile_dir is not None:
                     env["PI_CODING_AGENT_DIR"] = self._profile_dir
-                model_arg = self._model
+                model_arg = (
+                    "@%s" % self._model_role if self._model_role else self._model
+                )
+                # `RpcClient.start()` merges `env` onto `os.environ`.
             if self._config_rel is not None:
                 env["PI_CONFIG_DIR"] = self._config_rel
             if self._cache_retention is not None:
@@ -887,12 +890,23 @@ class OmpSession:
             state = await self._run_blocking(self._client.get_state)
             self._remember_sdk_session(state.session_id)
             model = getattr(state, "model", None)
+            actual_provider = _nonempty_string(getattr(model, "provider", None))
+            actual_model = _nonempty_string(getattr(model, "id", None))
+            role_resolved = (
+                self._model_role is not None
+                and (actual_provider is not None or actual_model is not None)
+            )
             runtime = AgentRuntimeResolved(
                 backend="omp",
-                provider=_nonempty_string(getattr(model, "provider", None)),
-                model=_nonempty_string(getattr(model, "id", None)),
+                provider=actual_provider,
+                model=actual_model,
                 effort=_nonempty_string(getattr(state, "thinking_level", None)),
                 provenance="get_state",
+                requested_role=self._model_role,
+                resolved_role=self._model_role if role_resolved else None,
+                role_provenance=(
+                    "omp_cli_model_role_alias" if role_resolved else None
+                ),
             )
             if runtime.provider is not None or runtime.model is not None or runtime.effort is not None:
                 self._record_resolved_runtime(runtime)
@@ -1176,6 +1190,11 @@ class OmpSession:
                     model=actual_model,
                     effort=None,
                     provenance="assistant_message",
+                    requested_role=self._model_role,
+                    resolved_role=self._model_role,
+                    role_provenance=(
+                        "omp_cli_model_role_alias" if self._model_role is not None else None
+                    ),
                 ),
             )
         self._loop.call_soon_threadsafe(self._emit_request_usage, report)
@@ -1189,8 +1208,13 @@ class OmpSession:
             "effort": event.effort or previous.get("effort"),
             "provenance": event.provenance,
         }
-        identity = tuple(runtime[key] for key in (
-            "backend", "provider", "model", "effort", "provenance"
+        for field in ("requested_role", "resolved_role", "role_provenance"):
+            value = getattr(event, field, None) or previous.get(field)
+            if value is not None:
+                runtime[field] = value
+        identity = tuple(runtime.get(key) for key in (
+            "backend", "provider", "model", "effort", "provenance",
+            "requested_role", "resolved_role", "role_provenance",
         ))
         if identity == self._runtime_identity:
             return
@@ -1524,11 +1548,20 @@ class OmpSession:
             self._active_input_id = None
             self._running = False
         self._settle_queued_inputs("backend exited before queued input was sent")
+        # Only this exact startup selector error is safe for caller fallback:
+        # start has not returned, so no prompt, provider request or host tool ran.
+        said = "%s\n%s" % (exc, getattr(self._stderr_client, "stderr", None) or "")
+        role_resolution_error = (
+            self._start_failed_at is not None
+            and self._model_role is not None
+            and ('model "@%s" not found' % self._model_role).lower() in said.lower()
+        )
         self._emit(
             AgentError(
                 stderr="%s: %s" % (type(exc).__name__, exc),
                 remediation=remediation or _remediation_for(exc),
                 viewer=viewer,
+                role_resolution_error=True if role_resolution_error else None,
             )
         )
 
