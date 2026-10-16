@@ -436,6 +436,9 @@ read as read; every other Datum operation is view grade and runs without an
 approval card. This is the shared internal-service policy: there is no
 product opt-in or approval bridge. All Datum capabilities are exposed,
 including evidence operations and cancel/reference relations.
+Direct `remote.call` access to Datum also needs no per-tool mutation opt-in.
+An explicit `read_only=True` still honours the caller's read-only contract;
+mutations retain their durable action ledger and source/lifecycle checks.
 
 Datum request lifecycle still matters: requests may be paused or cancelled,
 and a ready request ticket is not a review signoff, the indexed source must

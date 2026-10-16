@@ -429,6 +429,7 @@ async def call(
         return fail("remote call refused: %s is denied" % name)
     if (
         server.read_tools
+        and (read_only or not server.annotation_default_view)
         and name not in server.read_tools
         and name not in allowed_reads
         and name not in allowed_writes

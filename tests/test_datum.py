@@ -190,7 +190,7 @@ async def test_pause_gates_datum_view_operations_but_not_annotated_reads(fake, t
 
 
 @pytest.mark.asyncio
-async def test_direct_calls_are_read_guarded_and_named_writes_are_allowed(fake, tmp_path):
+async def test_direct_calls_honor_read_only_without_mutation_opt_in(fake, tmp_path):
     from annealage_ember import remote
     from annealage_ember.remote_actions import RemoteActionStore
 
@@ -209,7 +209,6 @@ async def test_direct_calls_are_read_guarded_and_named_writes_are_allowed(fake, 
         "request_datasheet",
         {"mpn": "X"},
         action_store=store,
-        allowed_writes=("request_datasheet",),
     )
     assert not allowed.get("is_error", False)
     assert fake.calls[-1] == ("request_datasheet", {"mpn": "X"})
@@ -219,7 +218,6 @@ async def test_direct_calls_are_read_guarded_and_named_writes_are_allowed(fake, 
         "cancel_evidence_job",
         {"job_id": "job"},
         action_store=store,
-        allowed_writes=("cancel_evidence_job",),
     )
     assert not cancelled.get("is_error", False)
     assert cancelled["content"][0]["text"] == 'cancel_evidence_job {"job_id": "job"}'
