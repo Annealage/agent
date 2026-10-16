@@ -271,10 +271,14 @@ def test_ungraded_and_unlisted_tools_are_left_out_with_a_warning(fake, bus, tmp_
     assert "the fake MCP server does not list vanished, which its grading names" in err
 
 
-def test_excluded_tools_are_left_out_without_a_warning(fake, bus, tmp_path, capsys):
+@pytest.mark.parametrize("default_view", [False, True])
+def test_excluded_tools_are_left_out_without_a_warning(fake, bus, tmp_path, capsys, default_view):
     """``extra`` is listed and ``withdrawn`` is not; excluding both leaves
     the listing warning-free."""
-    tools = _tools(bus, tmp_path, _fake(fake, excluded=("extra", "withdrawn")))
+    declaration = _fake(fake, excluded=("extra", "withdrawn"))._replace(
+        annotation_grading=default_view, annotation_default_view=default_view,
+    )
+    tools = _tools(bus, tmp_path, declaration)
     assert set(tools.remote_tables()["fake"]) == PROXIED
     assert not any(name.endswith(("__extra", "__withdrawn")) for name in tools.pre_allowed)
     err = capsys.readouterr().err

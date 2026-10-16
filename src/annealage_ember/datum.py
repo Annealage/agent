@@ -8,16 +8,11 @@ agent to look parts up there declares it as a remote beside its own tools
     ToolServer(tools, ..., remote=(datum.remote(url),))
     create_app(..., upload_actions=(datum.upload_action("my-project"),))
 
-``remote`` carries the shared model-facing policy: Datum's annotations decide
-which newly-added tools are read grade, explicit product choices decide which
-cost-bearing tools can be exposed, and a local deny list blocks shared-state
-writes. Product code uses ``remote.call`` with the same read-only guard.
-
-``submit_datasheet`` and ``request_datasheet`` are explicit write-grade tools.
-``submit_evidence_job`` costs Datum worker time, so it is product-only and must
-be opted into by name. A result is a candidate, never verified: ``validated``
-means structure and provenance only. ``cancel_evidence_job`` is denied because
-Datum has one submit token and any caller can cancel any job.
+``remote`` carries the shared internal-service policy: read-annotated tools
+are read grade and every other discovered Datum tool is view grade. None
+requires a permission card or product opt-in. Lifecycle pause/cancel checks
+and action provenance still apply. Evidence results are candidates, never
+verified facts: ``validated`` means structure and provenance only.
 
 Datum lists most of its tools only once ``getting_started`` has been called,
 so that is the ``prime`` call.
@@ -28,8 +23,6 @@ outside Datum. ``get_part_by_mpn`` rows carry ``match`` (``exact`` or
 ``family``; absent means exact), ``matched_mpn`` and ``requested_mpn``, and a
 ``family`` row is not the part that was asked for.
 
-Tools the server does not annotate as read-only are withheld unless their
-names are explicitly graded here.
 """
 
 from .remote import RemoteServer
@@ -52,11 +45,6 @@ REQUEST_TOOL = "request_datasheet"
 #: The tool that queues a document-bound evidence job.
 EVIDENCE_SUBMIT_TOOL = "submit_evidence_job"
 
-#: Tools never exposed to the model or permitted in product code.
-DENY = ("cancel_evidence_job", "publish_reference", "relate_documents", "unrelate_documents")
-
-#: Cost-bearing tools require an explicit product opt-in for model use.
-PRODUCT_ONLY = (EVIDENCE_SUBMIT_TOOL,)
 
 #: Fallback read-name guard for direct product calls, which may not have run
 #: model-facing discovery first.
@@ -76,18 +64,16 @@ READ_TOOLS = (
 PRIME = ("getting_started", {})
 
 
-def remote(url, *, view=()):
-    """Datum at ``url`` with annotation grading and explicit product opt-ins."""
+def remote(url):
+    """Datum at ``url``; all discovered capabilities run without approval."""
     return RemoteServer(
         SERVER,
         url,
-        Grading((), tuple(view), (SUBMIT_TOOL, REQUEST_TOOL)),
+        Grading((), (), ()),
         prime=PRIME,
-        excluded=DENY,
         annotation_grading=True,
-        product_only=PRODUCT_ONLY,
         read_tools=READ_TOOLS,
-        denied=DENY,
+        annotation_default_view=True,
     )
 
 

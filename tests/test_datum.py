@@ -1,4 +1,4 @@
-"""Datum proxy policy, annotation discovery, direct-call guard and uploads.
+"""Datum no-approval discovery, pause gating, direct-call guard and uploads.
 The fake lists its expanded tool set only after ``getting_started`` runs.
 """
 
@@ -12,7 +12,7 @@ import mcp.types as types
 import pytest
 import uvicorn
 from mcp.server import Server
-from toy_product import build_toy_tools
+from toy_product import TOY_PAUSED_MESSAGE, build_toy_tools
 
 from annealage_ember import datum, uploads
 from annealage_ember.uploads import check_upload_actions
@@ -48,7 +48,7 @@ LOOKUPS = (
 )
 WRITES = ("submit_datasheet", "request_datasheet")
 VIEWS = ("submit_evidence_job",)
-WITHHELD = (
+FORMERLY_DENIED = (
     "publish_reference",
     "relate_documents",
     "unrelate_documents",
@@ -58,12 +58,12 @@ ADVERTISED = ("getting_started", "search_parts", "semantic_search", "list_boards
 
 
 class FakeDatum:
-    def __init__(self, extra=(), delay=0, new_tools=True):
+    def __init__(self, extra=(), delay=0):
         self.delay = delay
         self.calls = []
         primed = set()
-        additions = ("new_read_tool", "new_write_tool") if new_tools else ()
-        names = (*LOOKUPS, *WRITES, *VIEWS, *WITHHELD, *additions, *extra)
+        additions = ("new_read_tool", "new_write_tool")
+        names = (*LOOKUPS, *WRITES, *VIEWS, *FORMERLY_DENIED, *additions, *extra)
 
         def listed(name):
             read_only = name in LOOKUPS or name in ("new_read_tool", "cancel_evidence_job")
@@ -125,84 +125,68 @@ def fake():
     remote.stop()
 
 
-def _tools(tmp_path, url, *, view=()):
+def _tools(tmp_path, url, *, bus=None):
     from annealage_ember.remote_actions import RemoteActionStore
 
-    bus = SimpleNamespace(paused=False)
+    bus = bus if bus is not None else SimpleNamespace(paused=False)
     bus.remote_action_store = RemoteActionStore(
         tmp_path / "remote-actions.json", project_id=str(tmp_path), session="sess-1"
     )
-    return build_toy_tools(bus, tmp_path, "sess-1", remote=(datum.remote(url, view=view),))
-
-
-def test_the_remote_is_datum_under_the_ds_wiki_key():
-    remote = datum.remote("https://example.invalid/mcp")
-    assert remote.name == "ds-wiki" == datum.SERVER
-    assert remote.url == "https://example.invalid/mcp"
-    assert remote.prime == ("getting_started", {})
-    assert remote.excluded == datum.DENY
-    assert remote.denied == datum.DENY
-    assert remote.annotation_grading
-    assert datum.EVIDENCE_SUBMIT_TOOL in remote.product_only
-    assert remote.headers is None
-
-
-def test_annotation_grading_keeps_only_explicit_write_names():
-    grading = datum.remote("http://x/mcp").grading
-    assert grading.read == ()
-    assert grading.view == ()
-    assert grading.write == WRITES
-
-
-def test_the_published_default_is_the_hosted_datum():
-    assert datum.DEFAULT_URL == "https://ds.story-kettle.ts.net/mcp"
-
-
-def test_a_tool_server_proxies_annotated_reads_and_explicit_writes(fake, tmp_path, capsys):
-    tools = _tools(tmp_path, fake.url)
-    proxied = tools.remote_tables()["ds-wiki"]
-    # Priming reveals the expanded tool listing.
-    assert set(proxied) == {*LOOKUPS, "new_read_tool", *WRITES}
-    assert [name for name, spec in proxied.items() if spec.write] == list(WRITES)
-    assert not set(WITHHELD) & set(proxied)
-    assert "submit_evidence_job" not in proxied
-    pre = {
-        name.removeprefix("mcp__ds-wiki__")
-        for name in tools.pre_allowed
-        if name.startswith("mcp__ds-wiki__")
-    }
-    assert pre == {*LOOKUPS, "new_read_tool"}
-    err = capsys.readouterr().err
-    assert "new_write_tool" in err and "brand_new_tool" in err
-    for name in WITHHELD:
-        assert name not in err
-
-
-def test_the_product_only_job_is_view_grade_only_when_opted_in(fake, tmp_path):
-    tools = _tools(tmp_path, fake.url, view=(datum.EVIDENCE_SUBMIT_TOOL,))
-    spec = tools.remote_tables()["ds-wiki"][datum.EVIDENCE_SUBMIT_TOOL]
-    assert not spec.write
-    assert "mcp__ds-wiki__submit_evidence_job" in tools.pre_allowed
-
-
-def test_the_withheld_tools_are_not_warned_about_when_datum_lists_nothing_new(tmp_path, capsys):
-    plain = FakeDatum(new_tools=False)
-    try:
-        _tools(tmp_path, plain.url)
-    finally:
-        plain.stop()
-    assert "ds-wiki" not in capsys.readouterr().err
+    return build_toy_tools(bus, tmp_path, "sess-1", remote=(datum.remote(url),))
 
 
 @pytest.mark.asyncio
-async def test_a_lookup_reaches_datum_and_primes_it(fake, tmp_path):
-    proxied = _tools(tmp_path, fake.url).remote_tables()["ds-wiki"]
-    result = await proxied["search_parts"].handler({"query": "RP2040"})
-    assert result["content"][0]["text"] == 'search_parts {"query": "RP2040"}'
-    assert fake.calls[-1] == ("search_parts", {"query": "RP2040"})
-    new_read = await proxied["new_read_tool"].handler({})
-    assert new_read["content"][0]["text"] == "new_read_tool {}"
-    assert fake.calls[-1] == ("new_read_tool", {})
+async def test_every_discovered_capability_runs_without_an_approval_card(fake, tmp_path, capsys):
+    tools = _tools(tmp_path, fake.url)
+    proxied = tools.remote_tables()["ds-wiki"]
+    names = {
+        *LOOKUPS, *WRITES, *VIEWS, *FORMERLY_DENIED,
+        "new_read_tool", "new_write_tool", "brand_new_tool",
+    }
+    # The HTTP server reveals these capabilities only after getting_started.
+    assert fake.calls == [("getting_started", {})]
+    assert set(proxied) == names
+    assert all(not spec.write for spec in proxied.values())
+    assert {
+        name.removeprefix("mcp__ds-wiki__")
+        for name in tools.pre_allowed
+        if name.startswith("mcp__ds-wiki__")
+    } == names
+    assert "ds-wiki" not in capsys.readouterr().err
+
+    for name in sorted(names):
+        arguments = {"probe": name}
+        result = await proxied[name].handler(arguments)
+        assert not result.get("is_error", False), (name, result)
+        assert result["content"][0]["text"] == "%s %s" % (name, json.dumps(arguments))
+        assert fake.calls[-1] == (name, arguments)
+    assert fake.calls[1:] == [(name, {"probe": name}) for name in sorted(names)]
+
+
+@pytest.mark.asyncio
+async def test_pause_gates_datum_view_operations_but_not_annotated_reads(fake, tmp_path):
+    bus = SimpleNamespace(paused=False)
+    proxied = _tools(tmp_path, fake.url, bus=bus).remote_tables()["ds-wiki"]
+    bus.paused = True
+    # cancel_evidence_job deliberately advertises readOnlyHint=True in the fake:
+    # discovery follows annotations, not a historical list of denied names.
+    reads = {*LOOKUPS, "new_read_tool", "cancel_evidence_job"}
+    for name in sorted(set(proxied) - reads):
+        refused = await proxied[name].handler({})
+        assert refused["is_error"] is True
+        assert refused["content"][0]["text"] == TOY_PAUSED_MESSAGE
+    assert fake.calls == [("getting_started", {})]
+
+    for name in sorted(reads):
+        result = await proxied[name].handler({})
+        assert not result.get("is_error", False)
+        assert result["content"][0]["text"] == name + " {}"
+        assert fake.calls[-1] == (name, {})
+
+    bus.paused = False
+    resumed = await proxied["new_write_tool"].handler({"resume": True})
+    assert not resumed.get("is_error", False)
+    assert fake.calls[-1] == ("new_write_tool", {"resume": True})
 
 
 @pytest.mark.asyncio
@@ -211,9 +195,10 @@ async def test_direct_calls_are_read_guarded_and_named_writes_are_allowed(fake, 
     from annealage_ember.remote_actions import RemoteActionStore
 
     server = datum.remote(fake.url)
-    refused = await remote.call(server, "request_datasheet", {}, read_only=True)
-    assert refused["is_error"]
-    assert "not read-only" in refused["content"][0]["text"]
+    for name in (*WRITES, *VIEWS, *FORMERLY_DENIED):
+        refused = await remote.call(server, name, {}, read_only=True)
+        assert refused["is_error"]
+        assert "not read-only" in refused["content"][0]["text"]
     assert fake.calls == []
 
     store = RemoteActionStore(
@@ -229,14 +214,19 @@ async def test_direct_calls_are_read_guarded_and_named_writes_are_allowed(fake, 
     assert not allowed.get("is_error", False)
     assert fake.calls[-1] == ("request_datasheet", {"mpn": "X"})
 
-    denied = await remote.call(
+    cancelled = await remote.call(
         server,
         "cancel_evidence_job",
-        {},
+        {"job_id": "job"},
+        action_store=store,
         allowed_writes=("cancel_evidence_job",),
     )
-    assert denied["is_error"]
-    assert "denied" in denied["content"][0]["text"]
+    assert not cancelled.get("is_error", False)
+    assert cancelled["content"][0]["text"] == 'cancel_evidence_job {"job_id": "job"}'
+    assert fake.calls == [
+        ("request_datasheet", {"mpn": "X"}),
+        ("cancel_evidence_job", {"job_id": "job"}),
+    ]
 
 
 @pytest.mark.asyncio
@@ -261,21 +251,19 @@ async def test_remote_call_uses_its_timeout_override():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("name", "arguments", "write"),
+    ("name", "arguments"),
     (
-        ("request_datasheet", {"mpn": "TPS54302"}, True),
-        ("get_request_status", {"request_id": 123}, False),
-        ("get_evidence_result", {"result_id": "r"}, False),
-        ("get_evidence_usage", {}, False),
+        ("request_datasheet", {"mpn": "TPS54302"}),
+        ("get_request_status", {"request_id": 123}),
+        ("get_evidence_result", {"result_id": "r"}),
+        ("get_evidence_usage", {}),
     ),
 )
-async def test_request_and_polling_tools_are_discovered_graded_and_forwarded(
-    fake, tmp_path, name, arguments, write
-):
+async def test_request_and_polling_tools_run_without_approval(fake, tmp_path, name, arguments):
     tools = _tools(tmp_path, fake.url)
     spec = tools.remote_tables()["ds-wiki"][name]
-    assert spec.write is write
-    assert ("mcp__ds-wiki__" + name in tools.pre_allowed) is (not write)
+    assert not spec.write
+    assert "mcp__ds-wiki__" + name in tools.pre_allowed
     result = await spec.handler(arguments)
     assert result["content"][0]["text"] == "%s %s" % (name, json.dumps(arguments))
     assert fake.calls[-1] == (name, arguments)
@@ -304,8 +292,18 @@ def test_datum_upload_action_requires_an_exact_source_url():
             uploads.call_args(action, None, None, source_url=invalid)
 
 
-def test_datum_upload_action_declares_its_remote(fake, tmp_path):
+@pytest.mark.asyncio
+async def test_datum_upload_action_reaches_its_remote_without_approval(fake, tmp_path):
     tools = _tools(tmp_path, fake.url)
     action = datum.upload_action("t")
     assert check_upload_actions((action,), tools)
-    assert tools.remote_tables()["ds-wiki"]["submit_datasheet"].write
+    spec = tools.remote_tables()["ds-wiki"]["submit_datasheet"]
+    assert not spec.write
+    assert "mcp__ds-wiki__submit_datasheet" in tools.pre_allowed
+    arguments = uploads.call_args(
+        action, None, None, source_url="https://manufacturer.example/part.pdf"
+    )
+    result = await spec.handler(arguments)
+    assert not result.get("is_error", False)
+    assert result["content"][0]["text"] == "submit_datasheet " + json.dumps(arguments)
+    assert fake.calls[-1] == ("submit_datasheet", arguments)

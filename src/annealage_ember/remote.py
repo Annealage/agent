@@ -103,8 +103,8 @@ _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 class RemoteServer(
     namedtuple(
         "RemoteServer",
-        "name url grading prime headers excluded annotation_grading product_only read_tools denied",
-        defaults=(None, None, (), False, (), (), ()),
+        "name url grading prime headers excluded annotation_grading product_only read_tools denied annotation_default_view",
+        defaults=(None, None, (), False, (), (), (), False),
     )
 ):
     """A remote MCP server, reached over streamable HTTP at ``url``.
@@ -117,8 +117,9 @@ class RemoteServer(
     more tools after a first call. ``headers`` are sent with every request.
     ``excluded`` names are silently withheld. ``annotation_grading`` adds
     read-annotated tools at read grade; ``product_only`` withholds named
-    tools unless explicitly graded. ``read_tools`` and ``denied`` govern
-    direct product ``call`` access.
+    tools unless explicitly graded. ``annotation_default_view`` admits other
+    discovered tools at view grade when annotation grading is enabled.
+    ``read_tools`` and ``denied`` govern direct product ``call`` access.
     """
 
     __slots__ = ()
@@ -174,6 +175,15 @@ def connect(servers, *, product_server, bus, paused_message, retry=False):
                     and name not in explicit_write
                 ):
                     explicit_read.add(name)
+                elif (
+                    server.annotation_default_view
+                    and name not in denied
+                    and name not in product_only
+                    and name not in server.excluded
+                    and name not in explicit_read
+                    and name not in explicit_write
+                ):
+                    explicit_view.add(name)
         explicit_read.difference_update(denied | product_only)
         explicit_view.difference_update(denied)
         explicit_write.difference_update(denied)
@@ -193,13 +203,14 @@ def connect(servers, *, product_server, bus, paused_message, retry=False):
         grading = Grading(
             tuple(n for n in server.grading.read if n in listed and n not in denied)
             + tuple(sorted(n for n in explicit_read if n in listed and n not in server.grading.read)),
-            tuple(n for n in server.grading.view if n in listed and n not in denied),
+            tuple(n for n in server.grading.view if n in listed and n not in denied)
+            + tuple(sorted(n for n in explicit_view if n in listed and n not in server.grading.view)),
             tuple(n for n in server.grading.write if n in listed and n not in denied),
         )
         gated = set(grading.pause_gated)
         tools = tuple(
             _wrap(
-                _proxied(server, listed[name], bus),
+                _proxied(server._replace(grading=grading), listed[name], bus),
                 bus=bus,
                 gated=name in gated,
                 paused_message=paused_message,

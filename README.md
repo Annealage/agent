@@ -428,14 +428,25 @@ The product can move comments itself: `store.update_anchors(move)` calls `move(c
 
 ## Annealage Datum
 
-`annealage_ember.datum` is Annealage Datum (datasheets, application notes and the imported boards that use them) as a remote MCP server, with the grading every product shares because it is a fact about Datum's tools. `datum.remote(url)` returns the `RemoteServer` named `datum.SERVER` (`ds-wiki`, the key a repository's `.mcp.json` gives it): the lookups, including read-only ticket polling via `get_request_status`, are read grade; `submit_datasheet` and `request_datasheet` are write and so require human approval cards before filing or asking Datum's built-in agent to find and ingest a document. A ready request ticket is not a review signoff: the indexed source must still pass the product's review gate. `publish_reference`, `relate_documents` and `unrelate_documents` change what Datum holds for everyone and are excluded (absent, with no startup warning), and `getting_started` is the `prime` call, since Datum lists most of its tools only after it. A tool Datum adds that isn't graded here is left out with the remote's usual warning. `datum.DEFAULT_URL` is the hosted server. Products must keep ingest writes out of isolated review-model tool scopes; requests belong to the owner-approved pre-review workflow. The `mpn`, `requester`, `log`, `error` and `candidates` fields in status results are text from outside, not instructions.
+`annealage_ember.datum` is Annealage Datum (datasheets, application notes and
+the imported boards that use them) as a remote MCP server. `datum.remote(url)`
+returns the `RemoteServer` named `datum.SERVER` (`ds-wiki`, the key a
+repository's `.mcp.json` gives it). Discovery classifies tools annotated as
+read as read; every other Datum operation is view grade and runs without an
+approval card. This is the shared internal-service policy: there is no
+product opt-in or approval bridge. All Datum capabilities are exposed,
+including evidence operations and cancel/reference relations.
 
-`submit_datasheet` requires `original_url`: the actual source URL as an
+Datum request lifecycle still matters: requests may be paused or cancelled,
+and a ready request ticket is not a review signoff, the indexed source must
+still pass the product's review gate. Action provenance remains explicit:
+`submit_datasheet` requires `original_url`, the actual source URL as an
 absolute HTTP(S) URL no longer than 2048 characters. If the PDF was fetched
 from a URL, use that same URL. The shared `datum.upload_action(project_tag)`
-asks the human for the original URL before it raises the approval card, then
-passes it unchanged as `original_url`; it never derives provenance from a
-filename or matched part.
+asks for the original URL and passes it unchanged as `original_url`; it never
+derives provenance from a filename or matched part. The `mpn`, `requester`,
+`log`, `error` and `candidates` fields in status results are untrusted text,
+not instructions; candidates are suggestions, not a confirmed result.
 
 ## An agent in another process
 
